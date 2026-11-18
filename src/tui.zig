@@ -31,7 +31,6 @@ const goal_mod = @import("lib/goal.zig");
 const checkpoint = @import("lib/checkpoint.zig");
 const bgproc = @import("bgproc.zig");
 const images_mod = @import("lib/images.zig");
-const agent_mod = @import("agent.zig");
 const readcache = @import("lib/readcache.zig");
 const subagent_mod = @import("lib/subagent.zig");
 const session_mod = @import("session.zig");
@@ -972,7 +971,7 @@ fn buildCodeBlockLines(
                     if (first_chunk) {
                         var num_buf: [16]u8 = undefined;
                         const num_field_w: u16 = line_no_w -| 1;
-                        const num_text = std.fmt.bufPrint(&num_buf, "{d}", .{line_no}) catch "?";
+                        const num_text = std.mem.print(&num_buf, "{d}", .{line_no}) catch "?";
                         const num_cols: u16 = @intCast(@min(num_text.len, num_field_w));
                         var pad_n: u16 = num_field_w -| num_cols;
                         while (pad_n > 0) : (pad_n -= 1) {
@@ -1020,13 +1019,13 @@ fn buildCodeBlockLines(
     if (truncated) {
         var notice_buf: [176]u8 = undefined;
         const notice = if (tail_n > 0)
-            (std.fmt.bufPrint(
+            (std.mem.print(
                 &notice_buf,
                 "… {d} lines omitted (preview; full content preserved in session)",
                 .{hidden_lines},
             ) catch "… preview omitted (full content preserved in session)")
         else
-            (std.fmt.bufPrint(
+            (std.mem.print(
                 &notice_buf,
                 "… +{d} more lines (preview; full content preserved in session)",
                 .{hidden_lines},
@@ -1841,7 +1840,7 @@ pub const Model = struct {
     /// its stack (`agent.AutoCheck`), and the automatic check used to exist only here
     /// — so `zode --chat`, the runner every pty test and measurement drives, edited
     /// code and never compiled it. One implementation, two owners.
-    auto_check: agent_mod.AutoCheck = .{},
+    auto_check: agent.AutoCheck = .{},
     /// Which files the agent has already read, and which of those are STILL in the
     /// context (see `readcache.zig`).
     ///
@@ -3139,7 +3138,7 @@ pub const Model = struct {
                     const age = sessionindex.ageLabel(now, e.created_at, &now_buf);
                     const label = self.allocator.dupe(u8, title) catch "";
                     var sbuf: [24]u8 = undefined;
-                    const sz = if (e.size_bytes > 0) (std.fmt.bufPrint(&sbuf, "{d} KB", .{e.size_bytes / 1024}) catch "") else "";
+                    const sz = if (e.size_bytes > 0) (std.mem.print(&sbuf, "{d} KB", .{e.size_bytes / 1024}) catch "") else "";
                     const summary = if (e.summary.len > 0) e.summary else (if (e.last_prompt.len > 0) e.last_prompt else "");
                     const desc = if (summary.len > 0 and e.tag.len > 0 and sz.len > 0)
                         (std.fmt.allocPrint(self.allocator, "{s} · {s} · #{s} · {s}", .{ age, sz, e.tag, summary }) catch self.allocator.dupe(u8, age) catch "")
@@ -3651,11 +3650,11 @@ pub const Model = struct {
             const summary = if (ne.summary.len > 0) ne.summary else (if (ne.last_prompt.len > 0) ne.last_prompt else "");
             var desc_buf: [96]u8 = undefined;
             const desc_text = if (summary.len > 0 and ne.size_bytes > 0)
-                (std.fmt.bufPrint(&desc_buf, "{s} · {d} KB · {s}", .{ age, ne.size_bytes / 1024, summary }) catch age)
+                (std.mem.print(&desc_buf, "{s} · {d} KB · {s}", .{ age, ne.size_bytes / 1024, summary }) catch age)
             else if (summary.len > 0)
-                (std.fmt.bufPrint(&desc_buf, "{s} · {s}", .{ age, summary }) catch age)
+                (std.mem.print(&desc_buf, "{s} · {s}", .{ age, summary }) catch age)
             else if (ne.size_bytes > 0)
-                (std.fmt.bufPrint(&desc_buf, "{s} · {d} KB", .{ age, ne.size_bytes / 1024 }) catch age)
+                (std.mem.print(&desc_buf, "{s} · {d} KB", .{ age, ne.size_bytes / 1024 }) catch age)
             else
                 age;
             const desc = gpa.dupe(u8, desc_text) catch "";
@@ -3668,7 +3667,7 @@ pub const Model = struct {
             .all => " · all projects",
             .branch => " · branch (project)",
         };
-        const ttext = std.fmt.bufPrint(&tbuf, "Resume ({d} sessions){s}", .{ entries.len, scope_label }) catch "Resume";
+        const ttext = std.mem.print(&tbuf, "Resume ({d} sessions){s}", .{ entries.len, scope_label }) catch "Resume";
         const nt = @min(ttext.len, self.picker_title.len);
         @memcpy(self.picker_title[0..nt], ttext[0..nt]);
         self.picker_title_len = nt;
@@ -3841,7 +3840,7 @@ pub const Model = struct {
     /// the right color).
     pub fn setStatusFmt(self: *Model, new_mood: StatusKind, comptime fmt: []const u8, args: anytype) void {
         var buf: [160]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, fmt, args) catch {
+        const s = std.mem.print(&buf, fmt, args) catch {
             self.setStatusWithMood(new_mood, fmt);
             return;
         };
@@ -3894,7 +3893,7 @@ pub const Model = struct {
 
     pub fn statusf(self: *Model, comptime fmt: []const u8, args: anytype) void {
         var buf: [160]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        const s = std.mem.print(&buf, fmt, args) catch return;
         self.setStatusText(s);
     }
 
@@ -5257,7 +5256,7 @@ pub const Model = struct {
             palette.freeItems(self.allocator, items);
             self.pending_items = null;
         }
-        const notice = std.fmt.bufPrint(&self.catalog_notice_buf, "Loading {s} model catalog…", .{provider_id}) catch "";
+        const notice = std.mem.print(&self.catalog_notice_buf, "Loading {s} model catalog…", .{provider_id}) catch "";
         self.catalog_notice_len = notice.len;
         self.dirty = true;
         self.unlock();
@@ -5979,7 +5978,7 @@ pub const Model = struct {
                         break :blk_b (c == ':' or c == ' ' or c == ',' or c == '!' or c == '.');
                     };
                     if (boundary) {
-                        break :blk std.fmt.bufPrint(&fail_head_buf, "\xe2\x9c\x97 {s}", .{head}) catch head;
+                        break :blk std.mem.print(&fail_head_buf, "\xe2\x9c\x97 {s}", .{head}) catch head;
                     }
                 }
             }
@@ -5991,9 +5990,9 @@ pub const Model = struct {
         // is condensed and can be expanded to the full transcript.
         const can_expand = result.len > 0 and !std.mem.eql(u8, result, summary);
         const line = if (can_expand)
-            std.fmt.bufPrint(&line_buf, "*{s}* · {d}ms · ^R", .{ display_head, ms }) catch display_head
+            std.mem.print(&line_buf, "*{s}* · {d}ms · ^R", .{ display_head, ms }) catch display_head
         else
-            std.fmt.bufPrint(&line_buf, "*{s}* · {d}ms", .{ display_head, ms }) catch display_head;
+            std.mem.print(&line_buf, "*{s}* · {d}ms", .{ display_head, ms }) catch display_head;
 
         // Three copies: the paragraph's (pending), the summary and the full
         // result (for Ctrl+R). All gpa-owned.
@@ -8073,7 +8072,7 @@ fn keyToBinding(gpa: std.mem.Allocator, key: vaxis.Key) !?[]u8 {
         if (cp == 57356) break :blk "home";
         if (cp == 57357) break :blk "end";
         if (cp >= vaxis.Key.f1 and cp <= vaxis.Key.f12) {
-            break :blk std.fmt.bufPrint(&fbuf, "f{d}", .{cp - vaxis.Key.f1 + 1}) catch return null;
+            break :blk std.mem.print(&fbuf, "f{d}", .{cp - vaxis.Key.f1 + 1}) catch return null;
         }
         if (cp < 0x20 or cp > 0x7e) return null;
         one[0] = @intCast(cp);
@@ -8907,7 +8906,7 @@ fn acceptAutocomplete(self: *Model) bool {
 /// rejected edit, so the message is accurate at paint time.
 fn inputTooLongRejected(self: *Model) void {
     const text_len = self.ed.text().len;
-    const msg = std.fmt.bufPrint(&self.input_err_buf, "Input too long: {d}-byte cap, {d} bytes already typed. Shorten the text and resend.", .{ ed.max_bytes, text_len }) catch {
+    const msg = std.mem.print(&self.input_err_buf, "Input too long: {d}-byte cap, {d} bytes already typed. Shorten the text and resend.", .{ ed.max_bytes, text_len }) catch {
         self.input_err = "Input too long: shorten the text.";
         self.input_too_long = true;
         return;
@@ -9920,13 +9919,13 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
             const secs = ms / 1000;
             const line = if (ms == 0)
                 if (tr.arg.len == 0)
-                    std.fmt.bufPrint(&tool_buf, "*{s}* running", .{tr.name}) catch ""
+                    std.mem.print(&tool_buf, "*{s}* running", .{tr.name}) catch ""
                 else
-                    std.fmt.bufPrint(&tool_buf, "*{s}*({s}) running", .{ tr.name, arg_shown }) catch ""
+                    std.mem.print(&tool_buf, "*{s}*({s}) running", .{ tr.name, arg_shown }) catch ""
             else if (tr.arg.len == 0)
-                std.fmt.bufPrint(&tool_buf, "*{s}* running · {d}.{d}s", .{ tr.name, secs, (ms % 1000) / 100 }) catch ""
+                std.mem.print(&tool_buf, "*{s}* running · {d}.{d}s", .{ tr.name, secs, (ms % 1000) / 100 }) catch ""
             else
-                std.fmt.bufPrint(&tool_buf, "*{s}*({s}) running · {d}.{d}s", .{ tr.name, arg_shown, secs, (ms % 1000) / 100 }) catch "";
+                std.mem.print(&tool_buf, "*{s}*({s}) running · {d}.{d}s", .{ tr.name, arg_shown, secs, (ms % 1000) / 100 }) catch "";
             // Copied here, while `tool_buf` is certainly alive and `tr.name` /
             // `tr.arg` cannot be freed under us: `toolRunEnd` frees them from
             // the worker thread as soon as it runs.
@@ -10471,7 +10470,7 @@ fn drawInput(
     // the prompt text itself.
     if (first > 0 and width > 16 and hint_row != top and !self.ac.active) {
         var ib: [32]u8 = undefined;
-        const lab = std.fmt.bufPrint(&ib, "\u{2191} {d} more", .{first}) catch "";
+        const lab = std.mem.print(&ib, "\u{2191} {d} more", .{first}) catch "";
         if (lab.len > 0 and lab.len + 4 < width) {
             _ = p.putClipped(width - 2 - @as(u16, @intCast(lab.len)), hint_row, lab, @as(u16, @intCast(lab.len)), theme.key_hint);
         }
@@ -10602,7 +10601,7 @@ fn drawAutocomplete(
         }
         if (self.ac.mode == .command and label.len + 4 < width) {
             var db: [96]u8 = undefined;
-            const d = std.fmt.bufPrint(&db, "  {s}", .{agentCommandDesc(label)}) catch continue;
+            const d = std.mem.print(&db, "  {s}", .{agentCommandDesc(label)}) catch continue;
             _ = p.putText(3 + @as(u16, @intCast(label.len)), y, d, theme.dim);
         }
     }
@@ -10611,9 +10610,9 @@ fn drawAutocomplete(
     // numbers, because "6 matches" with 6 rows shown looks complete and is not.
     var fb: [64]u8 = undefined;
     const foot = if (hidden > 0)
-        std.fmt.bufPrint(&fb, "{d} matches · +{d} more · ↑↓ · tab", .{ total, hidden }) catch ""
+        std.mem.print(&fb, "{d} matches · +{d} more · ↑↓ · tab", .{ total, hidden }) catch ""
     else
-        std.fmt.bufPrint(&fb, "{d} {s} · ↑↓ · tab", .{
+        std.mem.print(&fb, "{d} {s} · ↑↓ · tab", .{
             total,
             if (total == 1) @as([]const u8, "match") else "matches",
         }) catch "";
@@ -10773,9 +10772,9 @@ fn drawNewMessagesPill(
 
     var buf: [32]u8 = undefined;
     const label = if (unseen == 1)
-        std.fmt.bufPrint(&buf, "1 new message", .{}) catch "new"
+        std.mem.print(&buf, "1 new message", .{}) catch "new"
     else
-        std.fmt.bufPrint(&buf, "{d} new messages", .{unseen}) catch "new";
+        std.mem.print(&buf, "{d} new messages", .{unseen}) catch "new";
     if (label.len == 0) return;
 
     const w: u16 = @intCast(label.len + 2);
@@ -11119,7 +11118,7 @@ fn drawPermissionModal(
     // without overflowing; cap lines to keep the modal compact.
     var rbuf: [160]u8 = undefined;
     const rtext: []const u8 = if (rule.len > 0)
-        (std.fmt.bufPrint(&rbuf, "asked by rule: {s}", .{rule}) catch rule)
+        (std.mem.print(&rbuf, "asked by rule: {s}", .{rule}) catch rule)
     else
         "";
     const rule_rows_all: []const []const u8 = if (rtext.len > 0 and inner_w > 0)
@@ -11158,7 +11157,7 @@ fn drawPermissionModal(
     // Tool
     _ = p.putClipped(x + inner_x_pad, y + 3, "This tool wants to run:", inner_w, theme.brand_soft);
     var nb: [64]u8 = undefined;
-    const tname = std.fmt.bufPrint(&nb, "{s}", .{tool}) catch tool;
+    const tname = std.mem.print(&nb, "{s}", .{tool}) catch tool;
     _ = p.putClipped(x + inner_x_pad, y + 4, tname, inner_w, theme.brand_bold);
 
     var dy: u16 = y + 5;
@@ -11260,7 +11259,7 @@ fn drawPermissionModal(
 /// to name what "from now on" means.
 fn suggestion_label(suggestion: []const u8, buf: []u8) []const u8 {
     if (suggestion.len == 0) return "";
-    return std.fmt.bufPrint(buf, "always allow {s}", .{suggestion}) catch "";
+    return std.mem.print(buf, "always allow {s}", .{suggestion}) catch "";
 }
 
 /// The permission question in TWO ROWS, for a terminal that has no room for the
@@ -11302,7 +11301,7 @@ fn drawPermissionModalCompact(
     }
 
     var nb: [96]u8 = undefined;
-    const head = std.fmt.bufPrint(&nb, "⚠ Permission: {s}", .{tool}) catch "⚠ Permission";
+    const head = std.mem.print(&nb, "⚠ Permission: {s}", .{tool}) catch "⚠ Permission";
     _ = p.putClipped(1, y, head, width -| 2, theme.warn_bold);
 
     const opts_y: u16 = y + rows - 1;
@@ -11313,7 +11312,7 @@ fn drawPermissionModalCompact(
             _ = p.putClipped(1, y + 1, "sandbox available (S): OS restrictions if kernel allows", width -| 2, theme.hint);
         } else if (rule) |rname| {
             var rb: [160]u8 = undefined;
-            const why = std.fmt.bufPrint(&rb, "asked by rule: {s}", .{rname}) catch "asked by permission rule";
+            const why = std.mem.print(&rb, "asked by rule: {s}", .{rname}) catch "asked by permission rule";
             _ = p.putClipped(1, y + 1, why, width -| 2, theme.hint);
         } else {
             // Detail summary (first line/chunk), clipped.
@@ -11361,7 +11360,7 @@ fn drawPlanBlock(p: *Painter, top: u16, width: u16, pl: plan_mod.Plan) void {
     _ = p.putStable(0, top, frame, 2, theme.rule);
     if (pl.allDone()) {
         var buf: [64]u8 = undefined;
-        const txt = std.fmt.bufPrint(&buf, "☑ plan {d}/{d} · complete", .{ pl.len, pl.len }) catch "☑ plan complete";
+        const txt = std.mem.print(&buf, "☑ plan {d}/{d} · complete", .{ pl.len, pl.len }) catch "☑ plan complete";
         _ = p.putClipped(1, top, txt, width -| 1, theme.ok);
         return;
     }
@@ -11369,7 +11368,7 @@ fn drawPlanBlock(p: *Painter, top: u16, width: u16, pl: plan_mod.Plan) void {
     const i = pl.currentIndex() orelse return;
     const item = pl.items[i];
     var buf: [64]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&buf, "{s} plan {d}/{d} · {d} open · ", .{
+    const prefix = std.mem.print(&buf, "{s} plan {d}/{d} · {d} open · ", .{
         item.status.glyph(),
         pl.doneCount(),
         pl.len,
@@ -11475,7 +11474,7 @@ fn drawAskPanel(
             const raw_label = if (idx == snap.options.len) ask_other_label else snap.options[idx];
             const option = normalizeAskOption(p.arena, raw_label);
             var marker: [16]u8 = undefined;
-            const prefix = std.fmt.bufPrint(&marker, "▸ {d} ", .{idx + 1}) catch "▸ ";
+            const prefix = std.mem.print(&marker, "▸ {d} ", .{idx + 1}) catch "▸ ";
             const used = p.putClipped(1, compact_row, prefix, compact_w, theme.selected);
             const marker_cols = used - 1;
             const label = askLineForWidth(p, option, compact_w -| marker_cols, p.arena);
@@ -11549,7 +11548,7 @@ fn drawAskPanel(
     }
     if (q_more > 0 and row < last_row) {
         var mb: [48]u8 = undefined;
-        const m = std.fmt.bufPrint(&mb, "… {d} more lines of the question", .{q_more}) catch "…";
+        const m = std.mem.print(&mb, "… {d} more lines of the question", .{q_more}) catch "…";
         _ = p.putClipped(inner_col, row, m, inner_w, theme.hint_faint);
         row += 1;
     }
@@ -11576,9 +11575,9 @@ fn drawAskPanel(
             // answer…" looks like a button, not a choice), and a menu whose rows
             // are not all the same shape is hard to scan.
             const mk = if (is_sel)
-                std.fmt.bufPrint(&marker, "▸ {d} ", .{i + 1}) catch "  "
+                std.mem.print(&marker, "▸ {d} ", .{i + 1}) catch "  "
             else
-                std.fmt.bufPrint(&marker, "  {d} ", .{i + 1}) catch "  ";
+                std.mem.print(&marker, "  {d} ", .{i + 1}) catch "  ";
             const used = p.putClipped(inner_col, row, mk, inner_w, style);
             const marker_cols = used - inner_col;
             const tag_text = if (i == 0 and !is_other) " · Recommended" else "";
@@ -11612,7 +11611,7 @@ fn drawAskPanel(
         "↑↓ choose · Enter answers · Esc: you decide"
     else
         "Type your answer below · Enter sends · Esc: you decide";
-    const ht = std.fmt.bufPrint(&hb, "{s}", .{hint_txt}) catch hint_txt;
+    const ht = std.mem.print(&hb, "{s}", .{hint_txt}) catch hint_txt;
     if (ht.len > 0 and row < last_row) {
         _ = p.putClipped(inner_col, row, ht, inner_w, theme.hint);
     }
@@ -11620,7 +11619,7 @@ fn drawAskPanel(
 
     if (row < last_row) {
         var wb: [32]u8 = undefined;
-        const w = std.fmt.bufPrint(&wb, "waiting {d}s", .{waited_ms / 1000}) catch "";
+        const w = std.mem.print(&wb, "waiting {d}s", .{waited_ms / 1000}) catch "";
         if (w.len > 0) {
             _ = p.putClipped(inner_col, row, w, inner_w, theme.hint_faint);
         }
@@ -11921,18 +11920,18 @@ fn drawStateFooter(
     } else if (act.ask) {
         legend = "waiting for your answer";
         const ms = self.askMillis();
-        detail = std.fmt.bufPrint(&detail_buf, "· {d}s to answer", .{ms / 1000}) catch "";
+        detail = std.mem.print(&detail_buf, "· {d}s to answer", .{ms / 1000}) catch "";
     } else if (act.perm) {
         legend = "waiting for your permission";
     } else if (act.subagent_total > 0) {
-        legend = std.fmt.bufPrint(&detail_buf, "subagents {d}/{d}", .{
+        legend = std.mem.print(&detail_buf, "subagents {d}/{d}", .{
             act.subagent_completed,
             act.subagent_total,
         }) catch "subagents";
     } else if (running_tool) {
         legend = "running";
         const ms = self.toolRunMillis();
-        detail = std.fmt.bufPrint(&detail_buf, "{s} · {d}.{d}s", .{
+        detail = std.mem.print(&detail_buf, "{s} · {d}.{d}s", .{
             running_tool_name.?,
             ms / 1000,
             (ms % 1000) / 100,
@@ -11940,11 +11939,11 @@ fn drawStateFooter(
     } else if (act.streaming) {
         legend = "streaming";
         const ms = self.busyMillis();
-        detail = std.fmt.bufPrint(&detail_buf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
+        detail = std.mem.print(&detail_buf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
     } else if (act.busy) {
         legend = "thinking";
         const ms = self.busyMillis();
-        detail = std.fmt.bufPrint(&detail_buf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
+        detail = std.mem.print(&detail_buf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
     } else {
         // Idle: the agent's own last word, if it said one ("done", "ready").
         legend = self.status();
@@ -11957,11 +11956,11 @@ fn drawStateFooter(
     }
     if (queued > 0) {
         var qbuf: [32]u8 = undefined;
-        const q = std.fmt.bufPrint(&qbuf, "{d} queued", .{queued}) catch "";
+        const q = std.mem.print(&qbuf, "{d} queued", .{queued}) catch "";
         if (q.len > 0) {
             if (detail.len > 0) {
                 var both: [128]u8 = undefined;
-                detail = std.fmt.bufPrint(&both, "{s} · {s}", .{ detail, q }) catch detail;
+                detail = std.mem.print(&both, "{s} · {s}", .{ detail, q }) catch detail;
             } else {
                 detail = q;
             }
@@ -11982,10 +11981,10 @@ fn drawStateFooter(
                 const shown = if (trimmed.len <= 40)
                     trimmed
                 else
-                    std.fmt.bufPrint(&tbuf, "{s}…", .{trimmed[0..39]}) catch "";
+                    std.mem.print(&tbuf, "{s}…", .{trimmed[0..39]}) catch "";
                 if (shown.len > 0) {
                     var both: [192]u8 = undefined;
-                    const joined = std.fmt.bufPrint(&both, "{s} · {s}", .{ detail, shown }) catch "";
+                    const joined = std.mem.print(&both, "{s} · {s}", .{ detail, shown }) catch "";
                     if (joined.len > 0) detail = joined;
                 }
             }
@@ -12032,7 +12031,7 @@ fn drawStateFooter(
     }
     if (act.streaming and agent.tps_live > 1) {
         var tb: [32]u8 = undefined;
-        const speed = std.fmt.bufPrint(&tb, "⚡ {d:.0} tok/s", .{agent.tps_live}) catch "";
+        const speed = std.mem.print(&tb, "⚡ {d:.0} tok/s", .{agent.tps_live}) catch "";
         // The segment's text is painted with `putStable`, which does NOT copy:
         // the bytes have to live in the frame's arena, not in this frame's
         // stack. This is the `&[_]u8{c}` family, and a right-aligned group is
@@ -12069,7 +12068,7 @@ fn drawStateFooter(
                 rn += 1;
             }
             var nb2: [24]u8 = undefined;
-            const txt = std.fmt.bufPrint(&nb2, "↓ {d} new", .{unseen}) catch label;
+            const txt = std.mem.print(&nb2, "↓ {d} new", .{unseen}) catch label;
             const owned = arena.dupe(u8, txt) catch "";
             right[rn] = .{ .text = owned, .style = theme.brand };
             latest_idx = rn;
@@ -12220,7 +12219,7 @@ fn drawTranscriptSearchBar(p: *Painter, m: *const Model, width: u16, height: u16
     p.fillRange(x0, x0 + box_w, y0, " ", theme.selected);
     var buf: [192]u8 = undefined;
     const q = m.search_query_buf[0..m.search_query_len];
-    const label = std.fmt.bufPrint(&buf, " / {s}_  (Enter search, Esc close)", .{q}) catch " / ";
+    const label = std.mem.print(&buf, " / {s}_  (Enter search, Esc close)", .{q}) catch " / ";
     _ = p.putClipped(x0 + 1, y0, label, box_w -| 2, theme.selected);
 }
 
@@ -12241,7 +12240,7 @@ fn drawTranscriptView(p: *Painter, m: *Model, width: u16, height: u16) void {
 
     var title_buf: [96]u8 = undefined;
     const mode: []const u8 = if (m.transcript_view_show_all) "show all" else "compact";
-    const title = std.fmt.bufPrint(&title_buf, " Transcript ({s}) ", .{mode}) catch " Transcript ";
+    const title = std.mem.print(&title_buf, " Transcript ({s}) ", .{mode}) catch " Transcript ";
     _ = p.putText(x0 + 2, y0, title, theme.accent_bold);
     const hint = " ↑↓/j k scroll · PgUp/PgDn · g/G · Ctrl+E show all · Ctrl+O/Esc close ";
     _ = p.putClipped(x0 + 2, y0 + box_h - 1, hint, box_w -| 4, theme.hint);
@@ -12265,7 +12264,7 @@ fn drawTranscriptView(p: *Painter, m: *Model, width: u16, height: u16) void {
             else => "text",
         };
         var hdr: [96]u8 = undefined;
-        const header = std.fmt.bufPrint(&hdr, "[{d}] {s}", .{ pi + 1, kind_label }) catch kind_label;
+        const header = std.mem.print(&hdr, "[{d}] {s}", .{ pi + 1, kind_label }) catch kind_label;
         lines.append(p.ctx.arena, p.ctx.arena.dupe(u8, header) catch header) catch {};
 
         const text = para.textLive(m.allocator);
@@ -12337,7 +12336,7 @@ fn drawDiffViewer(p: *Painter, m: *const Model, width: u16, height: u16) void {
 
     const sel = @min(m.diff_viewer_sel, n - 1);
     var title_buf: [96]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, " Diff viewer  ({d}/{d} files) ", .{ sel + 1, n }) catch " Diff viewer ";
+    const title = std.mem.print(&title_buf, " Diff viewer  ({d}/{d} files) ", .{ sel + 1, n }) catch " Diff viewer ";
     _ = p.putText(x0 + 2, y0, title, theme.accent_bold);
     const hint = " ↑↓ file · PgUp/PgDn scroll · Enter jump · Esc close ";
     _ = p.putClipped(x0 + 2, y0 + box_h - 1, hint, box_w -| 4, theme.hint);
@@ -12357,13 +12356,13 @@ fn drawDiffViewer(p: *Painter, m: *const Model, width: u16, height: u16) void {
         const op_word = Model.fileIntelOpWord(e);
         const text = if (e.added == 0 and e.removed == 0)
             if (info.has)
-                (std.fmt.bufPrint(&line_buf, "{s}{s} [{s}] {s}  (unchanged)", .{ marker, op_word, info.label, path }) catch path)
+                (std.mem.print(&line_buf, "{s}{s} [{s}] {s}  (unchanged)", .{ marker, op_word, info.label, path }) catch path)
             else
-                (std.fmt.bufPrint(&line_buf, "{s}{s} {s}  (unchanged)", .{ marker, op_word, path }) catch path)
+                (std.mem.print(&line_buf, "{s}{s} {s}  (unchanged)", .{ marker, op_word, path }) catch path)
         else if (info.has)
-            (std.fmt.bufPrint(&line_buf, "{s}{s} [{s}] {s}  +{d} -{d}", .{ marker, op_word, info.label, path, e.added, e.removed }) catch path)
+            (std.mem.print(&line_buf, "{s}{s} [{s}] {s}  +{d} -{d}", .{ marker, op_word, info.label, path, e.added, e.removed }) catch path)
         else
-            (std.fmt.bufPrint(&line_buf, "{s}{s} {s}  +{d} -{d}", .{ marker, op_word, path, e.added, e.removed }) catch path);
+            (std.mem.print(&line_buf, "{s}{s} {s}  +{d} -{d}", .{ marker, op_word, path, e.added, e.removed }) catch path);
         const style = if (selected) theme.selected else theme.ink;
         _ = p.putClipped(x0 + 2, row, text, box_w -| 4, style);
     }
@@ -12530,7 +12529,7 @@ fn contextInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
     out.append(arena, .{ .text = label, .style = theme.status }) catch return null;
     out.append(arena, .{ .text = " ", .style = theme.status }) catch return null;
     var nb: [8]u8 = undefined;
-    const pct_txt = std.fmt.bufPrint(&nb, "{d}{s}%", .{ agent.ctx_pct, pct_suffix }) catch return null;
+    const pct_txt = std.mem.print(&nb, "{d}{s}%", .{ agent.ctx_pct, pct_suffix }) catch return null;
     // The percentage is printed with `putStable`, which does NOT copy the
     // bytes: `pct_txt` points at THIS frame's stack, and the renderer reads
     // the cells after the frame is over. It has to live in the frame's arena.
@@ -12547,7 +12546,7 @@ fn contextInfo(arena: std.mem.Allocator) ?[]const InfoSeg {
         out.append(arena, .{ .text = " ", .style = theme.status }) catch return null;
         const hit = cacheStats().hitRatePct();
         var hb: [8]u8 = undefined;
-        const hit_txt = std.fmt.bufPrint(&hb, "{d:.0}%", .{hit}) catch return out.items;
+        const hit_txt = std.mem.print(&hb, "{d:.0}%", .{hit}) catch return out.items;
         const owned_hit = arena.dupe(u8, hit_txt) catch return out.items;
         out.append(arena, .{ .text = owned_hit, .style = theme.status }) catch return null;
     }
@@ -12597,7 +12596,7 @@ fn verifycountsCountdown(m: *Model, buf: []u8) []const u8 {
     }
     const text = c.format(m.allocator) catch return "";
     defer m.allocator.free(text);
-    return std.fmt.bufPrint(buf, "· {s}", .{text}) catch "";
+    return std.mem.print(buf, "· {s}", .{text}) catch "";
 }
 
 fn drawSettingsScreen(p: *Painter, m: *Model, width: u16, height: u16) void {
@@ -12720,14 +12719,14 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
     var tbuf: [128]u8 = undefined;
     const pos = if (ps.total > 0) ps.sel + 1 else 0;
     const t1 = if (is_sessions)
-        (std.fmt.bufPrint(&tbuf, " {s}  ({d} of {d})", .{ ps.title, pos, ps.total }) catch " Resume")
+        (std.mem.print(&tbuf, " {s}  ({d} of {d})", .{ ps.title, pos, ps.total }) catch " Resume")
     else
-        (std.fmt.bufPrint(&tbuf, " {s}", .{ps.title}) catch " picker");
+        (std.mem.print(&tbuf, " {s}", .{ps.title}) catch " picker");
     _ = p.putText(x0 + 2, y0 + 1, t1, theme.accent_bold);
 
     var qbuf: [96]u8 = undefined;
     const q1 = if (ps.query.len > 0)
-        std.fmt.bufPrint(&qbuf, "filter: {s}_", .{ps.query}) catch "filter: _"
+        std.mem.print(&qbuf, "filter: {s}_", .{ps.query}) catch "filter: _"
     else
         "filter: (type to search)";
     _ = p.putText(x0 + 2, y0 + 2, q1, theme.dim);
@@ -12795,26 +12794,26 @@ fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
     if (ps.semantic_searching) {
         f1_text = "Searching…  ·  esc cancel";
     } else if (is_sessions and ps.query.len > 0) {
-        f1_text = std.fmt.bufPrint(
+        f1_text = std.mem.print(
             &fbuf,
             "\u{2191}\u{2193} nav · enter resume · ctrl+v preview · ctrl+s semantic · esc clears filter ({d}/{d})",
             .{ pos, ps.total },
         ) catch "esc clears filter · esc closes";
     } else if (is_sessions) {
         const sem = if (ps.semantic_mode) " · semantic" else "";
-        f1_text = std.fmt.bufPrint(
+        f1_text = std.mem.print(
             &fbuf,
             "\u{2191}\u{2193} nav · enter resume · ctrl+v preview · ctrl+a/b scope · ctrl+s semantic{s} · esc close ({d}/{d})",
             .{ sem, pos, ps.total },
         ) catch "enter resume · esc close";
     } else if (ps.query.len > 0) {
-        f1_text = std.fmt.bufPrint(
+        f1_text = std.mem.print(
             &fbuf,
             "\u{2191}\u{2193} navigate · enter select · esc clears filter · esc closes  ({d}/{d})",
             .{ pos, ps.total },
         ) catch "esc clears filter · esc closes";
     } else {
-        f1_text = std.fmt.bufPrint(
+        f1_text = std.mem.print(
             &fbuf,
             "\u{2191}\u{2193} navigate · enter select · esc close  ({d}/{d})",
             .{ pos, ps.total },
@@ -13247,7 +13246,7 @@ test "input: over the byte cap, the edit is rejected and the limit is named" {
     // The rejection note: painted inside the composer zone (the affected
     // zone), naming the limit. The key handler sets this exact state.
     m.input_too_long = true;
-    const msg = std.fmt.bufPrint(&m.input_err_buf, "Input too long: {d}-byte cap, {d} bytes already typed. Shorten the text and resend.", .{ ed.max_bytes, m.ed.text().len }) catch {
+    const msg = std.mem.print(&m.input_err_buf, "Input too long: {d}-byte cap, {d} bytes already typed. Shorten the text and resend.", .{ ed.max_bytes, m.ed.text().len }) catch {
         m.input_err = "Input too long: shorten the text.";
         return;
     };
@@ -14684,7 +14683,7 @@ test "scrollbar click and drag navigate absolute history positions" {
     defer m.deinit();
     for (0..80) |i| {
         var text: [32]u8 = undefined;
-        m.pushInfo(try std.fmt.bufPrint(&text, "history row {d}", .{i}));
+        m.pushInfo(try std.mem.print(&text, "history row {d}", .{i}));
     }
     const surface = try drawTest(&m, arena_state.allocator(), 80, 24);
     const bottom = m.max_offset;
@@ -14744,7 +14743,7 @@ test "losing focus or the pointer cancels the mouse gesture instead of stranding
     defer m.deinit();
     for (0..80) |i| {
         var text: [32]u8 = undefined;
-        m.pushInfo(try std.fmt.bufPrint(&text, "history row {d}", .{i}));
+        m.pushInfo(try std.mem.print(&text, "history row {d}", .{i}));
     }
     const surface = try drawTest(&m, arena_state.allocator(), 80, 24);
     try std.testing.expect(m.max_offset > 0);
@@ -14810,7 +14809,7 @@ test "a plain click does not fire the clipboard escape sequence" {
     defer m.deinit();
     for (0..40) |i| {
         var text: [32]u8 = undefined;
-        m.pushInfo(try std.fmt.bufPrint(&text, "history row {d}", .{i}));
+        m.pushInfo(try std.mem.print(&text, "history row {d}", .{i}));
     }
     _ = try drawTest(&m, arena_state.allocator(), 80, 24);
 
@@ -14949,7 +14948,7 @@ test "history height index tracks estimates, corrections, and cache resets" {
 
     for (0..257) |i| {
         var buf: [32]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buf, "history paragraph {d}", .{i});
+        const text = try std.mem.print(&buf, "history paragraph {d}", .{i});
         m.pushInfo(text);
     }
     _ = try drawTest(&m, arena_state.allocator(), 80, 24);
@@ -15072,7 +15071,7 @@ test "scroll: reading is not dragged away by the text that arrives" {
     var k: usize = 0;
     while (k < 12) : (k += 1) {
         var buf: [64]u8 = undefined;
-        m.streamDelta(std.fmt.bufPrint(&buf, "respuesta en vivo numero {d}", .{k}) catch "x");
+        m.streamDelta(std.mem.print(&buf, "respuesta en vivo numero {d}", .{k}) catch "x");
         _ = try drawTest(&m, arena_state.allocator(), 80, 24);
         try std.testing.expectEqual(held, m.first_visible);
     }
@@ -16270,7 +16269,7 @@ test "the palette owns the mouse while it is open" {
     defer m.deinit();
     for (0..80) |i| {
         var text: [32]u8 = undefined;
-        m.pushInfo(try std.fmt.bufPrint(&text, "history row {d}", .{i}));
+        m.pushInfo(try std.mem.print(&text, "history row {d}", .{i}));
     }
     const items = [_]palette.Item{
         .{ .kind = .command, .label = "/a" },
@@ -16325,7 +16324,7 @@ test "the prompt rail keeps the last six prompts, newest at the bottom" {
 
     for (0..8) |i| {
         var text: [32]u8 = undefined;
-        m.pushKind(.user, try std.fmt.bufPrint(&text, "prompt {d}", .{i}));
+        m.pushKind(.user, try std.mem.print(&text, "prompt {d}", .{i}));
         m.pushKind(.assistant, "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten");
     }
     m.show_prompt_dots = true;
@@ -16372,7 +16371,7 @@ test "clicking a prompt dot scrolls to that prompt instead of selecting text" {
 
     for (0..8) |i| {
         var text: [32]u8 = undefined;
-        m.pushKind(.user, try std.fmt.bufPrint(&text, "prompt {d}", .{i}));
+        m.pushKind(.user, try std.mem.print(&text, "prompt {d}", .{i}));
         m.pushKind(.assistant, "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten");
     }
     _ = try drawTest(&m, arena_state.allocator(), 80, 24);
@@ -16686,7 +16685,7 @@ test "layout: deep scroll re-parses the window and the text keeps coming out" {
     while (i < 200) : (i += 1) {
         var buf: [32]u8 = undefined;
         m.streamStart();
-        m.streamDelta(std.fmt.bufPrint(&buf, "marcador-{d}", .{i}) catch "x");
+        m.streamDelta(std.mem.print(&buf, "marcador-{d}", .{i}) catch "x");
         m.streamEnd();
     }
     // At the very bottom: you see the end.
@@ -16741,11 +16740,11 @@ test "a 300-line diff does not hang and is still ONE paragraph" {
     var n_after: usize = 0;
     var i: usize = 0;
     while (i < 300) : (i += 1) {
-        n_before += (std.fmt.bufPrint(before[n_before..], "linea {d}\n", .{i}) catch break).len;
+        n_before += (std.mem.print(before[n_before..], "linea {d}\n", .{i}) catch break).len;
     }
     i = 0;
     while (i < 300) : (i += 1) {
-        n_after += (std.fmt.bufPrint(after[n_after..], "linea {d}!\n", .{i}) catch break).len;
+        n_after += (std.mem.print(after[n_after..], "linea {d}!\n", .{i}) catch break).len;
     }
 
     _ = m.pushDiff(before[0..n_before], after[0..n_after]);
@@ -16777,8 +16776,8 @@ test "a long diff collapses into a preview, and Ctrl+R swaps it for the whole th
     var na: usize = 0;
     var i: usize = 0;
     while (i < 60) : (i += 1) {
-        nb += (std.fmt.bufPrint(before[nb..], "linea {d}\n", .{i}) catch break).len;
-        na += (std.fmt.bufPrint(after[na..], "linea {d}!\n", .{i}) catch break).len;
+        nb += (std.mem.print(before[nb..], "linea {d}\n", .{i}) catch break).len;
+        na += (std.mem.print(after[na..], "linea {d}!\n", .{i}) catch break).len;
     }
 
     m.pushToolStart("write", "src/demo.txt");
@@ -16879,8 +16878,8 @@ test "Ctrl+R on a paragraph that went COLD rehydrates it instead of corrupting i
     var na: usize = 0;
     var i: usize = 0;
     while (i < 80) : (i += 1) {
-        nb += (std.fmt.bufPrint(before[nb..], "line {d} with enough text for a realistic preview width\n", .{i}) catch break).len;
-        na += (std.fmt.bufPrint(after[na..], "line {d}! with enough text for a realistic preview width\n", .{i}) catch break).len;
+        nb += (std.mem.print(before[nb..], "line {d} with enough text for a realistic preview width\n", .{i}) catch break).len;
+        na += (std.mem.print(after[na..], "line {d}! with enough text for a realistic preview width\n", .{i}) catch break).len;
     }
 
     m.pushToolStart("write", "src/demo.txt");
@@ -18872,7 +18871,7 @@ test "scrolling past the segment cache cap leaves no cell pointing at a freed ar
     var i: usize = 0;
     while (i < 400) : (i += 1) {
         var line: [160]u8 = undefined;
-        const text = std.fmt.bufPrint(&line, "paragraph {d}: the quick brown fox jumps over the lazy dog " ++ repeat.rep("again ", 8), .{i}) catch "";
+        const text = std.mem.print(&line, "paragraph {d}: the quick brown fox jumps over the lazy dog " ++ repeat.rep("again ", 8), .{i}) catch "";
         m.pushKind(if (i % 2 == 0) .assistant else .tool_res, text);
     }
     m.drainPending();

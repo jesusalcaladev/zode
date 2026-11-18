@@ -157,7 +157,7 @@ pub fn parseImport(line: []const u8) ?[]const u8 {
 /// when the file cannot be read (missing/too big/unreadable).
 pub fn readExpandedAt(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ?[]u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch return null;
+    const path = std.mem.print(&path_buf, "{s}/{s}", .{ dir, name }) catch return null;
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_file_bytes)) catch return null;
     defer gpa.free(data);
 
@@ -249,7 +249,7 @@ test "expand: resolves imports relative to the importing file with temp-root fix
 
     const got = readExpandedAt(testing.allocator, testing.io, blk: {
         var p: [std.fs.max_path_bytes]u8 = undefined;
-        break :blk try std.fmt.bufPrint(&p, "{s}/proj/sub", .{root});
+        break :blk try std.mem.print(&p, "{s}/proj/sub", .{root});
     }, "AGENTS.md") orelse return error.TestUnexpectedResult;
     defer testing.allocator.free(got);
     try testing.expect(std.mem.indexOf(u8, got, "before") != null);
@@ -266,7 +266,7 @@ test "expand: missing import becomes a visible marker and does not fail the file
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
     var p: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&p, "{s}/p", .{root});
+    const dir = try std.mem.print(&p, "{s}/p", .{root});
     const got = readExpandedAt(testing.allocator, testing.io, dir, "AGENTS.md") orelse return error.TestUnexpectedResult;
     defer testing.allocator.free(got);
     try testing.expect(std.mem.indexOf(u8, got, "head") != null);
@@ -283,7 +283,7 @@ test "expand: cycle detection stops infinite recursion" {
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
     var p: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&p, "{s}/c", .{root});
+    const dir = try std.mem.print(&p, "{s}/c", .{root});
     const got = readExpandedAt(testing.allocator, testing.io, dir, "a.md") orelse return error.TestUnexpectedResult;
     defer testing.allocator.free(got);
     try testing.expect(std.mem.indexOf(u8, got, "A") != null);

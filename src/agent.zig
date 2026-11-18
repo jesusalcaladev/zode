@@ -610,7 +610,7 @@ fn planApprovalNudge(m: *tui.Model) ?[]u8 {
     var q_buf: [320]u8 = undefined;
     const pl = m.planCopy();
     const brief_note: []const u8 = if (pl.hasBrief()) " (includes objective/approach/guardrails)" else " (missing objective/approach/guardrails)";
-    const q = std.fmt.bufPrint(
+    const q = std.mem.print(
         &q_buf,
         "Plan ready: {d} step(s){s}. Approve it so zode can start implementing?",
         .{ pl.len, brief_note },
@@ -1171,7 +1171,7 @@ var hooks_arena: ?std.heap.ArenaAllocator = null;
 pub fn loadHooks() void {
     var hbuf: [640]u8 = undefined;
     const project_path = if (project_info.root()) |root|
-        std.fmt.bufPrint(&hbuf, "{s}/{s}", .{ root, project_hooks_file }) catch project_hooks_file
+        std.mem.print(&hbuf, "{s}/{s}", .{ root, project_hooks_file }) catch project_hooks_file
     else
         project_hooks_file;
     if (hooks_arena == null) hooks_arena = std.heap.ArenaAllocator.init(gpa_global);
@@ -1182,7 +1182,7 @@ pub fn loadPermRules() void {
     var pbuf: [512]u8 = undefined;
     var rbuf: [640]u8 = undefined;
     const project_path = if (project_info.root()) |root|
-        std.fmt.bufPrint(&rbuf, "{s}/{s}", .{ root, project_rules_file }) catch project_rules_file
+        std.mem.print(&rbuf, "{s}/{s}", .{ root, project_rules_file }) catch project_rules_file
     else
         project_rules_file;
     if (perm_rules_arena == null) perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
@@ -1712,7 +1712,7 @@ fn lastModelFilePath(buf: []u8) ?[]const u8 {
     const env = environ_global orelse return null;
     const home = env.get("HOME") orelse return null;
     if (home.len == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}/.config/zode/last_model", .{home}) catch null;
+    return std.mem.print(buf, "{s}/.config/zode/last_model", .{home}) catch null;
 }
 
 /// The file's two lines: provider, then model. An empty model line is honest —
@@ -1720,7 +1720,7 @@ fn lastModelFilePath(buf: []u8) ?[]const u8 {
 /// restores nothing for it.
 fn lastModelText(buf: []u8, provider: []const u8, model: []const u8) ?[]const u8 {
     if (provider.len == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}\n{s}\n", .{ provider, model }) catch null;
+    return std.mem.print(buf, "{s}\n{s}\n", .{ provider, model }) catch null;
 }
 
 /// The other half of the round trip. Anything malformed answers "nothing to
@@ -3243,7 +3243,7 @@ fn userCmdRoots(
     if (env) |e| {
         if (e.get("HOME")) |home| {
             if (home.len > 0) {
-                if (std.fmt.bufPrint(buf, "{s}/.config/{s}", .{ home, usercmds_mod.user_subdir })) |p| {
+                if (std.mem.print(buf, "{s}/.config/{s}", .{ home, usercmds_mod.user_subdir })) |p| {
                     out[n] = p;
                     n += 1;
                 } else |_| {}
@@ -3405,7 +3405,7 @@ fn runUserCommand(m: *tui.Model, idx: usize, arg: ?[]const u8) !void {
         return;
     }
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.md", .{ roots[e.root], e.name() }) catch {
+    const path = std.mem.print(&path_buf, "{s}/{s}.md", .{ roots[e.root], e.name() }) catch {
         m.pushInfoFmt("{s}: path too long", .{e.key()});
         return;
     };
@@ -4314,9 +4314,9 @@ fn aiTitleWorker(job: *AiTitleJob) void {
     // Build request.
     var url_buf: [1024]u8 = undefined;
     const url = if (job.kind == .anthropic)
-        (std.fmt.bufPrint(&url_buf, "{s}/messages", .{job.base_url}) catch return)
+        (std.mem.print(&url_buf, "{s}/messages", .{job.base_url}) catch return)
     else
-        (std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{job.base_url}) catch return);
+        (std.mem.print(&url_buf, "{s}/chat/completions", .{job.base_url}) catch return);
 
     const sys =
         "Generate a short session title for this coding conversation. " ++
@@ -5013,7 +5013,7 @@ fn maybeProposeMemories(m: *tui.Model) void {
         var id_buf: [80]u8 = undefined;
         const use_id = if (id.len > 0) sanitizeMemoryId(id, &id_buf) else blk: {
             const ts = std.Io.Timestamp.now(io_global, .real).toSeconds();
-            break :blk std.fmt.bufPrint(&id_buf, "proposal-{d}-{d}", .{ ts, saved }) catch "proposal";
+            break :blk std.mem.print(&id_buf, "proposal-{d}-{d}", .{ ts, saved }) catch "proposal";
         };
 
         const cwd = project_info.cwd();
@@ -6011,7 +6011,7 @@ fn planFileStatMtime(m: *tui.Model) i96 {
     if (!m.io_ready) return 0;
     var path_buf: [512]u8 = undefined;
     const path = if (session) |s|
-        std.fmt.bufPrint(&path_buf, ".zode/plans/{s}.md", .{s.id[0..]}) catch ".zode/plans/current.md"
+        std.mem.print(&path_buf, ".zode/plans/{s}.md", .{s.id[0..]}) catch ".zode/plans/current.md"
     else
         ".zode/plans/current.md";
     const st = std.Io.Dir.cwd().statFile(io_global, path, .{}) catch return 0;
@@ -6034,7 +6034,7 @@ fn writePlanFile(m: *tui.Model) void {
     if (plan.isEmpty()) return;
     var path_buf: [512]u8 = undefined;
     const path = if (session) |s|
-        std.fmt.bufPrint(&path_buf, ".zode/plans/{s}.md", .{s.id[0..]}) catch ".zode/plans/current.md"
+        std.mem.print(&path_buf, ".zode/plans/{s}.md", .{s.id[0..]}) catch ".zode/plans/current.md"
     else
         ".zode/plans/current.md";
     var arena_state = std.heap.ArenaAllocator.init(m.allocator);
@@ -6071,7 +6071,7 @@ fn loadPlanFile(m: *tui.Model) void {
     if (!m.io_ready) return;
     var path_buf: [512]u8 = undefined;
     const path = if (session) |s|
-        std.fmt.bufPrint(&path_buf, ".zode/plans/{s}.md", .{s.id[0..]}) catch ".zode/plans/current.md"
+        std.mem.print(&path_buf, ".zode/plans/{s}.md", .{s.id[0..]}) catch ".zode/plans/current.md"
     else
         ".zode/plans/current.md";
     var arena_state = std.heap.ArenaAllocator.init(m.allocator);
@@ -6587,12 +6587,12 @@ fn announceMentionsInlined(m: *tui.Model, mentions_in: MentionCount, iteration: 
     if (!(mentions_in.files > 0 and iteration == 0)) return;
     var note_buf: [160]u8 = undefined;
     const note = if (mentions_in.missing > 0)
-        std.fmt.bufPrint(&note_buf, "@file: {d} inlined with the prompt, {d} not found", .{
+        std.mem.print(&note_buf, "@file: {d} inlined with the prompt, {d} not found", .{
             mentions_in.files,
             mentions_in.missing,
         }) catch "@file: inlined"
     else
-        std.fmt.bufPrint(&note_buf, "@file: {d} inlined with the prompt", .{
+        std.mem.print(&note_buf, "@file: {d} inlined with the prompt", .{
             mentions_in.files,
         }) catch "@file: inlined";
     pushInfo(m, note);
@@ -7226,7 +7226,7 @@ fn scheduleCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _are
         if (cron_v != .string or prompt_v != .string) return schedReply(m, s, call, arena, budget, "cron and prompt must be strings.", "bad arguments");
         const once = if (obj.get("once")) |v| (v == .bool and v.bool) else false;
         var id_buf: [32]u8 = undefined;
-        const id = std.fmt.bufPrint(&id_buf, "s{d}", .{m.schedule_store.len + 1}) catch "s1";
+        const id = std.mem.print(&id_buf, "s{d}", .{m.schedule_store.len + 1}) catch "s1";
         m.schedule_store.add(id, cron_v.string, prompt_v.string, once) catch |err| {
             const text = tools_mod.describeError(arena, err, "schedule", call.args_json);
             return schedReply(m, s, call, arena, budget, text, "add refused");
@@ -7942,7 +7942,7 @@ fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
             var id_buf: [64]u8 = undefined;
             const use_id = if (id.len > 0) id else blk: {
                 const ts = std.Io.Timestamp.now(io_global, .real).toSeconds();
-                break :blk std.fmt.bufPrint(&id_buf, "proposal-{d}", .{ts}) catch "proposal";
+                break :blk std.mem.print(&id_buf, "proposal-{d}", .{ts}) catch "proposal";
             };
             s2.savePending(use_id, use_title, tags, "proposed by agent; user approval required", body) catch {
                 out = @constCast("Could not save the memory proposal.");
@@ -8032,7 +8032,7 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: s
                 const opt = question.options[0];
                 m.bench.asks_auto += 1;
                 const head = if (opt.len > 48) opt[0..48] else opt;
-                sum = std.fmt.bufPrint(&sum_buf, "answered for you (yolo): {s}{s}", .{
+                sum = std.mem.print(&sum_buf, "answered for you (yolo): {s}{s}", .{
                     head,
                     if (opt.len > 48) "…" else "",
                 }) catch "answered for you (yolo)";
@@ -8041,7 +8041,7 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: s
             .leave_open => blk: {
                 m.bench.asks_open += 1;
                 turn_stats.noteYoloOpen(question.question);
-                sum = std.fmt.bufPrint(&sum_buf, "left open (yolo): {s}", .{
+                sum = std.mem.print(&sum_buf, "left open (yolo): {s}", .{
                     if (question.header.len > 0) question.header else "the question",
                 }) catch "left open (yolo)";
                 break :blk ask.formatYoloDeferred(&ybuf);
@@ -8079,7 +8079,7 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: s
         // result: the history line next to `ask(...)` has to read as what they
         // said, not as what zode told the model about it.
         const head = if (t.len > 60) t[0..60] else t;
-        sum = std.fmt.bufPrint(&sum_buf, "{s}{s}", .{ head, if (t.len > 60) "…" else "" }) catch "answer";
+        sum = std.mem.print(&sum_buf, "{s}{s}", .{ head, if (t.len > 60) "…" else "" }) catch "answer";
     }
     if (answer) |a| m.allocator.free(a);
 
@@ -8538,9 +8538,9 @@ fn runTaskBatch(
     const limit = taskParallelLimit(m);
     var lbl: [96]u8 = undefined;
     const label = if (n == 1)
-        std.fmt.bufPrint(&lbl, "1 search in a subagent", .{}) catch "searching"
+        std.mem.print(&lbl, "1 search in a subagent", .{}) catch "searching"
     else
-        std.fmt.bufPrint(&lbl, "{d} searches in parallel", .{n}) catch "searching";
+        std.mem.print(&lbl, "{d} searches in parallel", .{n}) catch "searching";
     setStatusWithZo(m, .tooling, label);
     m.toolRunEnd();
 
@@ -8925,7 +8925,7 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             .ok => |t| pick = t,
             .why => |why_not| {
                 var nbuf: [440]u8 = undefined;
-                const note = std.fmt.bufPrint(
+                const note = std.mem.print(
                     &nbuf,
                     "[subagent note: the skill's model {s} was not used ({s}). Running on the default target.]",
                     .{ task.model, why_not },
@@ -8955,7 +8955,7 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             var nbuf: [440]u8 = undefined;
             var note_text: []const u8 = "[subagent note: the skill's allowed_tools was not valid.]";
             if (err == subagent_mod.ParseError.ToolNotReadOnly) {
-                const n = std.fmt.bufPrint(&nbuf, "[subagent note: the skill asked for tools outside the read-only set, so it cannot run.]", .{}) catch "[subagent note: the skill's tools were not accepted.]";
+                const n = std.mem.print(&nbuf, "[subagent note: the skill asked for tools outside the read-only set, so it cannot run.]", .{}) catch "[subagent note: the skill's tools were not accepted.]";
                 note_text = n;
             }
             rep.setNote(note_text);
@@ -9215,7 +9215,7 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
                 }
                 if (subagent_id.len > 0) {
                     var idnote: [96]u8 = undefined;
-                    const n = std.fmt.bufPrint(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
+                    const n = std.mem.print(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
                     if (n.len > 0) rep.setNote(n);
                 }
                 const partial = subagent_mod.formatReport(tstate.text.items, rep);
@@ -9313,7 +9313,7 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
             }
             if (subagent_id.len > 0) {
                 var idnote: [96]u8 = undefined;
-                const n = std.fmt.bufPrint(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
+                const n = std.mem.print(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
                 if (n.len > 0 and rep.note().len == 0) rep.setNote(n);
             }
             const out = subagent_mod.formatReport(tstate.text.items, rep);
@@ -9502,7 +9502,7 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
         }
         if (subagent_id.len > 0) {
             var idnote: [96]u8 = undefined;
-            const n = std.fmt.bufPrint(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
+            const n = std.mem.print(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
             if (n.len > 0 and rep.note().len == 0) rep.setNote(n);
         }
         const out = subagent_mod.formatReport(tstate.text.items, rep);
@@ -9516,7 +9516,7 @@ pub fn runSubagent(m: *tui.Model, task: subagent_mod.Task, rep: *subagent_mod.Re
     }
     if (subagent_id.len > 0) {
         var idnote: [96]u8 = undefined;
-        const n = std.fmt.bufPrint(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
+        const n = std.mem.print(&idnote, "[subagent id: {s} — pass resume=\"{s}\" to continue, or fork=\"{s}\" to copy]", .{ subagent_id, subagent_id, subagent_id }) catch "";
         if (n.len > 0 and rep.note().len == 0) rep.setNote(n);
     }
     return subagent_mod.refused("it ran out of steps without reporting anything", rep);
@@ -9590,7 +9590,7 @@ fn findToolJson(all: []const u8, name: []const u8) ?[]const u8 {
         const end = bgproc_matchObject(all, i) orelse return null;
         const span = all[i..end];
         var key_buf: [80]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "\"name\":\"{s}\"", .{name}) catch return null;
+        const key = std.mem.print(&key_buf, "\"name\":\"{s}\"", .{name}) catch return null;
         if (std.mem.indexOf(u8, span, key) != null) return span;
         i = end;
     }
@@ -11786,7 +11786,7 @@ pub fn openColorPicker(m: *tui.Model) void {
         items[i] = .{ .label = gpa.dupe(u8, n) catch return, .desc = desc };
     }
     var title_buf: [96]u8 = undefined;
-    const title = std.fmt.bufPrint(&title_buf, "diff palette · {s}", .{
+    const title = std.mem.print(&title_buf, "diff palette · {s}", .{
         if (theme.caps.no_color) "no color (NO_COLOR)" else if (theme.caps.daltonized) "daltonized" else "default",
     }) catch "diff palette";
     m.openPicker(4, title, items, onColorPick);
@@ -12321,7 +12321,7 @@ fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
             for (sorted) |mi| {
                 var hint_buf: [32]u8 = undefined;
                 const hint: []const u8 = if (mi.is_free) "free" else if (mi.context_length > 0)
-                    std.fmt.bufPrint(&hint_buf, "{d}k", .{mi.context_length / 1024}) catch ""
+                    std.mem.print(&hint_buf, "{d}k", .{mi.context_length / 1024}) catch ""
                 else
                     "";
                 const label = gpa.dupe(u8, mi.id) catch {
@@ -12364,7 +12364,7 @@ fn buildModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
                 for (sorted) |mi| {
                     var hint_buf: [32]u8 = undefined;
                     const hint: []const u8 = if (mi.is_free) "free" else if (mi.context_length > 0)
-                        std.fmt.bufPrint(&hint_buf, "{d}k", .{mi.context_length / 1024}) catch ""
+                        std.mem.print(&hint_buf, "{d}k", .{mi.context_length / 1024}) catch ""
                     else
                         "";
                     const label = gpa.dupe(u8, mi.id) catch continue;
@@ -12441,7 +12441,7 @@ fn buildModeTitlePart(m: *tui.Model, buf: *[128]u8) []const u8 {
 
     if (parts.items.len == 0) return "";
     const joined = std.mem.join(m.allocator, " · ", parts.items) catch return "";
-    return std.fmt.bufPrint(buf, "{s}", .{joined}) catch "";
+    return std.mem.print(buf, "{s}", .{joined}) catch "";
 }
 
 fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
@@ -12472,7 +12472,7 @@ fn openModelPalette(m: *tui.Model, list: []models_mod.Model) void {
     const mode_part = buildModeTitlePart(m, &title_buf);
     if (m.pal.custom_title.len > 0) m.allocator.free(m.pal.custom_title);
     if (mode_part.len > 0) {
-        const title = std.fmt.bufPrint(&title_buf, "Choose a model · {s}", .{mode_part}) catch "Choose a model";
+        const title = std.mem.print(&title_buf, "Choose a model · {s}", .{mode_part}) catch "Choose a model";
         m.pal.custom_title = m.allocator.dupe(u8, title) catch "";
     } else {
         m.pal.custom_title = "";
@@ -12494,7 +12494,7 @@ fn fallbackModelItems(m: *tui.Model, list: []models_mod.Model) ?[]palette.Item {
     for (list) |mi| {
         var hint_buf: [32]u8 = undefined;
         const hint: []const u8 = if (isFree(mi)) "free" else if (mi.context_length > 0)
-            std.fmt.bufPrint(&hint_buf, "{d}k", .{mi.context_length / 1024}) catch ""
+            std.mem.print(&hint_buf, "{d}k", .{mi.context_length / 1024}) catch ""
         else
             "";
         items[i] = .{
@@ -12582,9 +12582,9 @@ pub fn openEffortPicker(m: *tui.Model) void {
     // to `high` and another one to `xhigh` — the picker shows it.
     var title_buf: [128]u8 = undefined;
     const title = if (chat.effortSupport(cur_model) == .none)
-        std.fmt.bufPrint(&title_buf, "effort · {s} (no effort control)", .{cur_model}) catch "effort"
+        std.mem.print(&title_buf, "effort · {s} (no effort control)", .{cur_model}) catch "effort"
     else
-        std.fmt.bufPrint(&title_buf, "effort · {s} goes up to {s}", .{
+        std.mem.print(&title_buf, "effort · {s} goes up to {s}", .{
             cur_model,
             chat.maxEffortFor(cur_model).label(),
         }) catch "effort";
@@ -13103,7 +13103,7 @@ pub fn removeProviderKey(m: *tui.Model, provider: []const u8) void {
         return;
     };
     var path_buf: [1200]u8 = undefined;
-    const auth_path = std.fmt.bufPrint(&path_buf, "{s}/auth.json", .{dir_path}) catch return;
+    const auth_path = std.mem.print(&path_buf, "{s}/auth.json", .{dir_path}) catch return;
 
     var astate = std.heap.ArenaAllocator.init(gpa);
     defer astate.deinit();
@@ -13185,7 +13185,7 @@ pub fn storeKey(m: *tui.Model, provider: []const u8, key: []const u8) void {
         return;
     };
     var path_buf: [1200]u8 = undefined;
-    const auth_path = std.fmt.bufPrint(&path_buf, "{s}/auth.json", .{dir_path}) catch return;
+    const auth_path = std.mem.print(&path_buf, "{s}/auth.json", .{dir_path}) catch return;
 
     var astate = std.heap.ArenaAllocator.init(gpa);
     defer astate.deinit();
@@ -14813,12 +14813,12 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
     var head_buf: [256]u8 = undefined;
-    const dotgit = try std.fmt.bufPrint(&head_buf, "{s}/.git", .{root});
+    const dotgit = try std.mem.print(&head_buf, "{s}/.git", .{root});
     // The `.git` has to exist as a DIRECTORY before writing HEAD inside it:
     // `writeFile` does not create the parent and fails with FileNotFound.
     try std.Io.Dir.cwd().createDirPath(io_global, dotgit);
     var head_buf2: [256]u8 = undefined;
-    const head = try std.fmt.bufPrint(&head_buf2, "{s}/HEAD", .{dotgit});
+    const head = try std.mem.print(&head_buf2, "{s}/HEAD", .{dotgit});
     try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = head, .data = "ref: refs/heads/my-branch\n" });
 
     setProjectInfoForTest(io_global, root);
@@ -14865,7 +14865,7 @@ test "prompt: the REPO's AGENTS.md is used when the cwd has none of its own" {
     try std.Io.Dir.cwd().createDirPath(io_global, root);
 
     var agents_buf: [256]u8 = undefined;
-    const agents = try std.fmt.bufPrint(&agents_buf, "{s}/AGENTS.md", .{root});
+    const agents = try std.mem.print(&agents_buf, "{s}/AGENTS.md", .{root});
     try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = agents, .data = "REGLA DEL REPO" });
 
     const got = prompt_system.readAgentsIn(std.testing.allocator, io_global, root) orelse return error.TestUnexpectedResult;
@@ -14906,7 +14906,7 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
     const root = "/tmp/zode-skills-mtime-test";
     std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
     var skill_dir: [256]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&skill_dir, "{s}/.zode/skills/nuevo", .{root});
+    const dir = try std.mem.print(&skill_dir, "{s}/.zode/skills/nuevo", .{root});
     try std.Io.Dir.cwd().createDirPath(io_global, dir);
     defer std.Io.Dir.cwd().deleteTree(io_global, root) catch {};
 
@@ -14925,7 +14925,7 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
     // 2) One project skill appears. The root's `stat` has changed, so it has to show up
     //    without restarting anything.
     var skill_file: [512]u8 = undefined;
-    const skill_path = try std.fmt.bufPrint(&skill_file, "{s}/SKILL.md", .{dir});
+    const skill_path = try std.mem.print(&skill_file, "{s}/SKILL.md", .{dir});
     try std.Io.Dir.cwd().writeFile(io_global, .{ .sub_path = skill_path, .data = "---\ndescription: recien creado\n---\nbody\n" });
 
     const found = discoverSkills(std.testing.allocator, null);
@@ -15019,7 +15019,7 @@ test "tools: the schema announces the 5 new tools" {
     const json = tools_mod.toolsJson();
     for ([_][]const u8{ "ask", "skill", "task", "bash_output", "bash_kill" }) |name| {
         var key_buf: [32]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "\"name\":\"{s}\"", .{name}) catch unreachable;
+        const key = std.mem.print(&key_buf, "\"name\":\"{s}\"", .{name}) catch unreachable;
         try std.testing.expect(std.mem.indexOf(u8, json, key) != null);
     }
     // And `run_in_background` is in `bash`'s schema, which is where it is decided.
@@ -18259,7 +18259,7 @@ test "a project rule allows what the sensitive table asks about" {
     var pbuf: [512]u8 = undefined;
     const n = tmp.dir.realPath(io, &pbuf) catch return error.TestUnexpectedResult;
     var fbuf: [640]u8 = undefined;
-    const path = std.fmt.bufPrint(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
+    const path = std.mem.print(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
 
     // The rules are a global and the next test reads them: the state is put
     // back the way it was.
@@ -18297,7 +18297,7 @@ test "a rule that denies beats a rule that allows" {
     var pbuf: [512]u8 = undefined;
     const n = tmp.dir.realPath(io, &pbuf) catch return error.TestUnexpectedResult;
     var fbuf: [640]u8 = undefined;
-    const path = std.fmt.bufPrint(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
+    const path = std.mem.print(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
 
     const saved = perm_rules;
     defer perm_rules = saved;
@@ -18325,7 +18325,7 @@ test "a dontAsk rule means the model answers for itself, no dialog" {
     var pbuf: [512]u8 = undefined;
     const n = tmp.dir.realPath(io, &pbuf) catch return error.TestUnexpectedResult;
     var fbuf: [640]u8 = undefined;
-    const path = std.fmt.bufPrint(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
+    const path = std.mem.print(&fbuf, "{s}/.zode/permissions.json", .{pbuf[0..n]}) catch return error.TestUnexpectedResult;
 
     const saved = perm_rules;
     defer perm_rules = saved;
@@ -19558,7 +19558,7 @@ pub fn createAgentFromSettings(m: *tui.Model) void {
     var name_buf: [32]u8 = undefined;
     var name: []const u8 = "";
     while (n <= 999) : (n += 1) {
-        const candidate = std.fmt.bufPrint(&name_buf, "agent-{d}", .{n}) catch break;
+        const candidate = std.mem.print(&name_buf, "agent-{d}", .{n}) catch break;
         if (agentdefs.find(defs, candidate) == null) {
             name = candidate;
             break;

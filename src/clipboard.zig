@@ -133,7 +133,7 @@ fn pathExists(ctx: ?*const anyopaque, tool: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
-        const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, tool }) catch continue;
+        const full = std.mem.print(&buf, "{s}/{s}", .{ dir, tool }) catch continue;
         const st = std.Io.Dir.cwd().statFile(finder.io, full, .{}) catch continue;
         if (st.kind != .file and st.kind != .sym_link) continue;
         if (comptime std.Io.File.Permissions.has_executable_bit) {

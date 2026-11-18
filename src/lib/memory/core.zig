@@ -235,7 +235,7 @@ pub fn consult(gpa: std.mem.Allocator, entries: []const Entry, query: []const u8
         try out.appendSlice(gpa, "\n(no matching memories)\n");
     } else if (omitted > 0) {
         var note_buf: [96]u8 = undefined;
-        const note = std.fmt.bufPrint(&note_buf, "\n({d} matching memories omitted: outside consultation budget)\n", .{omitted}) catch "";
+        const note = std.mem.print(&note_buf, "\n({d} matching memories omitted: outside consultation budget)\n", .{omitted}) catch "";
         if (out.items.len + note.len <= budget_bytes) try out.appendSlice(gpa, note);
     }
     return .{ .text = try out.toOwnedSlice(gpa), .included = included, .omitted = omitted };
@@ -350,7 +350,7 @@ fn pathExists(io: std.Io, cwd: []const u8, repo_root: ?[]const u8, path: []const
     if (d) |*dd| { dd.close(io); return true; }
     if (cwd.len > 0 and path[0] != '/') {
         var b1: [std.fs.max_path_bytes]u8 = undefined;
-        if (std.fmt.bufPrint(&b1, "{s}/{s}", .{ cwd, path })) |p| {
+        if (std.mem.print(&b1, "{s}/{s}", .{ cwd, path })) |p| {
             f = std.Io.Dir.cwd().openFile(io, p, .{}) catch null;
             if (f) |*ff| { ff.close(io); return true; }
             d = std.Io.Dir.cwd().openDir(io, p, .{}) catch null;
@@ -360,7 +360,7 @@ fn pathExists(io: std.Io, cwd: []const u8, repo_root: ?[]const u8, path: []const
     if (repo_root) |root| {
         if (root.len > 0 and path[0] != '/') {
             var b2: [std.fs.max_path_bytes]u8 = undefined;
-            if (std.fmt.bufPrint(&b2, "{s}/{s}", .{ root, path })) |p| {
+            if (std.mem.print(&b2, "{s}/{s}", .{ root, path })) |p| {
                 f = std.Io.Dir.cwd().openFile(io, p, .{}) catch null;
                 if (f) |*ff| { ff.close(io); return true; }
                 d = std.Io.Dir.cwd().openDir(io, p, .{}) catch null;

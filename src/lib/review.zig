@@ -173,7 +173,7 @@ test "the checklist tells the model what the harness already did, so it does not
     // Every item is in there, in order, numbered from one.
     for (items, 0..) |it, i| {
         var needle: [96]u8 = undefined;
-        const n = try std.fmt.bufPrint(&needle, "{d}. {s}", .{ i + 1, it.what });
+        const n = try std.mem.print(&needle, "{d}. {s}", .{ i + 1, it.what });
         try t.expect(std.mem.indexOf(u8, out, n) != null);
     }
     // The reason travels with the item, because the reason is the part that works.

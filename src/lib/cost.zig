@@ -188,10 +188,10 @@ pub fn unpricedCount(rows: []const Row) usize {
 /// as zero is a bill that reads as free.
 pub fn formatUsd(buf: []u8, value: f64) []const u8 {
     if (!std.math.isFinite(value)) return "n/a";
-    if (value <= 0) return std.fmt.bufPrint(buf, "$0.00", .{}) catch "$0.00";
-    if (value >= 1) return std.fmt.bufPrint(buf, "${d:.2}", .{value}) catch "n/a";
-    if (value >= 0.01) return std.fmt.bufPrint(buf, "${d:.4}", .{value}) catch "n/a";
-    if (value >= 0.0001) return std.fmt.bufPrint(buf, "${d:.6}", .{value}) catch "n/a";
+    if (value <= 0) return std.mem.print(buf, "$0.00", .{}) catch "$0.00";
+    if (value >= 1) return std.mem.print(buf, "${d:.2}", .{value}) catch "n/a";
+    if (value >= 0.01) return std.mem.print(buf, "${d:.4}", .{value}) catch "n/a";
+    if (value >= 0.0001) return std.mem.print(buf, "${d:.6}", .{value}) catch "n/a";
     return "<$0.0001";
 }
 
@@ -398,7 +398,7 @@ test "cost: past the cap the tokens go to the spill row, they do not vanish" {
     var buf: [32]u8 = undefined;
     var i: usize = 0;
     while (i < max_models) : (i += 1) {
-        const id = std.fmt.bufPrint(&buf, "model-{d}", .{i}) catch unreachable;
+        const id = std.mem.print(&buf, "model-{d}", .{i}) catch unreachable;
         t.record(id, 100, 10);
     }
     try std.testing.expectEqual(max_models, t.len);

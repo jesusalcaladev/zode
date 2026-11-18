@@ -301,7 +301,7 @@ pub fn statusLine(self: *Registry, out: []u8) []const u8 {
         if (j.state == .running) n += 1;
     }
     if (n == 0) return "";
-    return std.fmt.bufPrint(out, "{d} bg", .{n}) catch "";
+    return std.mem.print(out, "{d} bg", .{n}) catch "";
 }
 
 fn lockSlot(j: *Job) void {
@@ -753,7 +753,7 @@ pub fn spawn(
     @memcpy(j.cmd_buf[0..j.cmd_len], command[0..j.cmd_len]);
     if (reg.output_base) |base| {
         var pbuf: [max_output_path]u8 = undefined;
-        if (std.fmt.bufPrint(&pbuf, "{s}/bg-{d}.out", .{ base, j.id })) |p| {
+        if (std.mem.print(&pbuf, "{s}/bg-{d}.out", .{ base, j.id })) |p| {
             j.output_path_len = @min(p.len, max_output_path);
             @memcpy(j.output_path_buf[0..j.output_path_len], p[0..j.output_path_len]);
             _ = std.Io.Dir.cwd().createDirPathStatus(io, base, @fromBackingInt(@intCast(0o700))) catch {};
@@ -1242,7 +1242,7 @@ test "spawn: the child LEADS its process group (or ESC cannot kill it)" {
 /// `readSliceShort` over a fixed buffer, which asks the kernel and not `stat`.
 fn procPgrp(io: std.Io, pid: std.posix.pid_t) !i64 {
     var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return error.NoPath;
+    const path = std.mem.print(&path_buf, "/proc/{d}/stat", .{pid}) catch return error.NoPath;
 
     var f = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer f.close(io);

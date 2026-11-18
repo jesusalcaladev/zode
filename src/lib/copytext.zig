@@ -103,12 +103,12 @@ pub fn formatRefusal(buf: []u8, sel: Select, arg: ?[]const u8) []const u8 {
     return switch (sel) {
         .found => "",
         .no_messages => no_messages_msg,
-        .usage => std.fmt.bufPrint(
+        .usage => std.mem.print(
             buf,
             "Usage: /copy [N] where N is 1 (latest), 2, 3, \u{2026} Got: {s}",
             .{std.mem.trim(u8, arg orelse "", " \t\r\n")},
         ) catch "Usage: /copy [N] where N is 1 (latest), 2, 3, \u{2026}",
-        .too_few => |avail| std.fmt.bufPrint(
+        .too_few => |avail| std.mem.print(
             buf,
             "Only {d} assistant {s} available to copy",
             .{ avail, if (avail == 1) "message" else "messages" },
@@ -389,7 +389,7 @@ pub fn buildCtx(gpa: std.mem.Allocator, text: []const u8) !Ctx {
 // ── the sentences the user reads ──────────────────────────────────────────
 
 pub fn formatFullLabel(buf: []u8, chars: usize, lines: usize) []const u8 {
-    return std.fmt.bufPrint(buf, "{s} ({d} characters, {d} lines)", .{ full_label_prefix, chars, lines }) catch full_label_prefix;
+    return std.mem.print(buf, "{s} ({d} characters, {d} lines)", .{ full_label_prefix, chars, lines }) catch full_label_prefix;
 }
 
 /// The picker's description for a block: `zig, 40 lines` / `40 lines` / `zig`
@@ -397,9 +397,9 @@ pub fn formatFullLabel(buf: []u8, chars: usize, lines: usize) []const u8 {
 pub fn formatBlockDesc(buf: []u8, lang: []const u8, code: []const u8) []const u8 {
     const lines = countLines(code);
     if (lang.len == 0 and lines <= 1) return "";
-    if (lang.len == 0) return std.fmt.bufPrint(buf, "{d} lines", .{lines}) catch "";
-    if (lines <= 1) return std.fmt.bufPrint(buf, "{s}", .{lang}) catch "";
-    return std.fmt.bufPrint(buf, "{s}, {d} lines", .{ lang, lines }) catch "";
+    if (lang.len == 0) return std.mem.print(buf, "{d} lines", .{lines}) catch "";
+    if (lines <= 1) return std.mem.print(buf, "{s}", .{lang}) catch "";
+    return std.mem.print(buf, "{s}, {d} lines", .{ lang, lines }) catch "";
 }
 
 /// "Copied to clipboard (8123 characters, 214 lines) — also written to …".
@@ -407,17 +407,17 @@ pub fn formatBlockDesc(buf: []u8, lang: []const u8, code: []const u8) []const u8
 /// best-effort (OSC 52 is genuinely best-effort) and a copy confirmation you
 /// cannot check is not a confirmation.
 pub fn formatCopied(buf: []u8, chars: usize, lines: usize, path: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Copied to clipboard ({d} characters, {d} lines) \u{2014} also written to {s}", .{ chars, lines, path }) catch
+    return std.mem.print(buf, "Copied to clipboard ({d} characters, {d} lines) \u{2014} also written to {s}", .{ chars, lines, path }) catch
         "Copied to clipboard";
 }
 
 pub fn formatCopiedBare(buf: []u8, chars: usize, lines: usize) []const u8 {
-    return std.fmt.bufPrint(buf, "Copied to clipboard ({d} characters, {d} lines)", .{ chars, lines }) catch
+    return std.mem.print(buf, "Copied to clipboard ({d} characters, {d} lines)", .{ chars, lines }) catch
         "Copied to clipboard";
 }
 
 pub fn formatWritten(buf: []u8, chars: usize, lines: usize, path: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "Written to {s} ({d} characters, {d} lines)", .{ path, chars, lines }) catch "Written to a file";
+    return std.mem.print(buf, "Written to {s} ({d} characters, {d} lines)", .{ path, chars, lines }) catch "Written to a file";
 }
 
 /// The message of a copy whose FILE could not be written.
@@ -425,7 +425,7 @@ pub fn formatWritten(buf: []u8, chars: usize, lines: usize, path: []const u8) []
 /// The clipboard half may still have worked, so the message says what DID
 /// happen and what did not: a failed write is shown, not swallowed.
 pub fn formatCopiedNoFile(buf: []u8, chars: usize, lines: usize, method: []const u8) []const u8 {
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "Copied to {s} ({d} characters, {d} lines) \u{2014} the file could not be written",
         .{ method, chars, lines },
@@ -438,7 +438,7 @@ pub fn formatCopiedNoFile(buf: []u8, chars: usize, lines: usize, method: []const
 /// confirmation: OSC 52 is best-effort (the terminal may ignore it, or print
 /// it), and a native tool is not the same thing as a terminal's own buffer.
 pub fn formatCopiedVia(buf: []u8, chars: usize, lines: usize, method: []const u8, path: []const u8) []const u8 {
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "Copied to {s} ({d} characters, {d} lines) \u{2014} also written to {s}",
         .{ method, chars, lines, path },
@@ -474,7 +474,7 @@ test "collectBackward: caps at max_lookback, newest first" {
     var texts: [max_lookback + 5][8]u8 = undefined;
     var views: [max_lookback + 5]View = undefined;
     for (&views, 0..) |*v, i| {
-        const s = std.fmt.bufPrint(&texts[i], "a{d}", .{i}) catch unreachable;
+        const s = std.mem.print(&texts[i], "a{d}", .{i}) catch unreachable;
         v.* = .{ .assistant = true, .content = s };
     }
     var out: [max_lookback][]const u8 = undefined;

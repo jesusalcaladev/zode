@@ -99,7 +99,7 @@ fn score(candidate: Entry, query: []const u8, query_terms: []const []const u8) u
 
     // The exact `server.tool` is the strongest signal there is.
     var qualified_buf: [512]u8 = undefined;
-    const qualified = std.fmt.bufPrint(&qualified_buf, "{s}.{s}", .{ candidate.server, candidate.name }) catch "";
+    const qualified = std.mem.print(&qualified_buf, "{s}.{s}", .{ candidate.server, candidate.name }) catch "";
     if (qualified.len > 0 and std.ascii.eqlIgnoreCase(qualified, query)) return 1000;
 
     var total: u32 = 0;

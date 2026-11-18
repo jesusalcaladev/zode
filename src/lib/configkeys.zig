@@ -99,7 +99,7 @@ pub fn fromName(name: []const u8) ?Key {
 /// The persisted allowlist can remember it, so a second `set model` does not
 /// ask again — that is the "already allowed" exception.
 pub fn permitSubject(k: Key, buf: []u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "Config({s})", .{k.name()}) catch null;
+    return std.mem.print(buf, "Config({s})", .{k.name()}) catch null;
 }
 
 /// Same as `permitSubject` but from a raw name (used by the registry before

@@ -194,7 +194,7 @@ pub fn stageName(s: Stage) []const u8 {
 /// `<unix-seconds>-<pid>`, which is unique enough for one working tree and is
 /// sortable in listings.
 pub fn runIdBuf(buf: []u8, unix_seconds: i64, pid: usize) []const u8 {
-    return std.fmt.bufPrint(buf, "{d}-{d}", .{ unix_seconds, pid }) catch "0-0";
+    return std.mem.print(buf, "{d}-{d}", .{ unix_seconds, pid }) catch "0-0";
 }
 
 /// How many repair passes the tester/verifier pair may ask for, past the

@@ -33,7 +33,7 @@ pub const Config = struct {
 
     /// URL of the chat completions endpoint, formatted into `buf`.
     pub fn urlChat(self: Config, buf: []u8) []const u8 {
-        return std.fmt.bufPrint(buf, "{s}/chat/completions", .{self.base_url}) catch self.base_url;
+        return std.mem.print(buf, "{s}/chat/completions", .{self.base_url}) catch self.base_url;
     }
 };
 

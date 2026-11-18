@@ -698,7 +698,7 @@ pub fn toolGitCommit(
 /// it does not exist, `git_commit` failed with "could not write the commit
 /// message to a temporary file", and the model never got a commit.
 pub fn writeCommitMessage(io: std.Io, path_buf: []u8, msg: []const u8) ![]const u8 {
-    const path = try std.fmt.bufPrint(path_buf, "/tmp/zode-commit-{d}.txt", .{std.Io.Timestamp.now(io, .real).toNanoseconds()});
+    const path = try std.mem.print(path_buf, "/tmp/zode-commit-{d}.txt", .{std.Io.Timestamp.now(io, .real).toNanoseconds()});
     var f = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true });
     defer f.close(io);
     f.setPermissions(io, commit_file_mode) catch {};

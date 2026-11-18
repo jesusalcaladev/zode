@@ -126,7 +126,7 @@ pub fn report(self: *const Stats, out: []u8, max_iter: usize, hit_pct: u8) ![]co
     // literal below free of format gymnastics.
     var tail: [64]u8 = undefined;
     const dropped_tail: []const u8 = if (self.ttft_dropped > 0)
-        std.fmt.bufPrint(&tail, " (+{d} older samples dropped)", .{self.ttft_dropped}) catch ""
+        std.mem.print(&tail, " (+{d} older samples dropped)", .{self.ttft_dropped}) catch ""
     else
         "";
 

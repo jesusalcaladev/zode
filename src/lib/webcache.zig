@@ -268,7 +268,7 @@ test "the entry count is bounded even when the bytes are tiny" {
 
     var buf: [64]u8 = undefined;
     for (0..max_entries + 10) |i| {
-        const url = try std.fmt.bufPrint(&buf, "https://e{d}.example/", .{i});
+        const url = try std.mem.print(&buf, "https://e{d}.example/", .{i});
         c.put(url, "x", @intCast(i));
     }
     try std.testing.expect(c.count() <= max_entries);
@@ -283,7 +283,7 @@ test "the budget is enforced: a page cannot be served past it" {
     defer c.deinit();
     var buf: [64]u8 = undefined;
     for (0..200) |i| {
-        const url = try std.fmt.bufPrint(&buf, "https://e{d}.example/", .{i});
+        const url = try std.mem.print(&buf, "https://e{d}.example/", .{i});
         c.put(url, &repeat.rep("y", 4096), @intCast(i));
     }
     try std.testing.expect(c.usedBytes() <= budget_bytes);

@@ -246,7 +246,7 @@ pub fn bundledEntries(gpa: std.mem.Allocator) ![]skills.Entry {
 
     for (bundled_skills) |s| {
         var path_buf: [128]u8 = undefined;
-        const path_str = std.fmt.bufPrint(path_buf[0..], "bundled://{s}", .{s.name}) catch return error.OutOfMemory;
+        const path_str = std.mem.print(path_buf[0..], "bundled://{s}", .{s.name}) catch return error.OutOfMemory;
         const path = gpa.dupe(u8, path_str) catch return error.OutOfMemory;
         errdefer gpa.free(path);
         const name = gpa.dupe(u8, s.name) catch return error.OutOfMemory;

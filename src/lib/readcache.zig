@@ -649,12 +649,12 @@ test "cache: the table fills up and keeps answering (eviction, not a crash)" {
     var name_buf: [32]u8 = undefined;
     const stat = .{ .inode = @as(u64, 1), .size = @as(u64, 10), .mtime = .{ .nanoseconds = @as(i128, 5) } };
     while (i < max_entries_default + 20) : (i += 1) {
-        const name = try std.fmt.bufPrint(&name_buf, "f{d}.zig", .{i});
+        const name = try std.mem.print(&name_buf, "f{d}.zig", .{i});
         c.record(name, stat, 1, 1, 10, 10);
     }
     try std.testing.expectEqual(max_entries_default, c.len);
     // It keeps working: it is a cache, not a chain.
-    const name = try std.fmt.bufPrint(&name_buf, "f{d}.zig", .{max_entries_default + 19});
+    const name = try std.mem.print(&name_buf, "f{d}.zig", .{max_entries_default + 19});
     try std.testing.expect(c.check(name, stat, 1, 10) == .already_sent);
 }
 
@@ -701,7 +701,7 @@ test "configure: the table scales with the model's window" {
     var name_buf: [32]u8 = undefined;
     var i: usize = 0;
     while (i < 200) : (i += 1) {
-        const name = try std.fmt.bufPrint(&name_buf, "g{d}.zig", .{i});
+        const name = try std.mem.print(&name_buf, "g{d}.zig", .{i});
         c.record(name, stat, 1, 1, 10, 10);
     }
     try std.testing.expectEqual(@as(usize, 200), c.len);

@@ -76,7 +76,7 @@ pub const Entry = struct {
 pub fn cachePath(env: ?*const std.process.Environ.Map, buf: []u8, provider_id: []const u8) ?[]const u8 {
     var id_buf: [64]u8 = undefined;
     const dir = configdir.dir(env, buf) orelse return null;
-    return std.fmt.bufPrint(buf[dir.len..], "{s}/models/{s}.json", .{ dir, sanitize(provider_id, &id_buf) }) catch null;
+    return std.mem.print(buf[dir.len..], "{s}/models/{s}.json", .{ dir, sanitize(provider_id, &id_buf) }) catch null;
 }
 
 /// The provider id goes into a FILENAME, so it cannot be anything that escapes the
@@ -110,7 +110,7 @@ pub fn write(
     // Atomic: write a temp file then rename, so a concurrent reader never
     // sees a truncated JSON (which previously forced a miss).
     var tmp_buf: [512]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch return;
+    const tmp_path = std.mem.print(&tmp_buf, "{s}.tmp", .{path}) catch return;
     const tmp_name = std.fs.path.basename(tmp_path);
     var f = dirh.createFile(io, tmp_name, .{ .truncate = true }) catch return;
     var f_closed = false;

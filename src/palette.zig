@@ -196,7 +196,7 @@ pub const Palette = struct {
     /// Formatted message (the callers come from `agent`, which cannot touch the
     /// palette's buffer directly).
     pub fn setKeyMessagef(self: *Palette, comptime fmt: []const u8, args: anytype, is_error: bool) void {
-        const s = std.fmt.bufPrint(&self.key_msg, fmt, args) catch return;
+        const s = std.mem.print(&self.key_msg, fmt, args) catch return;
         self.key_msg_len = s.len;
         self.key_msg_error = is_error;
     }
@@ -797,7 +797,7 @@ pub fn draw(
         .key_prompt => "Add API key",
     };
     var tb: [128]u8 = undefined;
-    const t1 = std.fmt.bufPrint(&tb, " {s}", .{title}) catch " ";
+    const t1 = std.mem.print(&tb, " {s}", .{title}) catch " ";
     _ = p.putText(box.x + 2, box.y + 1, t1, theme.brand_bold);
     _ = p.putText(box.x + box.w - 4, box.y + 1, "esc", theme.brand_soft);
 
@@ -1143,7 +1143,7 @@ fn drawModelPreview(p: *Painter, pal: *const Palette, box: Box) void {
 
     var line1: [160]u8 = undefined;
     const ctx_txt = if (item.ctx_tokens > 0)
-        (std.fmt.bufPrint(&line1, "context: {d}k tokens", .{item.ctx_tokens / 1024}) catch "context: unknown")
+        (std.mem.print(&line1, "context: {d}k tokens", .{item.ctx_tokens / 1024}) catch "context: unknown")
     else
         "context: unknown";
 
@@ -1152,7 +1152,7 @@ fn drawModelPreview(p: *Painter, pal: *const Palette, box: Box) void {
     const price_txt = if (item.is_free)
         "price: free"
     else if (item.price_prompt > 0 or item.price_completion > 0)
-        (std.fmt.bufPrint(
+        (std.mem.print(
             &price_buf,
             "price: ${d:.2}/1M in · ${d:.2}/1M out",
             .{ item.price_prompt * 1_000_000.0, item.price_completion * 1_000_000.0 },
@@ -1160,7 +1160,7 @@ fn drawModelPreview(p: *Painter, pal: *const Palette, box: Box) void {
     else
         "price: unknown";
     const free_txt: []const u8 = if (item.is_free) " · free" else "";
-    const text2 = std.fmt.bufPrint(&line2, "{s}{s}", .{ price_txt, free_txt }) catch price_txt;
+    const text2 = std.mem.print(&line2, "{s}{s}", .{ price_txt, free_txt }) catch price_txt;
 
     _ = p.putClipped(box.x + 2, y0, ctx_txt, box.w -| 4, theme.item);
     if (y0 + 1 < fy) _ = p.putClipped(box.x + 2, y0 + 1, text2, box.w -| 4, theme.dim);
@@ -1189,7 +1189,7 @@ fn drawFooter(p: *Painter, pal: *const Palette, box: Box, notice: []const u8) vo
         const total = pal.filtered[c].items.len;
         if (total > 0) {
             var cb: [32]u8 = undefined;
-            const counter = std.fmt.bufPrint(&cb, "{d}/{d}", .{ pal.sel[c] + 1, total }) catch "";
+            const counter = std.mem.print(&cb, "{d}/{d}", .{ pal.sel[c] + 1, total }) catch "";
             const cw: u16 = @intCast(displayWidth(counter));
             if (cw > 0 and cw + 2 < box.w) {
                 const cx = if (hint_x > cw + 2) hint_x - cw - 2 else box.x + 2;
@@ -1221,7 +1221,7 @@ fn drawKeyPrompt(p: *Painter, pal: *const Palette, box: Box) void {
     _ = p.putText(box.x + 3 + 11, top, label, theme.brand_bold);
 
     var pb: [96]u8 = undefined;
-    const prompt = std.fmt.bufPrint(&pb, "API key for {s}", .{label}) catch "API key";
+    const prompt = std.mem.print(&pb, "API key for {s}", .{label}) catch "API key";
     _ = p.putText(box.x + 3, top + 1, prompt, theme.brand);
 
     // Masked, like a password field. The last 3 characters stay visible so you

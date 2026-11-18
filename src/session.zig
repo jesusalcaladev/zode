@@ -310,7 +310,7 @@ pub const Session = struct {
 
     fn compactSidecarPath(self: *const Session, buf: []u8) ?[]const u8 {
         const p = self.path orelse return null;
-        return std.fmt.bufPrint(buf, "{s}.compact.json", .{p}) catch null;
+        return std.mem.print(buf, "{s}.compact.json", .{p}) catch null;
     }
 
     pub fn setCompactionBoundary(self: *Session, summary: []const u8, tail_keep: usize) void {
@@ -375,7 +375,7 @@ pub const Session = struct {
 
     fn capsSidecarPath(self: *const Session, buf: []u8) ?[]const u8 {
         const p = self.path orelse return null;
-        return std.fmt.bufPrint(buf, "{s}.caps.json", .{p}) catch null;
+        return std.mem.print(buf, "{s}.caps.json", .{p}) catch null;
     }
 
     pub fn saveCapsSidecar(self: *Session) void {

@@ -213,7 +213,7 @@ pub const Http = struct {
         defer @memset(auth_buf[0..], 0);
         var auth_value: ?[]const u8 = null;
         if (bearer) |token| {
-            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{token}) catch null;
+            auth_value = std.mem.print(&auth_buf, "Bearer {s}", .{token}) catch null;
         }
 
         var extra: [6]std.http.Header = undefined;

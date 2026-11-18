@@ -68,12 +68,12 @@ pub const Store = struct {
 
     pub fn entriesPath(self: *const Store, buf: []u8) ?[]const u8 {
         if (self.root.len == 0) return null;
-        return std.fmt.bufPrint(buf, "{s}/{s}", .{ self.root, entries_dir }) catch null;
+        return std.mem.print(buf, "{s}/{s}", .{ self.root, entries_dir }) catch null;
     }
 
     pub fn pendingPath(self: *const Store, buf: []u8) ?[]const u8 {
         if (self.root.len == 0) return null;
-        return std.fmt.bufPrint(buf, "{s}/{s}", .{ self.root, pending_dir }) catch null;
+        return std.mem.print(buf, "{s}/{s}", .{ self.root, pending_dir }) catch null;
     }
 
     pub fn loadAll(self: *const Store, out: []memory.Entry) ![]memory.Entry {
@@ -89,7 +89,7 @@ pub const Store = struct {
             if (ent.kind != .file) continue;
             if (!std.mem.endsWith(u8, ent.name, ".md")) continue;
             var fp: [std.fs.max_path_bytes]u8 = undefined;
-            const full = std.fmt.bufPrint(&fp, "{s}/{s}", .{ dir_path, ent.name }) catch continue;
+            const full = std.mem.print(&fp, "{s}/{s}", .{ dir_path, ent.name }) catch continue;
             const data = std.Io.Dir.cwd().readFileAlloc(self.io, full, self.gpa, .limited(memory.max_body_bytes * 4)) catch continue;
             defer self.gpa.free(data);
             const parsed = memory.parseMemory(data);
@@ -149,7 +149,7 @@ pub const Store = struct {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = self.entriesPath(&path_buf) orelse return error.NoStore;
         var file_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const full = try std.fmt.bufPrint(&file_buf, "{s}/{s}.md", .{ path, safe });
+        const full = try std.mem.print(&file_buf, "{s}/{s}.md", .{ path, safe });
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = full, .data = data });
         setPrivate(self.io, full);
     }
@@ -163,7 +163,7 @@ pub const Store = struct {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path = self.pendingPath(&path_buf) orelse return error.NoStore;
         var file_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const full = try std.fmt.bufPrint(&file_buf, "{s}/{s}.md", .{ path, safe });
+        const full = try std.mem.print(&file_buf, "{s}/{s}.md", .{ path, safe });
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = full, .data = data });
         setPrivate(self.io, full);
     }
@@ -180,8 +180,8 @@ pub const Store = struct {
         var ef: [std.fs.max_path_bytes]u8 = undefined;
         const pp = self.pendingPath(&pbuf) orelse return false;
         const ep = self.entriesPath(&ebuf) orelse return false;
-        const src = std.fmt.bufPrint(&pf, "{s}/{s}.md", .{ pp, safe }) catch return false;
-        const dst = std.fmt.bufPrint(&ef, "{s}/{s}.md", .{ ep, safe }) catch return false;
+        const src = std.mem.print(&pf, "{s}/{s}.md", .{ pp, safe }) catch return false;
+        const dst = std.mem.print(&ef, "{s}/{s}.md", .{ ep, safe }) catch return false;
         std.Io.Dir.rename(.cwd(), src, .cwd(), dst, self.io) catch {
             // Cross-dir rename quirks or missing file: fall back to copy+delete.
             const data = std.Io.Dir.cwd().readFileAlloc(self.io, src, self.gpa, .limited(memory.max_body_bytes * 4)) catch return false;
@@ -234,8 +234,8 @@ test "memory store discovery: repo root wins for a subdirectory launch" {
     const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
     var rb: [std.fs.max_path_bytes]u8 = undefined;
     var cb: [std.fs.max_path_bytes]u8 = undefined;
-    const repo = try std.fmt.bufPrint(&rb, "{s}/repo", .{root});
-    const cwd = try std.fmt.bufPrint(&cb, "{s}/repo/src", .{root});
+    const repo = try std.mem.print(&rb, "{s}/repo", .{root});
+    const cwd = try std.mem.print(&cb, "{s}/repo/src", .{root});
 
     var s = try Store.discover(testing.allocator, testing.io, cwd, repo);
     defer s.deinit();
@@ -250,7 +250,7 @@ test "memory store discovery: cwd store found when no repo root" {
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
     var cb: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = try std.fmt.bufPrint(&cb, "{s}/proj", .{root});
+    const cwd = try std.mem.print(&cb, "{s}/proj", .{root});
 
     var s = try Store.discover(testing.allocator, testing.io, cwd, null);
     defer s.deinit();
@@ -265,8 +265,8 @@ test "memory store: save, load, and precedence-consistent discovery with temp ro
     const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
     var rb: [std.fs.max_path_bytes]u8 = undefined;
     var cb: [std.fs.max_path_bytes]u8 = undefined;
-    const repo = try std.fmt.bufPrint(&rb, "{s}/r", .{root});
-    const cwd = try std.fmt.bufPrint(&cb, "{s}/r/src", .{root});
+    const repo = try std.mem.print(&rb, "{s}/r", .{root});
+    const cwd = try std.mem.print(&cb, "{s}/r/src", .{root});
 
     var s = try Store.resolveForProject(testing.allocator, testing.io, cwd, repo, true);
     defer s.deinit();
@@ -289,7 +289,7 @@ test "memory store: pending proposal requires approval to enter entries" {
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
     var cb: [std.fs.max_path_bytes]u8 = undefined;
-    const cwd = try std.fmt.bufPrint(&cb, "{s}/p", .{root});
+    const cwd = try std.mem.print(&cb, "{s}/p", .{root});
 
     var s = try Store.resolveForProject(testing.allocator, testing.io, cwd, null, true);
     defer s.deinit();

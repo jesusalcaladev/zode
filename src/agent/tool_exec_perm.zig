@@ -221,7 +221,7 @@ pub fn shouldOfferSandbox(is_bash: bool, command: []const u8, flagged: bool, san
 }
 
 pub fn formatRiskyPathDetail(path: []const u8, why: []const u8, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "{s} is not a place this tool writes: {s}",
         .{ path, if (why.len > 0) why else "it is protected" },

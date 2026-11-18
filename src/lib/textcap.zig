@@ -310,7 +310,7 @@ test "clipLines: a trailing newline does not count as an extra line" {
     var n: usize = 0;
     var fill: [32]u8 = undefined;
     for (0..10) |i| {
-        const line = std.fmt.bufPrint(&fill, "line {d}\n", .{i}) catch unreachable;
+        const line = std.mem.print(&fill, "line {d}\n", .{i}) catch unreachable;
         @memcpy(buf[n .. n + line.len], line);
         n += line.len;
     }

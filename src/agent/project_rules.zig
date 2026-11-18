@@ -11,14 +11,14 @@ pub const project_hooks_file = ".zode/hooks.json";
 
 pub fn resolvedProjectRulesPath(buf: []u8, project_root: ?[]const u8) []const u8 {
     if (project_root) |root| {
-        return std.fmt.bufPrint(buf, "{s}/{s}", .{ root, project_rules_file }) catch project_rules_file;
+        return std.mem.print(buf, "{s}/{s}", .{ root, project_rules_file }) catch project_rules_file;
     }
     return project_rules_file;
 }
 
 pub fn resolvedProjectHooksPath(buf: []u8, project_root: ?[]const u8) []const u8 {
     if (project_root) |root| {
-        return std.fmt.bufPrint(buf, "{s}/{s}", .{ root, project_hooks_file }) catch project_hooks_file;
+        return std.mem.print(buf, "{s}/{s}", .{ root, project_hooks_file }) catch project_hooks_file;
     }
     return project_hooks_file;
 }
@@ -65,5 +65,5 @@ pub fn loadHooksAt(out: *hooks_mod.Set, arena: std.mem.Allocator, io: std.Io, pa
 
 pub fn hooksPathForProjectPermissions(pp: []const u8, buf: []u8) ?[]const u8 {
     const dir = std.fs.path.dirname(pp) orelse ".";
-    return std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, "hooks.json" }) catch null;
+    return std.mem.print(buf, "{s}/{s}", .{ dir, "hooks.json" }) catch null;
 }

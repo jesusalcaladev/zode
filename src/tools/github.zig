@@ -113,7 +113,7 @@ fn opWhoami(io: std.Io, arena: std.mem.Allocator) ![]const u8 {
 
 fn opRepo(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const r = resolveRepo(io, obj, arena) catch |err| switch (err) { error.NoGitHubContext => return noContextMsg(), error.BadArgs => return "github repo: `repo` must be owner/name" };
-    var path_buf: [512]u8 = undefined; const path = std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}", .{ r.owner, r.repo }) catch return "github repo: path too long";
+    var path_buf: [512]u8 = undefined; const path = std.mem.print(&path_buf, "/repos/{s}/{s}", .{ r.owner, r.repo }) catch return "github repo: path too long";
     const resp = doRequest(arena, io, .GET, r, path, null) catch |err| return std.fmt.allocPrint(arena, "github repo: request failed ({s})", .{@errorName(err)}) catch "github repo: request failed";
     if (resp.status < 200 or resp.status >= 300) return api.errorMessage(arena, resp, r.token != null);
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, resp.body, .{}) catch return "github repo: could not parse response";
@@ -129,7 +129,7 @@ fn opPrList(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]co
     const r = resolveRepo(io, obj, arena) catch |err| switch (err) { error.NoGitHubContext => return noContextMsg(), error.BadArgs => return "github pr_list: `repo` must be owner/name" };
     const limit = clampLimit(obj, 20, 50); const state = common.getStr(obj, "state") orelse "open"; const head = common.getStr(obj, "head");
     var path_buf: [1024]u8 = undefined;
-    const path = if (head) |h| std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/pulls?state={s}&head={s}&per_page={d}", .{ r.owner, r.repo, urlEncode(arena, state), urlEncode(arena, h), @min(limit, @as(usize, 50)) }) catch return "github pr_list: path too long" else std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/pulls?state={s}&per_page={d}", .{ r.owner, r.repo, urlEncode(arena, state), @min(limit, @as(usize, 50)) }) catch return "github pr_list: path too long";
+    const path = if (head) |h| std.mem.print(&path_buf, "/repos/{s}/{s}/pulls?state={s}&head={s}&per_page={d}", .{ r.owner, r.repo, urlEncode(arena, state), urlEncode(arena, h), @min(limit, @as(usize, 50)) }) catch return "github pr_list: path too long" else std.mem.print(&path_buf, "/repos/{s}/{s}/pulls?state={s}&per_page={d}", .{ r.owner, r.repo, urlEncode(arena, state), @min(limit, @as(usize, 50)) }) catch return "github pr_list: path too long";
     const collected = collectArrayPages(io, arena, r, path, limit) catch |err| switch (err) { error.ApiStatus => { const resp = doRequest(arena, io, .GET, r, path, null) catch |e| return std.fmt.allocPrint(arena, "github pr_list: request failed ({s})", .{@errorName(e)}) catch "github pr_list: request failed"; return api.errorMessage(arena, resp, r.token != null); }, else => return std.fmt.allocPrint(arena, "github pr_list: request failed ({s})", .{@errorName(err)}) catch "github pr_list: request failed" };
     if (collected.items.len == 0) return "no pull requests found.";
     var out: std.ArrayList(u8) = .empty; try out.print(arena, "pull requests ({d}):\n", .{collected.items.len});
@@ -142,7 +142,7 @@ fn opPrList(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]co
 fn opPrView(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const r = resolveRepo(io, obj, arena) catch |err| switch (err) { error.NoGitHubContext => return noContextMsg(), error.BadArgs => return "github pr_view: `repo` must be owner/name" };
     const number = common.getInt(obj, "number") orelse return "github pr_view needs `number`.";
-    var path_buf: [256]u8 = undefined; const path = std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/pulls/{d}", .{ r.owner, r.repo, number }) catch return "github pr_view: path too long";
+    var path_buf: [256]u8 = undefined; const path = std.mem.print(&path_buf, "/repos/{s}/{s}/pulls/{d}", .{ r.owner, r.repo, number }) catch return "github pr_view: path too long";
     const resp = doRequest(arena, io, .GET, r, path, null) catch |err| return std.fmt.allocPrint(arena, "github pr_view: request failed ({s})", .{@errorName(err)}) catch "github pr_view: request failed";
     if (resp.status < 200 or resp.status >= 300) return api.errorMessage(arena, resp, r.token != null);
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, resp.body, .{}) catch return "github pr_view: could not parse response";
@@ -159,14 +159,14 @@ fn opPrView(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]co
 fn opPrChecks(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const r = resolveRepo(io, obj, arena) catch |err| switch (err) { error.NoGitHubContext => return noContextMsg(), error.BadArgs => return "github pr_checks: `repo` must be owner/name" };
     const number = common.getInt(obj, "number") orelse return "github pr_checks needs `number`.";
-    var pr_path_buf: [256]u8 = undefined; const pr_path = std.fmt.bufPrint(&pr_path_buf, "/repos/{s}/{s}/pulls/{d}", .{ r.owner, r.repo, number }) catch return "github pr_checks: path too long";
+    var pr_path_buf: [256]u8 = undefined; const pr_path = std.mem.print(&pr_path_buf, "/repos/{s}/{s}/pulls/{d}", .{ r.owner, r.repo, number }) catch return "github pr_checks: path too long";
     const pr_resp = doRequest(arena, io, .GET, r, pr_path, null) catch |err| return std.fmt.allocPrint(arena, "github pr_checks: request failed ({s})", .{@errorName(err)}) catch "github pr_checks: request failed";
     if (pr_resp.status < 200 or pr_resp.status >= 300) return api.errorMessage(arena, pr_resp, r.token != null);
     const prv = std.json.parseFromSliceLeaky(std.json.Value, arena, pr_resp.body, .{}) catch return "github pr_checks: could not parse PR response";
     if (prv != .object) return "github pr_checks: unexpected PR response";
     const pr = types.parsePullRequest(prv.object);
     if (pr.head_sha.len == 0) return "github pr_checks: could not determine PR head SHA";
-    var path_buf: [512]u8 = undefined; const path = std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/commits/{s}/check-runs?per_page=100", .{ r.owner, r.repo, pr.head_sha }) catch return "github pr_checks: path too long";
+    var path_buf: [512]u8 = undefined; const path = std.mem.print(&path_buf, "/repos/{s}/{s}/commits/{s}/check-runs?per_page=100", .{ r.owner, r.repo, pr.head_sha }) catch return "github pr_checks: path too long";
     const collected = collectCheckRunsPages(io, arena, r, path, 200) catch |err| switch (err) { error.ApiStatus => { const resp = doRequest(arena, io, .GET, r, path, null) catch |e| return std.fmt.allocPrint(arena, "github pr_checks: request failed ({s})", .{@errorName(e)}) catch "github pr_checks: request failed"; return api.errorMessage(arena, resp, r.token != null); }, else => return std.fmt.allocPrint(arena, "github pr_checks: request failed ({s})", .{@errorName(err)}) catch "github pr_checks: request failed" };
     if (collected.items.len == 0) return std.fmt.allocPrint(arena, "PR #{d} ({s}): no check runs", .{ number, pr.head_sha }) catch "no check runs";
     var passed: usize = 0; var failed: usize = 0; var pending: usize = 0; var other: usize = 0;
@@ -181,7 +181,7 @@ fn opPrChecks(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]
 fn opIssueList(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const r = resolveRepo(io, obj, arena) catch |err| switch (err) { error.NoGitHubContext => return noContextMsg(), error.BadArgs => return "github issue_list: `repo` must be owner/name" };
     const limit = clampLimit(obj, 20, 50); const state = common.getStr(obj, "state") orelse "open";
-    var path_buf: [512]u8 = undefined; const path = std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/issues?state={s}&per_page={d}", .{ r.owner, r.repo, urlEncode(arena, state), @min(limit, @as(usize, 50)) }) catch return "github issue_list: path too long";
+    var path_buf: [512]u8 = undefined; const path = std.mem.print(&path_buf, "/repos/{s}/{s}/issues?state={s}&per_page={d}", .{ r.owner, r.repo, urlEncode(arena, state), @min(limit, @as(usize, 50)) }) catch return "github issue_list: path too long";
     const collected = collectArrayPages(io, arena, r, path, limit) catch |err| switch (err) { error.ApiStatus => { const resp = doRequest(arena, io, .GET, r, path, null) catch |e| return std.fmt.allocPrint(arena, "github issue_list: request failed ({s})", .{@errorName(e)}) catch "github issue_list: request failed"; return api.errorMessage(arena, resp, r.token != null); }, else => return std.fmt.allocPrint(arena, "github issue_list: request failed ({s})", .{@errorName(err)}) catch "github issue_list: request failed" };
     var count: usize = 0; var lines: std.ArrayList(u8) = .empty;
     for (collected.items) |item| { if (item != .object) continue; if (item.object.get("pull_request") != null) continue; const issue = types.parseIssue(item.object); try lines.print(arena, "- #{d} [{s}] {s}", .{ issue.number, issue.state, issue.title }); if (issue.html_url.len > 0) try lines.print(arena, " {s}", .{issue.html_url}); try lines.append(arena, '\n'); count += 1; }
@@ -195,7 +195,7 @@ fn opIssueList(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![
 fn opIssueView(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
     const r = resolveRepo(io, obj, arena) catch |err| switch (err) { error.NoGitHubContext => return noContextMsg(), error.BadArgs => return "github issue_view: `repo` must be owner/name" };
     const number = common.getInt(obj, "number") orelse return "github issue_view needs `number`.";
-    var path_buf: [256]u8 = undefined; const path = std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/issues/{d}", .{ r.owner, r.repo, number }) catch return "github issue_view: path too long";
+    var path_buf: [256]u8 = undefined; const path = std.mem.print(&path_buf, "/repos/{s}/{s}/issues/{d}", .{ r.owner, r.repo, number }) catch return "github issue_view: path too long";
     const resp = doRequest(arena, io, .GET, r, path, null) catch |err| return std.fmt.allocPrint(arena, "github issue_view: request failed ({s})", .{@errorName(err)}) catch "github issue_view: request failed";
     if (resp.status < 200 or resp.status >= 300) return api.errorMessage(arena, resp, r.token != null);
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, resp.body, .{}) catch return "github issue_view: could not parse response";
@@ -212,7 +212,7 @@ fn opActionsRuns(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) 
     const r = resolveRepo(io, obj, arena) catch |err| switch (err) { error.NoGitHubContext => return noContextMsg(), error.BadArgs => return "github actions_runs: `repo` must be owner/name" };
     const limit = clampLimit(obj, 20, 50); const branch = common.getStr(obj, "branch");
     var path_buf: [1024]u8 = undefined;
-    const path = if (branch) |b| std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/actions/runs?per_page={d}&branch={s}", .{ r.owner, r.repo, @min(limit, @as(usize, 50)), urlEncode(arena, b) }) catch return "github actions_runs: path too long" else std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/actions/runs?per_page={d}", .{ r.owner, r.repo, @min(limit, @as(usize, 50)) }) catch return "github actions_runs: path too long";
+    const path = if (branch) |b| std.mem.print(&path_buf, "/repos/{s}/{s}/actions/runs?per_page={d}&branch={s}", .{ r.owner, r.repo, @min(limit, @as(usize, 50)), urlEncode(arena, b) }) catch return "github actions_runs: path too long" else std.mem.print(&path_buf, "/repos/{s}/{s}/actions/runs?per_page={d}", .{ r.owner, r.repo, @min(limit, @as(usize, 50)) }) catch return "github actions_runs: path too long";
     const collected = collectWorkflowRunsPages(io, arena, r, path, limit) catch |err| switch (err) { error.ApiStatus => { const resp = doRequest(arena, io, .GET, r, path, null) catch |e| return std.fmt.allocPrint(arena, "github actions_runs: request failed ({s})", .{@errorName(e)}) catch "github actions_runs: request failed"; return api.errorMessage(arena, resp, r.token != null); }, else => return std.fmt.allocPrint(arena, "github actions_runs: request failed ({s})", .{@errorName(err)}) catch "github actions_runs: request failed" };
     if (collected.items.len == 0) return "no workflow runs found.";
     var out: std.ArrayList(u8) = .empty; try out.print(arena, "workflow runs ({d})", .{collected.items.len}); if (branch) |b| try out.print(arena, " branch={s}", .{b}); try out.appendSlice(arena, ":\n");
@@ -228,9 +228,9 @@ fn opPrCreate(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]
     const title = common.getStr(obj, "title") orelse return "github pr_create needs `title`.";
     const head = common.getStr(obj, "head") orelse blk: { break :blk context.currentBranch(arena, io) orelse return "github pr_create needs `head` (or run from a git branch)."; };
     const base = common.getStr(obj, "base") orelse "main"; const body = common.getStr(obj, "body") orelse ""; const draft = common.getBool(obj, "draft");
-    var list_path_buf: [1024]u8 = undefined; const owner_prefix = std.fmt.allocPrint(arena, "{s}:{s}", .{ r.owner, head }) catch head; const list_path = std.fmt.bufPrint(&list_path_buf, "/repos/{s}/{s}/pulls?state=open&head={s}&per_page=10", .{ r.owner, r.repo, urlEncode(arena, owner_prefix) }) catch null;
+    var list_path_buf: [1024]u8 = undefined; const owner_prefix = std.fmt.allocPrint(arena, "{s}:{s}", .{ r.owner, head }) catch head; const list_path = std.mem.print(&list_path_buf, "/repos/{s}/{s}/pulls?state=open&head={s}&per_page=10", .{ r.owner, r.repo, urlEncode(arena, owner_prefix) }) catch null;
     if (list_path) |lp| { if (doRequest(arena, io, .GET, r, lp, null)) |resp| { if (resp.status >= 200 and resp.status < 300) { if (std.json.parseFromSliceLeaky(std.json.Value, arena, resp.body, .{})) |v| { if (v == .array and v.array.items.len > 0) { if (v.array.items[0] == .object) { const existing = types.parsePullRequest(v.array.items[0].object); if (existing.number > 0) { return std.fmt.allocPrint(arena, "existing open PR found (idempotent): #{d} {s}\nurl: {s}", .{ existing.number, existing.title, existing.html_url }) catch "existing open PR found"; } } } } else |_| {} } } else |_| {} }
-    var path_buf: [512]u8 = undefined; const path = std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/pulls", .{ r.owner, r.repo }) catch return "github pr_create: path too long";
+    var path_buf: [512]u8 = undefined; const path = std.mem.print(&path_buf, "/repos/{s}/{s}/pulls", .{ r.owner, r.repo }) catch return "github pr_create: path too long";
     const Payload = struct { title: []const u8, head: []const u8, base: []const u8, body: []const u8, draft: bool };
     const resp = api.requestJson(arena, io, .POST, try api.buildUrl(arena, r.api_base, path), r.token, Payload{ .title = title, .head = head, .base = base, .body = body, .draft = draft }) catch |err| return std.fmt.allocPrint(arena, "github pr_create: request failed ({s})", .{@errorName(err)}) catch "github pr_create: request failed";
     if (resp.status < 200 or resp.status >= 300) return api.errorMessage(arena, resp, true);
@@ -246,7 +246,7 @@ fn opPrUpdate(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]
     const number = common.getInt(obj, "number") orelse return "github pr_update needs `number`.";
     const title = common.getStr(obj, "title"); const body = common.getStr(obj, "body"); const base = common.getStr(obj, "base"); const state = common.getStr(obj, "state");
     if (title == null and body == null and base == null and state == null) return "github pr_update needs at least one of: title, body, base, state.";
-    var path_buf: [256]u8 = undefined; const path = std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/pulls/{d}", .{ r.owner, r.repo, number }) catch return "github pr_update: path too long";
+    var path_buf: [256]u8 = undefined; const path = std.mem.print(&path_buf, "/repos/{s}/{s}/pulls/{d}", .{ r.owner, r.repo, number }) catch return "github pr_update: path too long";
     var buf = std.Io.Writer.Allocating.init(arena); const w = &buf.writer; try w.writeAll("{"); var first = true;
     if (title) |t| { try w.writeAll("\"title\":"); try std.json.Stringify.value(t, .{}, w); first = false; }
     if (body) |b| { if (!first) try w.writeAll(","); try w.writeAll("\"body\":"); try std.json.Stringify.value(b, .{}, w); first = false; }
@@ -265,7 +265,7 @@ fn opPrComment(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![
     const r = resolveRepo(io, obj, arena) catch |err| switch (err) { error.NoGitHubContext => return noContextMsg(), error.BadArgs => return "github pr_comment: `repo` must be owner/name" };
     if (r.token == null) return "github pr_comment requires authentication. Set GITHUB_TOKEN/GH_TOKEN or save a token in ~/.config/zode/auth.json.";
     const number = common.getInt(obj, "number") orelse return "github pr_comment needs `number`."; const body = common.getStr(obj, "body") orelse return "github pr_comment needs `body`.";
-    var path_buf: [256]u8 = undefined; const path = std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/issues/{d}/comments", .{ r.owner, r.repo, number }) catch return "github pr_comment: path too long";
+    var path_buf: [256]u8 = undefined; const path = std.mem.print(&path_buf, "/repos/{s}/{s}/issues/{d}/comments", .{ r.owner, r.repo, number }) catch return "github pr_comment: path too long";
     const Payload = struct { body: []const u8 };
     const resp = api.requestJson(arena, io, .POST, try api.buildUrl(arena, r.api_base, path), r.token, Payload{ .body = body }) catch |err| return std.fmt.allocPrint(arena, "github pr_comment: request failed ({s})", .{@errorName(err)}) catch "github pr_comment: request failed";
     if (resp.status < 200 or resp.status >= 300) return api.errorMessage(arena, resp, true);
@@ -278,7 +278,7 @@ fn opIssueCreate(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) 
     const r = resolveRepo(io, obj, arena) catch |err| switch (err) { error.NoGitHubContext => return noContextMsg(), error.BadArgs => return "github issue_create: `repo` must be owner/name" };
     if (r.token == null) return "github issue_create requires authentication. Set GITHUB_TOKEN/GH_TOKEN or save a token in ~/.config/zode/auth.json.";
     const title = common.getStr(obj, "title") orelse return "github issue_create needs `title`."; const body = common.getStr(obj, "body") orelse "";
-    var path_buf: [256]u8 = undefined; const path = std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/issues", .{ r.owner, r.repo }) catch return "github issue_create: path too long";
+    var path_buf: [256]u8 = undefined; const path = std.mem.print(&path_buf, "/repos/{s}/{s}/issues", .{ r.owner, r.repo }) catch return "github issue_create: path too long";
     const Payload = struct { title: []const u8, body: []const u8 };
     const resp = api.requestJson(arena, io, .POST, try api.buildUrl(arena, r.api_base, path), r.token, Payload{ .title = title, .body = body }) catch |err| return std.fmt.allocPrint(arena, "github issue_create: request failed ({s})", .{@errorName(err)}) catch "github issue_create: request failed";
     if (resp.status < 200 or resp.status >= 300) return api.errorMessage(arena, resp, true);
@@ -292,7 +292,7 @@ fn opIssueComment(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator)
     const r = resolveRepo(io, obj, arena) catch |err| switch (err) { error.NoGitHubContext => return noContextMsg(), error.BadArgs => return "github issue_comment: `repo` must be owner/name" };
     if (r.token == null) return "github issue_comment requires authentication. Set GITHUB_TOKEN/GH_TOKEN or save a token in ~/.config/zode/auth.json.";
     const number = common.getInt(obj, "number") orelse return "github issue_comment needs `number`."; const body = common.getStr(obj, "body") orelse return "github issue_comment needs `body`.";
-    var path_buf: [256]u8 = undefined; const path = std.fmt.bufPrint(&path_buf, "/repos/{s}/{s}/issues/{d}/comments", .{ r.owner, r.repo, number }) catch return "github issue_comment: path too long";
+    var path_buf: [256]u8 = undefined; const path = std.mem.print(&path_buf, "/repos/{s}/{s}/issues/{d}/comments", .{ r.owner, r.repo, number }) catch return "github issue_comment: path too long";
     const Payload = struct { body: []const u8 };
     const resp = api.requestJson(arena, io, .POST, try api.buildUrl(arena, r.api_base, path), r.token, Payload{ .body = body }) catch |err| return std.fmt.allocPrint(arena, "github issue_comment: request failed ({s})", .{@errorName(err)}) catch "github issue_comment: request failed";
     if (resp.status < 200 or resp.status >= 300) return api.errorMessage(arena, resp, true);

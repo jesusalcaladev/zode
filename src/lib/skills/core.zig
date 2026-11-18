@@ -735,7 +735,7 @@ test "systemPromptSection: the budget caps the size of the listing" {
     var names: [50][8]u8 = undefined;
     var entries: [50]skills.Entry = undefined;
     for (&entries, 0..) |*e, i| {
-        const name = std.fmt.bufPrint(&names[i], "skill{d}", .{i}) catch "s";
+        const name = std.mem.print(&names[i], "skill{d}", .{i}) catch "s";
         e.* = .{ .name = name, .description = "a description that is not short at all" };
     }
     var buf: [16 * 1024]u8 = undefined;

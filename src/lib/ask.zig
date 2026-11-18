@@ -124,13 +124,13 @@ pub fn decide(bypass: bool, has_options: bool) Decision {
 
 /// The text the model reads when the harness took its recommendation.
 pub fn formatYoloTaken(buf: []u8, option: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}\"{s}\"{s}", .{ yolo_taken_prefix, option, yolo_taken_suffix }) catch
+    return std.mem.print(buf, "{s}\"{s}\"{s}", .{ yolo_taken_prefix, option, yolo_taken_suffix }) catch
         "Nobody was asked (YOLO mode): I took your own recommendation. Say it in your final summary.";
 }
 
 /// The text the model reads when the question is left open.
 pub fn formatYoloDeferred(buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}", .{yolo_deferred_text}) catch
+    return std.mem.print(buf, "{s}", .{yolo_deferred_text}) catch
         "Nobody was asked (YOLO mode). Mention it in your final summary.";
 }
 
@@ -168,10 +168,10 @@ pub fn formatAnswered(text: []const u8) Answered {
 
     var a = Answered{};
     const suffix = if (cut) marker else "";
-    const written = std.fmt.bufPrint(&a.buf, "{s}{s}{s}", .{ prefix, src, suffix }) catch
+    const written = std.mem.print(&a.buf, "{s}{s}{s}", .{ prefix, src, suffix }) catch
         // Unreachable with the reservation above, but a partial prefix would be
         // read as the whole answer, so the fallback is a complete sentence.
-        std.fmt.bufPrint(&a.buf, "{s}(no answer captured)", .{prefix}) catch "";
+        std.mem.print(&a.buf, "{s}(no answer captured)", .{prefix}) catch "";
     a.len = written.len;
     return a;
 }

@@ -161,11 +161,11 @@ pub const Context = struct {
 pub fn cachePath(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
     const m = env orelse return null;
     if (m.get("XDG_CACHE_HOME")) |c| {
-        if (c.len > 0) return std.fmt.bufPrint(buf, "{s}/zode/update.json", .{c}) catch null;
+        if (c.len > 0) return std.mem.print(buf, "{s}/zode/update.json", .{c}) catch null;
     }
     const home = m.get("HOME") orelse return null;
     if (home.len == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}/.cache/zode/update.json", .{home}) catch null;
+    return std.mem.print(buf, "{s}/.cache/zode/update.json", .{home}) catch null;
 }
 
 const CacheEntry = struct {
@@ -189,7 +189,7 @@ fn saveCache(ctx: Context, tag: []const u8, now: i64) void {
         std.Io.Dir.cwd().createDirPath(ctx.io, dir) catch {};
     }
     var body_buf: [512]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf, "{{\"checked_at\":{d},\"latest\":\"{s}\"}}", .{ now, tag }) catch return;
+    const body = std.mem.print(&body_buf, "{{\"checked_at\":{d},\"latest\":\"{s}\"}}", .{ now, tag }) catch return;
     std.Io.Dir.cwd().writeFile(ctx.io, .{ .sub_path = path, .data = body }) catch {};
 }
 
@@ -515,7 +515,7 @@ fn download(ctx: Context, url: []const u8) ?[]const u8 {
 /// so the notice, `/update` and the tests cannot say three different things.
 pub fn phrase(buf: []u8, up: Update) []const u8 {
     const kind = if (up.kind) |k| k.label() else "new";
-    return std.fmt.bufPrint(buf, "{s} is available ({s})", .{ up.version, kind }) catch return "an update is available";
+    return std.mem.print(buf, "{s} is available ({s})", .{ up.version, kind }) catch return "an update is available";
 }
 
 // ── tests ────────────────────────────────────────────────────────

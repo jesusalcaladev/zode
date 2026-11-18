@@ -185,7 +185,7 @@ test "filewatch: changes beyond the output cap are truncated, not a crash" {
     var buf: [16]u8 = undefined;
     var i: usize = 0;
     while (i < 80) : (i += 1) {
-        const p = std.fmt.bufPrint(&buf, "f{d}.zig", .{i}) catch continue;
+        const p = std.mem.print(&buf, "f{d}.zig", .{i}) catch continue;
         prev[i] = snap(p, 1, 100, 10, 0xaa);
         cur[i] = snap(p, 1, 200, 10, 0);
     }

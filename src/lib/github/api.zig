@@ -23,7 +23,7 @@ pub const Auth = struct {
 
 fn authJsonPath(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
     const dir = configdir.dir(env, buf) orelse return null;
-    return std.fmt.bufPrint(buf[dir.len..], "{s}/auth.json", .{dir}) catch null;
+    return std.mem.print(buf[dir.len..], "{s}/auth.json", .{dir}) catch null;
 }
 
 pub fn resolveToken(arena: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, host: []const u8) Auth {
@@ -113,7 +113,7 @@ pub fn request(arena: std.mem.Allocator, io: std.Io, method: Method, url: []cons
     headers[hlen] = .{ .name = "user-agent", .value = "zode" };
     hlen += 1;
     if (token) |t| {
-        const auth_val = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch null;
+        const auth_val = std.mem.print(&auth_buf, "Bearer {s}", .{t}) catch null;
         if (auth_val) |av| {
             headers[hlen] = .{ .name = "authorization", .value = av };
             hlen += 1;

@@ -66,8 +66,13 @@ fn isIdent(c: u8) bool {
 }
 
 /// The name passed as `&name` right after `bufPrint(` on this line.
+fn hasPrintCall(line: []const u8) bool {
+    return std.mem.indexOf(u8, line, "bufPrint(&") != null or
+        std.mem.indexOf(u8, line, "print(&") != null;
+}
+
 fn bufPrintBuffer(line: []const u8) ?[]const u8 {
-    const marker = "bufPrint(&";
+    const marker = if (std.mem.indexOf(u8, line, "bufPrint(&") != null) "bufPrint(&" else "print(&";
     const at = std.mem.indexOf(u8, line, marker) orelse return null;
     const start = at + marker.len;
     var end = start;
@@ -132,7 +137,7 @@ pub fn scan(gpa: std.mem.Allocator, source: []const u8) ![]Finding {
         if (std.mem.indexOf(u8, line, "memaudit: allow") != null) continue;
 
         // Class 1: field = bufPrint(&stack_local, ...)
-        if (std.mem.indexOf(u8, line, "bufPrint(&") != null and assignedToField(line)) {
+        if (hasPrintCall(line) and assignedToField(line)) {
             if (bufPrintBuffer(line)) |buf| {
                 for (names.items) |n| {
                     if (std.mem.eql(u8, n, buf)) {
@@ -156,7 +161,7 @@ test "memaudit: flags a stack buffer stored in a returned struct field" {
         \\fn loader() Loader {
         \\    var path_buf: [4096]u8 = undefined;
         \\    var loader = Loader.init();
-        \\    loader.project_dir = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ a, b }) catch loader.project_dir;
+        \\    loader.project_dir = std.mem.print(&path_buf, "{s}/{s}", .{ a, b }) catch loader.project_dir;
         \\    return loader;
         \\}
         \\
@@ -176,7 +181,7 @@ test "memaudit: a module-level scratch buffer is allowed" {
         \\var loader_path_bufs: [4][4096]u8 = undefined;
         \\fn loader() Loader {
         \\    var loader = Loader.init();
-        \\    loader.project_dir = std.fmt.bufPrint(&loader_path_bufs[0], "{s}", .{a}) catch loader.project_dir;
+        \\    loader.project_dir = std.mem.print(&loader_path_bufs[0], "{s}", .{a}) catch loader.project_dir;
         \\    return loader;
         \\}
         \\
@@ -205,7 +210,7 @@ test "memaudit: flags a borrowed .items stored as message content" {
 test "memaudit: memaudit-allow suppresses a reviewed line" {
     const src =
         \\    var buf: [16]u8 = undefined;
-        \\    out.field = std.fmt.bufPrint(&buf, "{s}", .{a}) catch out.field; // memaudit: allow - reviewed
+        \\    out.field = std.mem.print(&buf, "{s}", .{a}) catch out.field; // memaudit: allow - reviewed
         \\
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -216,10 +221,10 @@ test "memaudit: memaudit-allow suppresses a reviewed line" {
 
 test "memaudit: safe patterns are not findings" {
     const src =
-        \\const p = std.fmt.bufPrint(&buf, "{s}", .{a}) catch return; // local const, safe
+        \\const p = std.mem.print(&buf, "{s}", .{a}) catch return; // local const, safe
         \\for (tstate.calls.items) |call| use(call);
         \\segs[0] = .{ .text = arena_list.items, .style = theme.table }; // arena-backed
-        \\m.field = std.fmt.bufPrint(&module_static[0], "{s}", .{a}) catch ""; // static buffer
+        \\m.field = std.mem.print(&module_static[0], "{s}", .{a}) catch ""; // static buffer
         \\
     ;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -263,7 +263,7 @@ pub fn scan(
             if (std.ascii.eqlIgnoreCase(base, "README")) continue;
             if (alreadyIn(out[0..n], base)) continue; // the first root wins
 
-            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, ent.name }) catch continue;
+            const path = std.mem.print(&path_buf, "{s}/{s}", .{ dir_path, ent.name }) catch continue;
             const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_body)) catch |err| {
                 if (err == error.FileTooBig) {
                     // Listed WITH the reason instead of hidden: a command that
@@ -299,12 +299,12 @@ fn alreadyIn(list: []const Entry, base: []const u8) bool {
 // the suite would leave junk in their repo, and a test that writes into
 // `~/.config` is the mistake the June fuzzer made with `auth.json`.
 fn tmpRoot(out: []u8) ![]const u8 {
-    return std.fmt.bufPrint(out, ".zode-cmds-test-{d}", .{std.testing.random_seed});
+    return std.mem.print(out, ".zode-cmds-test-{d}", .{std.testing.random_seed});
 }
 
 fn writeFixture(root: []const u8, rel: []const u8, body: []const u8) !void {
     var buf: [512]u8 = undefined;
-    const full = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ root, rel });
+    const full = try std.mem.print(&buf, "{s}/{s}", .{ root, rel });
     if (std.fs.path.dirname(full)) |dir| {
         try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
     }
@@ -388,7 +388,7 @@ test "render: frontmatter stripped, args expanded, caller owns the result" {
     // std.testing.allocator as the REAL allocator (not an arena): the render
     // result is gpa-owned, and the leak check on that exact pair is the point.
     var path_buf: [320]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/review.md", .{root});
+    const path = try std.mem.print(&path_buf, "{s}/review.md", .{root});
     const got = render(std.testing.allocator, std.testing.io, path, "the last commit") orelse
         return error.TestUnexpectedResult;
     defer std.testing.allocator.free(got);
@@ -432,9 +432,9 @@ test "scan: finds the commands, project first, and the non-files are not command
     // the loop, and one shared scratch would leave them all pointing at the
     // last one written (the `sb.path` trap this repo has already paid for).
     var proj_buf: [300]u8 = undefined;
-    const proj = try std.fmt.bufPrint(&proj_buf, "{s}/proj", .{root});
+    const proj = try std.mem.print(&proj_buf, "{s}/proj", .{root});
     var home_buf: [300]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "{s}/home", .{root});
+    const home = try std.mem.print(&home_buf, "{s}/home", .{root});
     var roots = [_][]const u8{ proj, home };
 
     var entries: [8]Entry = undefined;
@@ -459,7 +459,7 @@ test "scan: the cap stops the list instead of overflowing it" {
     try writeFixture(root, "one/b.md", "b");
 
     var one_buf: [300]u8 = undefined;
-    const one = try std.fmt.bufPrint(&one_buf, "{s}/one", .{root});
+    const one = try std.mem.print(&one_buf, "{s}/one", .{root});
     var roots = [_][]const u8{one};
 
     var entries: [1]Entry = undefined;

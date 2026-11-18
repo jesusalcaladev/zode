@@ -210,7 +210,7 @@ pub fn findRoot(io: std.Io, start: []const u8, out: []u8) ?[]const u8 {
 /// zode pretends it is not in a repository.
 fn hasGitEntry(io: std.Io, dir: []const u8) bool {
     var path_buf: [max_path + 8]u8 = undefined;
-    const p = std.fmt.bufPrint(&path_buf, "{s}/.git", .{dir}) catch return false;
+    const p = std.mem.print(&path_buf, "{s}/.git", .{dir}) catch return false;
     const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return false;
     return st.kind == .directory or st.kind == .file;
 }
@@ -223,7 +223,7 @@ fn hasGitEntry(io: std.Io, dir: []const u8) bool {
 /// worktree.
 pub fn readGitDir(io: std.Io, root: []const u8, out: []u8) ?[]const u8 {
     var path_buf: [max_path + 8]u8 = undefined;
-    const dotgit = std.fmt.bufPrint(&path_buf, "{s}/.git", .{root}) catch return null;
+    const dotgit = std.mem.print(&path_buf, "{s}/.git", .{root}) catch return null;
     const st = std.Io.Dir.cwd().statFile(io, dotgit, .{}) catch return null;
 
     if (st.kind == .directory) {
@@ -258,7 +258,7 @@ pub fn readGitDir(io: std.Io, root: []const u8, out: []u8) ?[]const u8 {
         @memcpy(out[0..target.len], target);
         return out[0..target.len];
     }
-    return std.fmt.bufPrint(out, "{s}/{s}", .{ root, target }) catch null;
+    return std.mem.print(out, "{s}/{s}", .{ root, target }) catch null;
 }
 
 /// The current branch, or null when detached (or when `HEAD` is unreadable).
@@ -267,7 +267,7 @@ pub fn readGitDir(io: std.Io, root: []const u8, out: []u8) ?[]const u8 {
 /// name, and the model would `git checkout` it.
 pub fn readBranch(io: std.Io, git_dir: []const u8, out: []u8) ?[]const u8 {
     var path_buf: [max_path + 8]u8 = undefined;
-    const head = std.fmt.bufPrint(&path_buf, "{s}/HEAD", .{git_dir}) catch return null;
+    const head = std.mem.print(&path_buf, "{s}/HEAD", .{git_dir}) catch return null;
     const full = std.Io.Dir.cwd().readFileAlloc(io, head, std.heap.page_allocator, .limited(512)) catch return null;
     defer std.heap.page_allocator.free(full);
     return branchFromHead(full, out);
@@ -328,7 +328,7 @@ fn sandbox(rel: []u8, abs: []u8) ![]const u8 {
 
     var cwd: [max_path]u8 = undefined;
     const base = cwdPath(std.testing.io, null, &cwd) orelse return error.NoCwd;
-    const full = try std.fmt.bufPrint(abs, "{s}/{s}", .{ base, name });
+    const full = try std.mem.print(abs, "{s}/{s}", .{ base, name });
     return full;
 }
 
@@ -343,7 +343,7 @@ fn writeAt(io: std.Io, path: []const u8, data: []const u8) !void {
 }
 
 fn join(comptime fmt: []const u8, args: anytype, buf: []u8) ![]const u8 {
-    return std.fmt.bufPrint(buf, fmt, args);
+    return std.mem.print(buf, fmt, args);
 }
 
 test "branchFromHead: returns a branch, rejects a sha" {

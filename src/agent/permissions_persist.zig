@@ -8,7 +8,7 @@ const config_mod = @import("../config.zig");
 pub fn filePath(buf: []u8, env: ?*const std.process.Environ.Map) ?[]const u8 {
     const e = env orelse return null;
     const home = e.get("HOME") orelse return null;
-    return std.fmt.bufPrint(buf, "{s}/.config/zode/permissions.json", .{home}) catch null;
+    return std.mem.print(buf, "{s}/.config/zode/permissions.json", .{home}) catch null;
 }
 
 pub const ParseResult = struct {

@@ -38,7 +38,7 @@ pub const Loader = struct {
 
         // The project root: `<cwd>/.zode/output-styles`.
         if (self.project_root) |root| {
-            const pp = std.fmt.bufPrint(&bufs[n], "{s}/{s}", .{ root, styles.project_dir }) catch "";
+            const pp = std.mem.print(&bufs[n], "{s}/{s}", .{ root, styles.project_dir }) catch "";
             paths[n] = pp;
             n += 1;
         } else if (self.project_dir.len > 0) {
@@ -49,7 +49,7 @@ pub const Loader = struct {
         }
 
         if (self.repo_root) |root| {
-            const pr = std.fmt.bufPrint(&bufs[n], "{s}/{s}", .{ root, styles.project_dir }) catch "";
+            const pr = std.mem.print(&bufs[n], "{s}/{s}", .{ root, styles.project_dir }) catch "";
             paths[n] = pr;
             n += 1;
         }
@@ -63,7 +63,7 @@ pub const Loader = struct {
         } else if (self.env) |env| {
             const home = env.get("HOME") orelse "";
             if (home.len > 0) {
-                const uh = std.fmt.bufPrint(&bufs[n], "{s}/{s}", .{ home, styles.user_subdir }) catch "";
+                const uh = std.mem.print(&bufs[n], "{s}/{s}", .{ home, styles.user_subdir }) catch "";
                 paths[n] = uh;
                 n += 1;
             }
@@ -107,14 +107,14 @@ pub const Loader = struct {
                         if (entry.name.len == 0 or entry.name[0] == '.') continue;
                         if (!styles.validName(entry.name)) continue;
                         fallback_name = entry.name;
-                        break :blk std.fmt.bufPrint(&file_buf, "{s}/{s}/{s}", .{
+                        break :blk std.mem.print(&file_buf, "{s}/{s}/{s}", .{
                             dir_path, entry.name, styles.filename,
                         }) catch continue;
                     },
                     .file => blk: {
                         const stem = styles.stemOf(entry.name) orelse continue;
                         fallback_name = stem;
-                        break :blk std.fmt.bufPrint(&file_buf, "{s}/{s}", .{
+                        break :blk std.mem.print(&file_buf, "{s}/{s}", .{
                             dir_path, entry.name,
                         }) catch continue;
                     },
@@ -353,9 +353,9 @@ test "scan: project shadows repo and user, both layouts and bundled styles are f
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
     var path_bufs: [3][std.fs.max_path_bytes]u8 = undefined;
-    const proj = try std.fmt.bufPrint(&path_bufs[0], "{s}/proj", .{root});
-    const repo = try std.fmt.bufPrint(&path_bufs[1], "{s}/repo", .{root});
-    const user = try std.fmt.bufPrint(&path_bufs[2], "{s}/user", .{root});
+    const proj = try std.mem.print(&path_bufs[0], "{s}/proj", .{root});
+    const repo = try std.mem.print(&path_bufs[1], "{s}/repo", .{root});
+    const user = try std.mem.print(&path_bufs[2], "{s}/user", .{root});
 
     var loader = Loader.init(a, io, null);
     loader.project_dir = proj;
@@ -433,7 +433,7 @@ test "scan: two directories with the same frontmatter name are deduplicated" {
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const styles_dir = try std.fmt.bufPrint(&path_buf, "{s}/styles", .{root});
+    const styles_dir = try std.mem.print(&path_buf, "{s}/styles", .{root});
 
     var loader = Loader.init(a, io, null);
     loader.project_dir = styles_dir;

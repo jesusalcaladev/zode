@@ -525,7 +525,7 @@ fn writeFileAt(io: std.Io, path: []const u8, data: []const u8) !void {
 
 /// A registry file with the given pid and heartbeat, on the caller's stack.
 fn instanceJson(buf: []u8, pid: i32, last_beat_ms: i64) ![]const u8 {
-    return std.fmt.bufPrint(buf, "{{\"v\":1,\"pid\":{d},\"last_beat\":{d}}}", .{ pid, last_beat_ms });
+    return std.mem.print(buf, "{{\"v\":1,\"pid\":{d},\"last_beat\":{d}}}", .{ pid, last_beat_ms });
 }
 
 fn exists(io: std.Io, path: []const u8) bool {
@@ -588,7 +588,7 @@ const Sandbox = struct {
 
     fn path(self: *const Sandbox, buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
         _ = self;
-        return std.fmt.bufPrint(buf, fmt, args) catch unreachable;
+        return std.mem.print(buf, fmt, args) catch unreachable;
     }
 };
 

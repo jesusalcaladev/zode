@@ -92,7 +92,7 @@ fn cmdAdd(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     }
     const ms: u64 = @intCast(@divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
     var name_buf: [32]u8 = undefined;
-    const name = std.fmt.bufPrint(&name_buf, "{x}.json", .{@as(u64, @intCast(ms))}) catch "changeset.json";
+    const name = std.mem.print(&name_buf, "{x}.json", .{@as(u64, @intCast(ms))}) catch "changeset.json";
     const path = std.fmt.allocPrint(gpa, ".churn/{s}", .{name}) catch return 1;
     defer gpa.free(path);
     var payload: std.ArrayList(u8) = .empty;

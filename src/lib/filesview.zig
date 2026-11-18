@@ -317,7 +317,7 @@ test "Changed: the table stops at the cap and says how many were left out" {
     var i: usize = 0;
     while (i < max_changed + 5) : (i += 1) {
         var buf: [16]u8 = undefined;
-        c.note(try std.fmt.bufPrint(&buf, "f{d}.zig", .{i}));
+        c.note(try std.mem.print(&buf, "f{d}.zig", .{i}));
     }
     try testing.expectEqual(@as(usize, max_changed), c.count());
     try testing.expectEqual(@as(usize, 5), c.dropped);
@@ -326,7 +326,7 @@ test "Changed: the table stops at the cap and says how many were left out" {
 test "Changed: a path that does not fit is dropped, not truncated" {
     var c = Changed{};
     var buf: [path_max + 10]u8 = undefined;
-    const long = try std.fmt.bufPrint(&buf, "{s}", .{&repeat.rep("x", (path_max + 5))});
+    const long = try std.mem.print(&buf, "{s}", .{&repeat.rep("x", (path_max + 5))});
     c.note(long);
     try testing.expectEqual(@as(usize, 0), c.count());
     try testing.expectEqual(@as(usize, 1), c.dropped);

@@ -2034,7 +2034,7 @@ pub fn cmdSession(m: *tui.Model) void {
             (gpa.dupe(u8, title) catch "");
         // 29.3/30.3/35.3: <relative time> · <size> · #tag · <running summary>.
         var dbuf: [32]u8 = undefined;
-        const size = if (s.size_bytes > 0) std.fmt.bufPrint(&dbuf, "{d} KB", .{s.size_bytes / 1024}) catch "" else "";
+        const size = if (s.size_bytes > 0) std.mem.print(&dbuf, "{d} KB", .{s.size_bytes / 1024}) catch "" else "";
         const summary = if (s.summary.len > 0) s.summary else (if (s.last_prompt.len > 0) s.last_prompt else "");
         const desc = if (summary.len > 0 and s.tag.len > 0 and size.len > 0)
             (std.fmt.allocPrint(gpa, "{s} · {s} · #{s} · {s}", .{ age, size, s.tag, summary }) catch gpa.dupe(u8, age) catch "")
@@ -2056,7 +2056,7 @@ pub fn cmdSession(m: *tui.Model) void {
     }
 
     var tbuf: [64]u8 = undefined;
-    const ptitle = std.fmt.bufPrint(&tbuf, "Resume ({d} sessions)", .{owned_len}) catch "Resume";
+    const ptitle = std.mem.print(&tbuf, "Resume ({d} sessions)", .{owned_len}) catch "Resume";
     // openPickerIdxRename copies the title into the model's fixed buffer.
     m.openPickerIdxRename(
         tui.sessions_picker_tag,
@@ -3137,7 +3137,7 @@ pub fn extractReleaseSection(gpa: std.mem.Allocator, changelog: []const u8, vers
         "## [Unreleased]"
     else blk: {
         const v = if (version.len > 0 and (version[0] == 'v' or version[0] == 'V')) version[1..] else version;
-        break :blk std.fmt.bufPrint(&needle_buf, "## [{s}]", .{v}) catch return null;
+        break :blk std.mem.print(&needle_buf, "## [{s}]", .{v}) catch return null;
     };
 
     const start = std.mem.indexOf(u8, changelog, needle) orelse return null;
@@ -3477,7 +3477,7 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
     const cfg = cleanConfigDir(gpa, m.environ);
     var wt_buf: [std.fs.max_path_bytes]u8 = undefined;
     const project_root = agent.project_info.root() orelse agent.project_info.cwd();
-    const wt_root = std.fmt.bufPrint(&wt_buf, "{s}/{s}", .{ project_root, worktree_mod.worktrees_subdir }) catch null;
+    const wt_root = std.mem.print(&wt_buf, "{s}/{s}", .{ project_root, worktree_mod.worktrees_subdir }) catch null;
     defer if (cfg) |p| gpa.free(p);
 
     const now_secs = std.Io.Timestamp.now(agent.io_global, .real).toSeconds();
@@ -3694,7 +3694,7 @@ pub fn cmdBtw(m: *tui.Model, arg: ?[]const u8) void {
 
             var rep = subagent_mod.Report{};
             var desc_buf: [160]u8 = undefined;
-            const desc = std.fmt.bufPrint(&desc_buf, "btw: {s}", .{clipQuestion(job.question, 120)}) catch "btw side question";
+            const desc = std.mem.print(&desc_buf, "btw: {s}", .{clipQuestion(job.question, 120)}) catch "btw side question";
             const task = subagent_mod.Task{
                 .description = desc,
                 .prompt = job.question,
@@ -3894,7 +3894,7 @@ fn performCopy(m: *tui.Model, ctx: *const copytext.Ctx, index: usize) void {
     // The toast is drawn on later frames, so its text MUST outlive this stack
     // frame. Format into the Model-owned buffer: a stack local here is the exact
     // `field = bufPrint(&local)` escape that memaudit catches.
-    m.copy_toast_text = std.fmt.bufPrint(&m.copy_toast_buf, "Copied to clipboard ({d} chars)", .{chars}) catch "Copied to clipboard";
+    m.copy_toast_text = std.mem.print(&m.copy_toast_buf, "Copied to clipboard ({d} chars)", .{chars}) catch "Copied to clipboard";
     m.copy_toast_frames = 12;
 
     var name_buf: [64]u8 = undefined;
@@ -4122,7 +4122,7 @@ fn installUpdateNow(m: *tui.Model, ctx: selfupdate.Context) void {
         },
     };
     var nbuf: [160]u8 = undefined;
-    const note = std.fmt.bufPrint(&nbuf, "Updated to {s} · restart zode", .{tag}) catch "Updated · restart zode";
+    const note = std.mem.print(&nbuf, "Updated to {s} · restart zode", .{tag}) catch "Updated · restart zode";
     m.pushInfoFmt("updated to {s} · restart zode to use it", .{tag});
     m.pushNotification(note);
 }

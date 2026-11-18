@@ -387,9 +387,9 @@ pub const Roster = struct {
         // middle of bufPrint (which is exactly what a 4 KB error body does).
         var tmp: [reason_len_max]u8 = undefined;
         const text = if (detail.len == 0)
-            std.fmt.bufPrint(&tmp, "{s}", .{why.label()}) catch why.label()
+            std.mem.print(&tmp, "{s}", .{why.label()}) catch why.label()
         else
-            std.fmt.bufPrint(&tmp, "{s}: {s}", .{ why.label(), detail }) catch why.label();
+            std.mem.print(&tmp, "{s}: {s}", .{ why.label(), detail }) catch why.label();
 
         const cool: i128 = switch (why) {
             .failed, .stalled => failed_cooldown_ms,

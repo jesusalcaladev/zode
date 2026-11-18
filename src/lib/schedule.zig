@@ -178,7 +178,7 @@ fn writeStr(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !voi
 pub fn pathForSession(buf: []u8, session_path: []const u8) ![]const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, session_path, '.') orelse return error.BadFile;
     if (!std.mem.endsWith(u8, session_path, ".jsonl")) return error.BadFile;
-    return std.fmt.bufPrint(buf, "{s}.schedules.json", .{session_path[0..dot]}) catch error.BadFile;
+    return std.mem.print(buf, "{s}.schedules.json", .{session_path[0..dot]}) catch error.BadFile;
 }
 
 test "schedule: add/list/remove by id" {

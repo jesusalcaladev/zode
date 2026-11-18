@@ -301,7 +301,7 @@ test "the file cap truncates, and the byte cap warns" {
     var i: u8 = 0;
     while (i < max_files) : (i += 1) {
         var name: [32]u8 = undefined;
-        const nm = std.fmt.bufPrint(&name, "f{d}.txt", .{i}) catch unreachable;
+        const nm = std.mem.print(&name, "f{d}.txt", .{i}) catch unreachable;
         _ = st.items[0].addFile(gpa, nm, &chunk, true);
     }
     // Not one more file: the array is fixed.
@@ -324,7 +324,7 @@ test "the ring: the last one is the most recent, and when full the old one is dr
     var n: usize = 0;
     while (n < max_checkpoints + 2) : (n += 1) {
         var buf: [16]u8 = undefined;
-        const lbl = std.fmt.bufPrint(&buf, "turno {d}", .{n}) catch unreachable;
+        const lbl = std.mem.print(&buf, "turno {d}", .{n}) catch unreachable;
         st.begin(lbl);
         _ = st.items[0].addFile(gpa, "a.txt", "contenido", true);
     }

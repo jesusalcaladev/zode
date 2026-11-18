@@ -26,7 +26,7 @@ pub fn ensureAgentDefs(
     var roots: std.ArrayList([]u8) = .empty;
     defer roots.deinit(gpa);
     var proj_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const proj_path = std.fmt.bufPrint(&proj_buf, "{s}/{s}", .{ project_cwd, agentdefs.project_dir }) catch "";
+    const proj_path = std.mem.print(&proj_buf, "{s}/{s}", .{ project_cwd, agentdefs.project_dir }) catch "";
     if (proj_path.len > 0) {
         if (gpa.dupe(u8, proj_path)) |pc| roots.append(gpa, pc) catch gpa.free(pc) else |_| {}
     }
@@ -34,7 +34,7 @@ pub fn ensureAgentDefs(
         if (e.get("HOME")) |home| {
             if (home.len > 0) {
                 var user_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const user_path = std.fmt.bufPrint(&user_buf, "{s}/{s}/{s}", .{ home, ".config", agentdefs.user_subdir }) catch "";
+                const user_path = std.mem.print(&user_buf, "{s}/{s}/{s}", .{ home, ".config", agentdefs.user_subdir }) catch "";
                 if (user_path.len > 0) {
                     if (gpa.dupe(u8, user_path)) |uc| roots.append(gpa, uc) catch gpa.free(uc) else |_| {}
                 }
@@ -104,9 +104,9 @@ fn addDefinition(
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const file_path = if (is_dir)
-        std.fmt.bufPrint(&path_buf, "{s}/{s}/AGENT.md", .{ root, name }) catch return
+        std.mem.print(&path_buf, "{s}/{s}/AGENT.md", .{ root, name }) catch return
     else
-        std.fmt.bufPrint(&path_buf, "{s}/{s}.md", .{ root, name }) catch return;
+        std.mem.print(&path_buf, "{s}/{s}.md", .{ root, name }) catch return;
     const text = std.Io.Dir.cwd().readFileAlloc(io, file_path, gpa, .limited(64 * 1024)) catch return;
     defer gpa.free(text);
 
@@ -231,8 +231,8 @@ fn skillsLoader(
 ) skillstore.Loader {
     var loader = skillstore.Loader.init(gpa, io, env);
     if (project_cwd.len == 0) return loader;
-    loader.project_dir = std.fmt.bufPrint(&loader_path_bufs[0], "{s}/{s}", .{ project_cwd, skills.project_dir }) catch loader.project_dir;
-    loader.agents_dir = std.fmt.bufPrint(&loader_path_bufs[1], "{s}/{s}", .{ project_cwd, skills.agents_dir }) catch loader.agents_dir;
+    loader.project_dir = std.mem.print(&loader_path_bufs[0], "{s}/{s}", .{ project_cwd, skills.project_dir }) catch loader.project_dir;
+    loader.agents_dir = std.mem.print(&loader_path_bufs[1], "{s}/{s}", .{ project_cwd, skills.agents_dir }) catch loader.agents_dir;
     if (project_root) |root| {
         if (!std.mem.eql(u8, root, project_cwd)) loader.repo_root = root;
     }
@@ -376,7 +376,7 @@ fn stylesLoader(
 ) outputstyle_store.Loader {
     var loader = outputstyle_store.Loader.init(gpa, io, env);
     if (project_cwd.len == 0) return loader;
-    loader.project_dir = std.fmt.bufPrint(&loader_path_bufs[2], "{s}/{s}", .{ project_cwd, outputstyles.project_dir }) catch loader.project_dir;
+    loader.project_dir = std.mem.print(&loader_path_bufs[2], "{s}/{s}", .{ project_cwd, outputstyles.project_dir }) catch loader.project_dir;
     if (project_root) |root| {
         if (!std.mem.eql(u8, root, project_cwd)) loader.repo_root = root;
     }
@@ -466,7 +466,7 @@ test "discovery: loader paths survive the function that built them" {
 
     var churn: [4][std.fs.max_path_bytes]u8 = undefined;
     for (0..64) |i| {
-        _ = std.fmt.bufPrint(&churn[i % 4], "churn-{d}-{s}", .{ i, cwd }) catch {};
+        _ = std.mem.print(&churn[i % 4], "churn-{d}-{s}", .{ i, cwd }) catch {};
     }
     try std.testing.expect(std.mem.startsWith(u8, sk.project_dir, cwd));
     try std.testing.expect(std.mem.startsWith(u8, st.project_dir, cwd));

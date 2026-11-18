@@ -111,12 +111,12 @@ pub fn isAnthropic(cfg: Config, id: []const u8) bool {
 /// Path of `~/.config/zode/auth.json` (where the palette stores keys).
 pub fn authPath(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
     const dir = configDir(env, buf) orelse return null;
-    return std.fmt.bufPrint(buf[dir.len..], "{s}/auth.json", .{dir}) catch null;
+    return std.mem.print(buf[dir.len..], "{s}/auth.json", .{dir}) catch null;
 }
 
 fn configPath(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
     const dir = configdir.dir(env, buf) orelse return null;
-    return std.fmt.bufPrint(buf[dir.len..], "{s}/config.json", .{dir}) catch null;
+    return std.mem.print(buf[dir.len..], "{s}/config.json", .{dir}) catch null;
 }
 
 /// Loads `~/.config/zode/config.json`. Best-effort: if it is missing or corrupt
@@ -902,7 +902,7 @@ pub fn writeFileSecure(
         const rc = std.os.linux.getrandom(@ptrCast(&rnd), @sizeOf(u64), 0);
         if (@as(isize, @bitCast(rc)) > 0) nonce = rnd;
     }
-    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.{x:0>16}.tmp", .{ path, nonce });
+    const tmp = try std.mem.print(&tmp_buf, "{s}.{x:0>16}.tmp", .{ path, nonce });
 
     var file = try std.Io.Dir.cwd().createFile(io, tmp, .{
         .truncate = true,

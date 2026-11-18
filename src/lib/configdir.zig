@@ -9,11 +9,11 @@ const std = @import("std");
 pub fn dir(env: ?*const std.process.Environ.Map, buf: []u8) ?[]const u8 {
     const m = env orelse return null;
     if (m.get("XDG_CONFIG_HOME")) |xdg| {
-        if (xdg.len > 0) return std.fmt.bufPrint(buf, "{s}/zode", .{xdg}) catch null;
+        if (xdg.len > 0) return std.mem.print(buf, "{s}/zode", .{xdg}) catch null;
     }
     const home = m.get("HOME") orelse return null;
     if (home.len == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}/.config/zode", .{home}) catch null;
+    return std.mem.print(buf, "{s}/.config/zode", .{home}) catch null;
 }
 
 test "configdir: XDG_CONFIG_HOME wins, HOME is the fallback" {

@@ -513,7 +513,7 @@ test "team: broadcast is linear in team size" {
     try team.create("t");
     for (0..6) |i| {
         var buf: [8]u8 = undefined;
-        const n = std.fmt.bufPrint(&buf, "m{d}", .{i}) catch unreachable;
+        const n = std.mem.print(&buf, "m{d}", .{i}) catch unreachable;
         try team.add(n, false);
     }
     try std.testing.expectEqual(@as(usize, 6), try team.send("lead", "*", "hello"));

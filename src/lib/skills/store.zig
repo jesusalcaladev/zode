@@ -87,7 +87,7 @@ pub const Loader = struct {
             if (!std.mem.eql(u8, root, self.project_dir)) {
                 for ([_][]const u8{ self.project_dir, self.agents_dir }) |sub| {
                     if (n + 1 >= max_roots) break;
-                    const joined = std.fmt.bufPrint(&bufs[n], "{s}/{s}", .{ root, sub }) catch continue;
+                    const joined = std.mem.print(&bufs[n], "{s}/{s}", .{ root, sub }) catch continue;
                     out[n] = joined;
                     n += 1;
                 }
@@ -96,7 +96,7 @@ pub const Loader = struct {
 
         if (self.joinHome()) |home| {
             if (n >= max_roots) return n;
-            const joined = std.fmt.bufPrint(&bufs[n], "{s}/.config/{s}", .{ home, skills.user_subdir }) catch return n;
+            const joined = std.mem.print(&bufs[n], "{s}/.config/{s}", .{ home, skills.user_subdir }) catch return n;
             out[n] = joined;
             n += 1;
         }
@@ -164,7 +164,7 @@ pub const Loader = struct {
                 if (alreadyIn(out[0..n], entry.name)) continue;
 
                 var file_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const file_path = std.fmt.bufPrint(&file_buf, "{s}/{s}/{s}", .{
+                const file_path = std.mem.print(&file_buf, "{s}/{s}/{s}", .{
                     dir_path, entry.name, skills.filename,
                 }) catch continue;
 
@@ -275,7 +275,7 @@ pub const Loader = struct {
             };
             errdefer self.gpa.free(desc_copy);
             var path_buf: [128]u8 = undefined;
-            const path_str = std.fmt.bufPrint(path_buf[0..], "bundled://{s}", .{bs.name}) catch {
+            const path_str = std.mem.print(path_buf[0..], "bundled://{s}", .{bs.name}) catch {
                 self.gpa.free(name_copy);
                 self.gpa.free(desc_copy);
                 continue;
@@ -586,7 +586,7 @@ test "alreadyIn: finds exact duplicates, not similar ones" {
 /// the worst way — the fixtures were written to a garbage path and every
 /// discovery test failed with "found 0" for no visible reason.
 fn tmpRoot(out: []u8) ![]const u8 {
-    return std.fmt.bufPrint(out, ".zode-skills-test-{d}", .{std.testing.random_seed});
+    return std.mem.print(out, ".zode-skills-test-{d}", .{std.testing.random_seed});
 }
 
 /// `<root>/<sub>`, as gpa memory (the `project_dir` field outlives the buffer).
@@ -596,7 +596,7 @@ fn skillRootOf(gpa: std.mem.Allocator, root: []const u8, sub: []const u8) ![]u8 
 
 fn writeFixture(root: []const u8, rel: []const u8, body: []const u8) !void {
     var buf: [512]u8 = undefined;
-    const full = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ root, rel });
+    const full = try std.mem.print(&buf, "{s}/{s}", .{ root, rel });
     if (std.fs.path.dirname(full)) |dir| {
         try std.Io.Dir.cwd().createDirPath(std.testing.io, dir);
     }
@@ -725,7 +725,7 @@ test "scan: the PROJECT shadows the user's one with the same name (they do not m
     var env_map = std.process.Environ.Map.init(std.testing.allocator);
     defer env_map.deinit();
     var home_buf: [320]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, "{s}/home", .{root});
+    const home = try std.mem.print(&home_buf, "{s}/home", .{root});
     try env_map.put("HOME", home);
 
     var loader = store.Loader.init(gpa, std.testing.io, &env_map);
@@ -1155,7 +1155,7 @@ test "stampPath: a file that disappears is remembered as missing" {
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
     var rel: [64]u8 = undefined;
-    const rel_path = try std.fmt.bufPrint(&rel, "{s}/SKILL.md", .{root});
+    const rel_path = try std.mem.print(&rel, "{s}/SKILL.md", .{root});
     try writeFixture(root, "SKILL.md", "---\ndescription: x\n---\n");
 
     var before: store.Stamp = .{};
@@ -1220,11 +1220,11 @@ test "scan: respects the entry cap (it does not grow without limit)" {
     var i: usize = 0;
     while (i < 12) : (i += 1) {
         var name_buf: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "s{d}", .{i});
+        const name = try std.mem.print(&name_buf, "s{d}", .{i});
         var body_buf: [128]u8 = undefined;
-        const body = try std.fmt.bufPrint(&body_buf, "---\ndescription: d{d}\n---\n", .{i});
+        const body = try std.mem.print(&body_buf, "---\ndescription: d{d}\n---\n", .{i});
         var rel: [64]u8 = undefined;
-        const rel_path = try std.fmt.bufPrint(&rel, ".zode/skills/{s}/SKILL.md", .{name});
+        const rel_path = try std.mem.print(&rel, ".zode/skills/{s}/SKILL.md", .{name});
         try writeFixture(root, rel_path, body);
     }
 

@@ -263,7 +263,7 @@ test "the built-in prompt does NOT carry a second list of the tools" {
         var named: usize = 0;
         for (tools_mod.defs) |d| {
             var needle_buf: [96]u8 = undefined;
-            const needle = std.fmt.bufPrint(&needle_buf, "`{s}`", .{d.name}) catch continue;
+            const needle = std.mem.print(&needle_buf, "`{s}`", .{d.name}) catch continue;
             if (std.mem.indexOf(u8, line, needle) != null) named += 1;
         }
         if (named >= 3) {

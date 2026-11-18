@@ -114,7 +114,7 @@ pub fn replaceImagePlaceholders(text: []const u8) []const u8 {
             }
             if (is_image) {
                 var repl_buf: [32]u8 = undefined;
-                const repl_slice = std.fmt.bufPrint(repl_buf[0..], "[image.{s}]", .{ext}) catch break;
+                const repl_slice = std.mem.print(repl_buf[0..], "[image.{s}]", .{ext}) catch break;
                 const repl_len = repl_slice.len;
                 if (ri + repl_len > 512) break;
                 @memcpy(result[ri .. ri + repl_len], repl_buf[0..repl_len]);

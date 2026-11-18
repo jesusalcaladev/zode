@@ -69,7 +69,7 @@ pub fn runParallelBatch(
         m.pushToolStart(call.name, arg);
     }
     var batch_buf: [128]u8 = undefined;
-    const batch_label = std.fmt.bufPrint(&batch_buf, "{d} searches in parallel", .{n}) catch "searching";
+    const batch_label = std.mem.print(&batch_buf, "{d} searches in parallel", .{n}) catch "searching";
     ops.setStatusTooling(ops.ctx, batch_label);
     m.toolRunEnd();
 
@@ -150,7 +150,7 @@ pub fn runParallelBatch(
 
     const total_ms = elapsedMs(io, t0);
     var sum_buf: [128]u8 = undefined;
-    const sum = std.fmt.bufPrint(&sum_buf, "{d} searches in parallel · {d}.{d}s", .{
+    const sum = std.mem.print(&sum_buf, "{d} searches in parallel · {d}.{d}s", .{
         n,
         total_ms / 1000,
         (total_ms % 1000) / 100,
@@ -522,7 +522,7 @@ pub fn execOneCall(
         var detail: []const u8 = if (std.mem.eql(u8, call.name, "batch"))
             tools_mod.batchPermissionDetail(call.args_json, arena)
         else
-            std.fmt.bufPrint(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
+            std.mem.print(&dbuf, "{s} {s}", .{ call.name, arg }) catch call.name;
         if (std.mem.eql(u8, call.name, "bash")) {
             detail = tool_exec_policy.enrichBashPermissionDetail(detail, arg, arena);
         }

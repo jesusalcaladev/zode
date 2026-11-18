@@ -84,10 +84,10 @@ pub fn pipelineWriteGate(
     const auto_allowed = ops.permAutoAllowed(call_name, arg, args_json, arena);
     if (rule_allowed or auto_allowed) return null;
     var dbuf: [384]u8 = undefined;
-    const detail = std.fmt.bufPrint(&dbuf, "tester: {s} {s}", .{ call_name, arg }) catch call_name;
+    const detail = std.mem.print(&dbuf, "tester: {s} {s}", .{ call_name, arg }) catch call_name;
     var with_rule: [512]u8 = undefined;
     const full = if (rule_text.len > 0)
-        std.fmt.bufPrint(&with_rule, "{s} — your rule `{s}` matches", .{ detail, rule_text }) catch detail
+        std.mem.print(&with_rule, "{s} — your rule `{s}` matches", .{ detail, rule_text }) catch detail
     else
         detail;
     return switch (m.requestPermission(call_name, full)) {

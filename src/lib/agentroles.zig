@@ -136,13 +136,13 @@ pub fn roleSubsetOfCaller(role: Role, caller_allowed: []const []const u8) bool {
 /// into the system prompt.
 pub fn memoryDir(buf: []u8, project_cwd: []const u8, role: Role) ?[]const u8 {
     if (project_cwd.len == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}/.zode/agent-memory/{s}", .{ project_cwd, role.name() }) catch null;
+    return std.mem.print(buf, "{s}/.zode/agent-memory/{s}", .{ project_cwd, role.name() }) catch null;
 }
 
 /// Path to the role's lessons file inside the memory directory.
 pub fn lessonsPath(buf: []u8, project_cwd: []const u8, role: Role) ?[]const u8 {
     if (project_cwd.len == 0) return null;
-    return std.fmt.bufPrint(buf, "{s}/.zode/agent-memory/{s}/lessons.md", .{ project_cwd, role.name() }) catch null;
+    return std.mem.print(buf, "{s}/.zode/agent-memory/{s}/lessons.md", .{ project_cwd, role.name() }) catch null;
 }
 
 /// Reads role memory (lessons) if present. Returns empty slice when missing or
@@ -205,7 +205,7 @@ pub fn memoryPreface(arena: std.mem.Allocator, mem: []const u8) []const u8 {
 pub fn subagentsDir(buf: []u8, session_path: []const u8) ?[]const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, session_path, '/') orelse return null;
     const dir = session_path[0..slash];
-    return std.fmt.bufPrint(buf, "{s}/subagents", .{dir}) catch null;
+    return std.mem.print(buf, "{s}/subagents", .{dir}) catch null;
 }
 
 /// Path of a saved subagent window: `<subagentsDir>/<id>.jsonl`.
@@ -213,7 +213,7 @@ pub fn windowPath(buf: []u8, session_path: []const u8, id: []const u8) ?[]const 
     if (!isValidId(id)) return null;
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = subagentsDir(&dir_buf, session_path) orelse return null;
-    return std.fmt.bufPrint(buf, "{s}/{s}.jsonl", .{ dir, id }) catch null;
+    return std.mem.print(buf, "{s}/{s}.jsonl", .{ dir, id }) catch null;
 }
 
 /// A valid subagent session id: short, filesystem-safe.
@@ -229,7 +229,7 @@ pub fn isValidId(id: []const u8) bool {
 
 /// Generates a short id from a counter into `buf`.
 pub fn newId(buf: []u8, counter: u64) []const u8 {
-    return std.fmt.bufPrint(buf, "sa-{x}", .{counter}) catch "sa-0";
+    return std.mem.print(buf, "sa-{x}", .{counter}) catch "sa-0";
 }
 
 /// One window message (used for serialization and parsing).
@@ -262,7 +262,7 @@ fn appendJsonString(out: *std.ArrayList(u8), arena: std.mem.Allocator, s: []cons
             else => {
                 if (c < 0x20) {
                     var esc: [6]u8 = undefined;
-                    const e = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch "\\u0000";
+                    const e = std.mem.print(&esc, "\\u{x:0>4}", .{c}) catch "\\u0000";
                     try out.appendSlice(arena, e);
                 } else {
                     try out.append(arena, c);
@@ -444,7 +444,7 @@ test "agentroles: appendMemory creates the lessons file and readMemory reads it 
     var cwdbuf: [std.fs.max_path_bytes]u8 = undefined;
     const n = std.Io.Dir.cwd().readLink(std.testing.io, "/proc/self/cwd", &cwdbuf) catch 0;
     const base: []const u8 = if (n > 0 and cwdbuf[0] == '/') cwdbuf[0..n] else ".";
-    const root = try std.fmt.bufPrint(&abs, "{s}/{s}", .{ base, name });
+    const root = try std.mem.print(&abs, "{s}/{s}", .{ base, name });
 
     try std.testing.expectEqualStrings("", readMemory(std.testing.io, std.testing.allocator, root, .explore));
 
@@ -473,9 +473,9 @@ test "agentroles: saveWindow/loadWindow round-trip on disk" {
     var cwdbuf: [std.fs.max_path_bytes]u8 = undefined;
     const n = std.Io.Dir.cwd().readLink(std.testing.io, "/proc/self/cwd", &cwdbuf) catch 0;
     const base: []const u8 = if (n > 0 and cwdbuf[0] == '/') cwdbuf[0..n] else ".";
-    const root = try std.fmt.bufPrint(&abs, "{s}/{s}", .{ base, name });
+    const root = try std.mem.print(&abs, "{s}/{s}", .{ base, name });
     var sp_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const session_path = try std.fmt.bufPrint(&sp_buf, "{s}/session.jsonl", .{root});
+    const session_path = try std.mem.print(&sp_buf, "{s}/session.jsonl", .{root});
 
     const msgs = [_]WindowMsg{
         .{ .role = "system", .content = "sys" },

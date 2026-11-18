@@ -84,14 +84,14 @@ pub fn validName(name: []const u8) bool {
 /// or the buffer is too small — a path that escapes the repo is never built.
 pub fn worktreePath(buf: []u8, repo_root: []const u8, name: []const u8) ?[]const u8 {
     if (!validName(name)) return null;
-    return std.fmt.bufPrint(buf, "{s}/{s}/{s}", .{ repo_root, worktrees_subdir, name }) catch null;
+    return std.mem.print(buf, "{s}/{s}/{s}", .{ repo_root, worktrees_subdir, name }) catch null;
 }
 
 /// The branch created with the worktree. Prefixed so it cannot collide with a
 /// user's branch by accident (`zode-wt/<name>`).
 pub fn branchName(buf: []u8, name: []const u8) ?[]const u8 {
     if (!validName(name)) return null;
-    return std.fmt.bufPrint(buf, "zode-wt/{s}", .{name}) catch null;
+    return std.mem.print(buf, "zode-wt/{s}", .{name}) catch null;
 }
 
 /// One line of `git status --porcelain` → a short human description. We keep

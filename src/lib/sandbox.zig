@@ -126,7 +126,7 @@ pub fn detect(io: std.Io, dir: std.Io.Dir, path: ?[]const u8) Kind {
         while (it.next()) |d| {
             if (d.len == 0) continue;
             for ([_]Kind{ .bwrap, .firejail }) |kind| {
-                const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ d, binary(kind) }) catch continue;
+                const full = std.mem.print(&buf, "{s}/{s}", .{ d, binary(kind) }) catch continue;
                 dir.access(io, full, .{}) catch continue;
                 return kind;
             }
@@ -134,7 +134,7 @@ pub fn detect(io: std.Io, dir: std.Io.Dir, path: ?[]const u8) Kind {
     }
     for (standard_dirs) |d| {
         for ([_]Kind{ .bwrap, .firejail }) |kind| {
-            const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ d, binary(kind) }) catch continue;
+            const full = std.mem.print(&buf, "{s}/{s}", .{ d, binary(kind) }) catch continue;
             dir.access(io, full, .{}) catch continue;
             return kind;
         }

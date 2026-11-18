@@ -245,7 +245,7 @@ pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const
         }
     }
     setCacheBreakPrev(hashes);
-    const composed = std.fmt.bufPrint(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}", .{
+    const composed = std.mem.print(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}", .{
         effective_base,
         routing,
         verification_prompt,
@@ -261,7 +261,7 @@ pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const
         if (out.len <= blocks_len + overhead) break :blk routing;
         const room = out.len - blocks_len - overhead;
         const fit = prompt_mod.fitPrefix(effective_base, room);
-        break :blk std.fmt.bufPrint(
+        break :blk std.mem.print(
             out,
             "{s}\n{s}: {d} of {d} bytes kept{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}",
             .{

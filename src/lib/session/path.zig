@@ -89,7 +89,7 @@ pub fn projectHash(arena: std.mem.Allocator, project_root: []const u8) ![]u8 {
     std.crypto.hash.sha2.Sha256.hash(project_root, &digest, .{});
     var out = try arena.alloc(u8, 32);
     for (digest[0..16], 0..) |b, i| {
-        _ = std.fmt.bufPrint(out[i * 2 .. i * 2 + 2], "{x:0>2}", .{b}) catch unreachable;
+        _ = std.mem.print(out[i * 2 .. i * 2 + 2], "{x:0>2}", .{b}) catch unreachable;
     }
     return out;
 }

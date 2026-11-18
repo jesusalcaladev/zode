@@ -290,7 +290,7 @@ fn tagEnd(html: []const u8, i: usize) ?usize {
 /// into the buffer being indexed is the worst possible kind of bug: it gives no error, it gives garbage.
 fn closingTag(html: []const u8, open_at: usize, name: []const u8) ?usize {
     var needle_buf: [64]u8 = undefined;
-    const needle = std.fmt.bufPrint(&needle_buf, "</{s}", .{name}) catch return null;
+    const needle = std.mem.print(&needle_buf, "</{s}", .{name}) catch return null;
     const at = std.mem.indexOfPos(u8, html, open_at + 1, needle) orelse return null;
     const gt = std.mem.indexOfScalarPos(u8, html, at, '>') orelse return null;
     return gt + 1;

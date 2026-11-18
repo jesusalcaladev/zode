@@ -101,7 +101,7 @@ pub fn formatCompact(buf: []u8, c: Change, nerd_icons: bool) []const u8 {
     _ = nerd_icons;
     var path_buf: [200]u8 = undefined;
     const p = shortenPathInto(&path_buf, c.path, 56);
-    return std.fmt.bufPrint(buf, "{s}  +{d} -{d}", .{ p, c.added, c.removed }) catch c.path;
+    return std.mem.print(buf, "{s}  +{d} -{d}", .{ p, c.added, c.removed }) catch c.path;
 }
 
 /// Expanded file card lines (renderer applies styles/borders as appropriate).

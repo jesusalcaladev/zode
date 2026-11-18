@@ -90,7 +90,7 @@ pub fn run(
         ops.refreshContextUsage(m);
         const turn_ms = ops.elapsedMs(turn_t0);
         var buf: [64]u8 = undefined;
-        const done_status = std.fmt.bufPrint(&buf, "done · {d}.{d}s", .{ turn_ms / 1000, (turn_ms % 1000) / 100 }) catch "done";
+        const done_status = std.mem.print(&buf, "done · {d}.{d}s", .{ turn_ms / 1000, (turn_ms % 1000) / 100 }) catch "done";
         ops.setStatusWithZo(m, .done, done_status);
         return false;
     }

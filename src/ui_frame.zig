@@ -199,7 +199,7 @@ fn sgr(st: vaxis.Style) []const u8 {
     var n: usize = 0;
     const add = struct {
         fn f(b: []u8, at: usize, comptime fmt: []const u8, args: anytype) usize {
-            return at + (std.fmt.bufPrint(b[at..], fmt, args) catch return at).len;
+            return at + (std.mem.print(b[at..], fmt, args) catch return at).len;
         }
     }.f;
     n = add(&buf, n, "\x1b[0", .{});

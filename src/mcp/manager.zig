@@ -38,7 +38,7 @@ pub const ErrText = struct {
     len: usize = 0,
 
     pub fn set(self: *ErrText, comptime fmt: []const u8, args: anytype) void {
-        const s = std.fmt.bufPrint(&self.buf, fmt, args) catch self.buf[0..0];
+        const s = std.mem.print(&self.buf, fmt, args) catch self.buf[0..0];
         self.len = s.len;
     }
     pub fn setText(self: *ErrText, s: []const u8) void {

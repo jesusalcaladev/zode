@@ -89,5 +89,5 @@ pub fn enrichBashPermissionDetail(detail: []const u8, command_arg: []const u8, a
     const why = cmdsafety.classify(command_arg, arena).why;
     if (why.len == 0) return detail;
     var both: [640]u8 = undefined;
-    return std.fmt.bufPrint(&both, "{s} — {s}", .{ detail, why }) catch detail;
+    return std.mem.print(&both, "{s} — {s}", .{ detail, why }) catch detail;
 }

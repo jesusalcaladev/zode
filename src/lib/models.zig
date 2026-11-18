@@ -50,7 +50,7 @@ pub fn dbg(comptime fmt: []const u8, args: anytype) void {
     providers.appendEnvRedactionKeys(&keys, std.heap.page_allocator, session_mod.redactionEnv());
     if (session_mod.redactionExtraKey().len >= 8) keys.append(std.heap.page_allocator, session_mod.redactionExtraKey()) catch {};
     for (session_mod.redactionExtraKeys()) |k| if (k.len >= 8) keys.append(std.heap.page_allocator, k) catch {};
-    const raw = std.fmt.bufPrint(&line, fmt, args) catch return;
+    const raw = std.mem.print(&line, fmt, args) catch return;
     const scrubbed = redact_mod.redact(std.heap.page_allocator, raw, keys.items) catch raw;
     defer if (scrubbed.ptr != raw.ptr) std.heap.page_allocator.free(scrubbed);
     const src = if (scrubbed.len <= scrubbed_buf.len) blk: {

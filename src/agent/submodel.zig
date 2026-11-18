@@ -20,9 +20,9 @@ pub const Target = struct {
 /// The endpoint for a target.
 pub fn targetUrl(buf: []u8, t: Target) []const u8 {
     return if (t.kind == .anthropic)
-        std.fmt.bufPrint(buf, "{s}/messages", .{t.base_url}) catch t.base_url
+        std.mem.print(buf, "{s}/messages", .{t.base_url}) catch t.base_url
     else
-        std.fmt.bufPrint(buf, "{s}/chat/completions", .{t.base_url}) catch t.base_url;
+        std.mem.print(buf, "{s}/chat/completions", .{t.base_url}) catch t.base_url;
 }
 
 pub const SubPick = struct {

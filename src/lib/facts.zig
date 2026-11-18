@@ -324,7 +324,7 @@ test "facts: store stays capped, oldest evicted first" {
     var buf: [32]u8 = undefined;
     var i: usize = 0;
     while (i < max_facts + 10) : (i += 1) {
-        const t = std.fmt.bufPrint(&buf, "fact {d}", .{i}) catch continue;
+        const t = std.mem.print(&buf, "fact {d}", .{i}) catch continue;
         try std.testing.expect(s.add(.fact, t, "f.zig", 0));
     }
     try std.testing.expectEqual(max_facts, s.len);

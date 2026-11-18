@@ -633,7 +633,7 @@ pub fn pathForSession(buf: []u8, session_path: []const u8) ![]const u8 {
         session_path[0 .. session_path.len - ".json".len]
     else
         session_path;
-    return std.fmt.bufPrint(buf, "{s}.tasks.json", .{stem});
+    return std.mem.print(buf, "{s}.tasks.json", .{stem});
 }
 
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {

@@ -469,7 +469,7 @@ fn newerFirst(_: void, a: Entry, b: Entry) bool {
 /// are two different ages that read the same.
 pub fn ageLabel(now: i64, then: i64, buf: []u8) []const u8 {
     const d = now - then;
-    if (d <= 1) return std.fmt.bufPrint(buf, "now", .{}) catch "now";
+    if (d <= 1) return std.mem.print(buf, "now", .{}) catch "now";
     const s: u64 = @intCast(d);
     const pair: struct { n: u64, unit: []const u8 } = if (s < 60)
         .{ .n = s, .unit = "s" }
@@ -485,7 +485,7 @@ pub fn ageLabel(now: i64, then: i64, buf: []u8) []const u8 {
         .{ .n = s / (30 * 86_400), .unit = "mo" }
     else
         .{ .n = s / (365 * 86_400), .unit = "y" };
-    return std.fmt.bufPrint(buf, "{d}{s}", .{ pair.n, pair.unit }) catch "?";
+    return std.mem.print(buf, "{d}{s}", .{ pair.n, pair.unit }) catch "?";
 }
 
 // ── tests ─────────────────────────────────────────────────────

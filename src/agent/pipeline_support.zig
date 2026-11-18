@@ -49,7 +49,7 @@ pub fn gitDiffHEAD(arena: std.mem.Allocator, io: std.Io) []const u8 {
     const n = pipeline_mod.review_diff_cap;
     const buf = arena.alloc(u8, n + 64) catch return diff[0..n];
     @memcpy(buf[0..n], diff[0..n]);
-    const tail = std.fmt.bufPrint(buf[n..], "\n[diff truncated at {d} KB — ask for specific files]\n", .{n / 1024}) catch "";
+    const tail = std.mem.print(buf[n..], "\n[diff truncated at {d} KB — ask for specific files]\n", .{n / 1024}) catch "";
     return buf[0 .. n + tail.len];
 }
 
@@ -70,14 +70,14 @@ pub fn pipelineRunDir(buf: []u8, io: std.Io) ?[]const u8 {
     const pid: usize = @intCast(std.os.linux.getpid());
     var id_buf: [64]u8 = undefined;
     const id = pipeline_mod.runIdBuf(&id_buf, ts, pid);
-    return std.fmt.bufPrint(buf, ".zode/pipeline/{s}", .{id}) catch null;
+    return std.mem.print(buf, ".zode/pipeline/{s}", .{id}) catch null;
 }
 
 /// Best-effort write of one artifact. Never fails the run.
 pub fn writeArtifact(io: std.Io, run_dir: []const u8, name: []const u8, data: []const u8) void {
     std.Io.Dir.cwd().createDirPath(io, run_dir) catch return;
     var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ run_dir, name }) catch return;
+    const path = std.mem.print(&path_buf, "{s}/{s}", .{ run_dir, name }) catch return;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data }) catch {};
 }
 

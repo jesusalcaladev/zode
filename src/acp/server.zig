@@ -593,7 +593,7 @@ const Server = struct {
             std.Io.Dir.cwd().deleteFile(self.io, path) catch {};
             inline for (.{ ".meta.json", ".caps.json", ".compact.json" }) |suf| {
                 var sbuf: [std.fs.max_path_bytes]u8 = undefined;
-                if (std.fmt.bufPrint(&sbuf, "{s}{s}", .{ path, suf })) |sp| {
+                if (std.mem.print(&sbuf, "{s}{s}", .{ path, suf })) |sp| {
                     std.Io.Dir.cwd().deleteFile(self.io, sp) catch {};
                 } else |_| {}
             }
@@ -766,9 +766,9 @@ const Server = struct {
         const kind = chat.kindForProvider(def.id);
         var url_buf: [1024]u8 = undefined;
         const url = if (kind == .anthropic)
-            std.fmt.bufPrint(&url_buf, "{s}/messages", .{def.base_url}) catch def.base_url
+            std.mem.print(&url_buf, "{s}/messages", .{def.base_url}) catch def.base_url
         else
-            std.fmt.bufPrint(&url_buf, "{s}/chat/completions", .{def.base_url}) catch def.base_url;
+            std.mem.print(&url_buf, "{s}/chat/completions", .{def.base_url}) catch def.base_url;
         const key = providers.keyFor(def, self.env);
         var model_name: []const u8 = if (self.env) |e| (e.get("ZODE_MODEL") orelse "") else "";
         if (model_name.len == 0) model_name = agent.userModel();
@@ -1054,7 +1054,7 @@ fn persistAlways(tool_name: []const u8, subjects: []const []const u8, action: pe
     const pattern = sanitizePattern(subject, &pat_buf);
     if (action == .allow and permrules.isDangerousPattern(tool_name, pattern)) return;
     var text_buf: [768]u8 = undefined;
-    const text = std.fmt.bufPrint(&text_buf, "{s}({s}) {s}", .{ tool_name, pattern, action.name() }) catch return;
+    const text = std.mem.print(&text_buf, "{s}({s}) {s}", .{ tool_name, pattern, action.name() }) catch return;
     _ = agent.savePermRule(.{
         .tool = tool_name,
         .pattern = pattern,

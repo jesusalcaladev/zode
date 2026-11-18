@@ -618,7 +618,7 @@ fn dbgPrint(comptime fmt: []const u8, args: anytype) void {
     providers.appendEnvRedactionKeys(&keys, std.heap.page_allocator, session_mod.redactionEnv());
     if (session_mod.redactionExtraKey().len >= 8) keys.append(std.heap.page_allocator, session_mod.redactionExtraKey()) catch {};
     for (session_mod.redactionExtraKeys()) |k| if (k.len >= 8) keys.append(std.heap.page_allocator, k) catch {};
-    const msg = std.fmt.bufPrint(&raw, fmt, args) catch return;
+    const msg = std.mem.print(&raw, fmt, args) catch return;
     const scrubbed = redact_mod.redact(std.heap.page_allocator, msg, keys.items) catch msg;
     defer if (scrubbed.ptr != msg.ptr) std.heap.page_allocator.free(scrubbed);
     std.debug.print("{s}", .{scrubbed});
@@ -1329,7 +1329,7 @@ fn streamRaw(
         setServerMessageInto(&ctx.err, ctx.raw[0..ctx.raw_len]);
         if (ctx.mirror_globals) main_err = ctx.err;
         if (ctx.err.len == 0) {
-            const fb = std.fmt.bufPrint(&ctx.err.buf, "HTTP {d}", .{res.status}) catch return err;
+            const fb = std.mem.print(&ctx.err.buf, "HTTP {d}", .{res.status}) catch return err;
             ctx.err.len = fb.len;
             if (ctx.mirror_globals) main_err = ctx.err;
         }
