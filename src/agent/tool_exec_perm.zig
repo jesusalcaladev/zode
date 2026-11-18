@@ -18,14 +18,6 @@ pub fn formatRuleAskText(rule_text: []const u8, pattern: []const u8, source: per
 
 pub const HookPermDecision = enum { allow, deny, ask };
 
-pub fn mapHookPermDecision(decision: anytype) HookPermDecision {
-    // hooks_mod.permissionDecision returns an enum with allow/deny/ask variants.
-    return switch (decision) {
-        .allow => .allow,
-        .deny => .deny,
-        .ask => .ask,
-    };
-}
 
 /// The rule the "always allow" answer would remember, as TEXT.
 /// See agent.zig permSuggestion for semantics.
@@ -214,11 +206,6 @@ test "formatRuleDenyMessage" {
     try std.testing.expect(std.mem.indexOf(u8, msg, "project") != null);
 }
 
-/// Whether to offer sandboxed execution for a flagged bash command in the dialog.
-pub fn shouldOfferSandbox(is_bash: bool, command: []const u8, flagged: bool, sandbox_available: bool) bool {
-    _ = command;
-    return is_bash and flagged and sandbox_available;
-}
 
 pub fn formatRiskyPathDetail(path: []const u8, why: []const u8, buf: []u8) []const u8 {
     return std.mem.print(

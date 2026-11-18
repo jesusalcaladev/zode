@@ -39,9 +39,6 @@ pub const TurnCtx = struct {
         self.text.deinit(gpa);
     }
 
-    pub fn finishSlice(self: *const TurnCtx) []const u8 {
-        return self.finish[0..self.finish_len];
-    }
 };
 
 /// Budget for tool results of one assistant message.

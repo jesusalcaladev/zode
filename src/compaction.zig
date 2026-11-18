@@ -509,12 +509,6 @@ pub fn describe(m: Mode) []const u8 {
     };
 }
 
-/// The compaction budget: `budgetPctFor`% of the limit, scaled by window size.
-/// For a 1M model this is ~98% (practically no compaction); for a 128k model
-/// it stays 80%.
-pub fn budgetTokens(env: ?*const std.process.Environ.Map) i64 {
-    return budgetFor(env, 0);
-}
 
 pub fn budgetFor(env: ?*const std.process.Environ.Map, model_ctx: u32) i64 {
     return @divTrunc(contextLimitFor(env, model_ctx) * budgetPctFor(env, model_ctx), 100);

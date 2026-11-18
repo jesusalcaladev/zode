@@ -269,13 +269,6 @@ pub fn drainCompletions(self: *Registry, arena: std.mem.Allocator) []Completion 
     return out.toOwnedSlice(arena) catch &.{};
 }
 
-/// The raw id of a running job (for the UI: "which command is that?").
-pub fn commandOf(self: *Registry, id: u32) ?[]const u8 {
-    for (&self.slots) |*j| {
-        if (j.isLive() and j.id == id) return j.commandSlice();
-    }
-    return null;
-}
 
 pub fn liveCount(self: *Registry) usize {
     var n: usize = 0;
@@ -1609,11 +1602,3 @@ test "Phase 10: killed task reports its terminal state" {
     });
 }
 
-fn killAllCount(reg: *Registry, io: std.Io, budget_ms: u64) usize {
-    killAll(reg, io, budget_ms);
-    var n: usize = 0;
-    for (&reg.slots) |*j| {
-        if (j.isLive()) n += 1;
-    }
-    return n;
-}

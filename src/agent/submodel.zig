@@ -222,9 +222,6 @@ pub fn submodelReport(m: *tui.Model, user_config: config_mod.Config, ctx: Resolv
     }
 }
 
-pub fn failReason() []const u8 {
-    return sub_fail_buf[0..sub_fail_len];
-}
 
 fn envGet(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const e = env orelse return null;

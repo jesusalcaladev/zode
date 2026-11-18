@@ -1058,23 +1058,7 @@ fn firstLineCut(arena: std.mem.Allocator, text: []const u8, max_bytes: usize) []
     return arena.dupe(u8, cut) catch "";
 }
 
-/// Rename a session by writing the new name to its sidecar.
-/// Both of these take the SESSION path and let `sessionindex` derive the
-/// sidecar: the first version derived it here and passed the sidecar in, and
-/// `writeMeta` derived it AGAIN, so the name was written to
-/// `zode-1.meta.meta.json` and the list never saw it.
-pub fn setSessionName(io: std.Io, arena: std.mem.Allocator, path: []const u8, name: []const u8) !void {
-    var meta = sessionindex.readMeta(arena, io, path);
-    meta.name = try arena.dupe(u8, name);
-    try sessionindex.writeMeta(io, arena, path, meta);
-}
 
-/// Set the model in the session's sidecar.
-pub fn setSessionModel(io: std.Io, arena: std.mem.Allocator, path: []const u8, model: []const u8) !void {
-    var meta = sessionindex.readMeta(arena, io, path);
-    meta.model = try arena.dupe(u8, model);
-    try sessionindex.writeMeta(io, arena, path, meta);
-}
 
 /// Frees a list of entries (their path/name/model/preview are in the arena).
 pub fn freeEntries(arena: std.mem.Allocator, entries: []Entry) void {

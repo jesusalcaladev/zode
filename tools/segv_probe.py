@@ -91,9 +91,12 @@ def main() -> int:
         print("FAIL: expected a signal death, got exit", os.WEXITSTATUS(status))
         failed = True
 
-    restored = b"\x1b[?1049l" in out or b"\x1b[?25h" in out
-    if not restored:
-        print("FAIL: terminal restore bytes never reached the pty")
+    # Require the FULL restore sequence, not one byte that could come from a
+    # normal redraw. Must match termseq.restore_all in src/lib/termseq.zig.
+    RESTORE_ALL = (b"\x1b[?2004l\x1b[?1002;1003;1004;1006;1016l"
+                   b"\x1b[<u\x1b[0m\x1b[?1049l\x1b[?25h")
+    if RESTORE_ALL not in out:
+        print("FAIL: the full termseq.restore_all sequence never reached the pty")
         failed = True
 
     try:
@@ -108,6 +111,9 @@ def main() -> int:
         failed = True
     if "frames:" not in log:
         print("FAIL: crash log has no frames section")
+        failed = True
+    if "pc:" not in log:
+        print("FAIL: crash log has no pc: entry from the segfault handler")
         failed = True
 
     print("segv: OK" if not failed else "segv: FAILED")

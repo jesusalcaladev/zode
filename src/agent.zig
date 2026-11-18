@@ -295,10 +295,6 @@ pub fn setProjectInfoForTest(io: std.Io, start: []const u8) void {
     project.detectAt(io, start, &project_info);
 }
 
-/// `true` when `project_info` has been filled. For tests only.
-pub fn projectInfoReady() bool {
-    return project_info.cwd_len != 0;
-}
 
 /// Phase 18: the active worktree session — the one place that remembers where
 /// to return when `exit_worktree` runs.
@@ -343,14 +339,6 @@ pub fn switchProjectContext(gpa: std.mem.Allocator, io: std.Io, env: ?*const std
     plan_file_mtime_live = false;
 }
 
-/// The cwd + git paragraph, for callers that compose their own prompt.
-///
-/// Exists because the headless runner builds its own (it has no session to sync),
-/// and because the alternative — reaching into `project_info` from `main.zig` — is
-/// how a global turns into something three files depend on.
-pub fn projectInfoPromptLines(out: []u8) []const u8 {
-    return project_info.promptLines(out);
-}
 
 /// Skills/styles discovery and caches extracted to `agent/discovery.zig`.
 pub fn discoverSkills(gpa: std.mem.Allocator, env: ?*const std.process.Environ.Map) []const skills.Entry {
@@ -1190,17 +1178,6 @@ pub fn loadPermRules() void {
     loadHooks();
 }
 
-pub fn loadPermRulesFrom(io: std.Io, project_path: ?[]const u8, user_path: ?[]const u8) void {
-    if (perm_rules_arena == null) perm_rules_arena = std.heap.ArenaAllocator.init(gpa_global);
-    loadPermRulesInto(perm_rules_arena.?.allocator(), io, project_path, user_path);
-    if (project_path) |pp| {
-        var hbuf: [640]u8 = undefined;
-        if (project_rules.hooksPathForProjectPermissions(pp, &hbuf)) |path| {
-            if (hooks_arena == null) hooks_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            project_rules.loadHooksAt(&hooks_set, hooks_arena.?.allocator(), io, path);
-        }
-    }
-}
 
 pub fn loadPermRulesInto(
     arena: std.mem.Allocator,
@@ -1558,36 +1535,8 @@ pub fn activeProviderDef(env: ?*const std.process.Environ.Map) *const providers.
     return providers.byId(cur_provider_id) orelse providers.activeDef(env);
 }
 
-/// Key state of the active provider's API key.
-///
-/// `verified` means the key has been tested and works (recent auth success).
-/// `saved` means the key is stored in `auth.json` but has not been verified.
-/// `invalid` means the key is known to be bad (e.g., auth error received).
-/// `unknown` means no key is configured.
-///
-/// Takes the provider's environment to determine the key source.
-pub fn keyState(env: *const std.process.Environ.Map) u8 {
-    // Check saved keys first (from auth.json)
-    const def = activeProviderDef(env);
-    if (def.key_env.len > 0) {
-        // If there are saved keys, the key is at least "saved"
-        // Check if it also works via the environment
-        if (providers.keyFor(def, env) != null) return 1; // verified
-        return 2; // saved
-    }
-    // Check environment
-    const env_key = envGet(env, "ZODE_API_KEY");
-    if (env_key) |_| return 1; // verified (we assume it works if env has it)
-    return 0; // unknown
-}
 
 // Helper to compute the env var name for a provider's key
-fn providerKeyEnvName(def: *const providers.ProviderDef) []const u8 {
-    // Use the provider's key_env field if available, otherwise fall back to
-    // the generic ZODE_API_KEY
-    if (def.key_env.len > 0) return def.key_env[0];
-    return "ZODE_API_KEY";
-}
 
 // API key of the active provider: first the one saved in `auth.json`, then
 /// the environment variable, then the generic one.
@@ -3865,21 +3814,6 @@ fn resumeTerm(m: *tui.Model, term: []const u8) void {
     pushInfoFmt(m, "no session matching {s}. Use /resume to pick.", .{term});
 }
 
-/// `/resume` (no args): opens the session picker (29.1/29.4). Kept as a
-/// function for callers that want the old "latest by mtime" behavior — but the
-/// command now opens the picker so the choice is never a guess (Phase 29).
-fn resumeLatest(m: *tui.Model) void {
-    var astate = std.heap.ArenaAllocator.init(m.allocator);
-    defer astate.deinit();
-    const a = astate.allocator();
-
-    const latest = session_mod.Session.latestSessionPath(a, io_global) catch null;
-    const path = latest orelse {
-        pushInfo(m, "no saved sessions");
-        return;
-    };
-    resumeSessionAtPath(m, path);
-}
 
 // ── the chat: worker and agent loop ───────────────────────────
 

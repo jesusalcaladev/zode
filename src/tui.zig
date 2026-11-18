@@ -139,15 +139,6 @@ fn moodStyle(kind: StatusKind) vaxis.Style {
     };
 }
 
-/// Columns of an art fragment, not bytes.
-fn glyphCols(s: []const u8) usize {
-    @setEvalBranchQuota(10_000);
-    const view = std.unicode.Utf8View.initUnchecked(s);
-    var it = view.iterator();
-    var n: usize = 0;
-    while (it.nextCodepoint()) |_| n += 1;
-    return n;
-}
 
 /// The wordmark, one glyph per letter, 6 columns wide and 5 rows tall.
 ///
@@ -2774,15 +2765,6 @@ pub const Model = struct {
         self.redraw_requested.store(true, .seq_cst);
     }
 
-    pub fn clearTranscriptSearch(self: *Model) void {
-        self.search_bar_active = false;
-        self.search_query_len = 0;
-        self.search_matches.clearRetainingCapacity();
-        self.search_current = 0;
-        self.search_has_query = false;
-        self.dirty = true;
-        self.redraw_requested.store(true, .seq_cst);
-    }
 
     fn scrollToParaIndex(self: *Model, para_idx: usize) void {
         if (para_idx >= self.paras.items.len) return;
@@ -3781,18 +3763,6 @@ pub const Model = struct {
         self.unlock();
     }
 
-    ///
-    /// Public because `agent.zig` is the one that opens the picker with them, and
-    /// `closePicker` frees them too: two owners of the same strings is how the
-    /// double free happens, so the rule is ONE free per item and it lives with the
-    /// allocator that made them.
-    pub fn freePickerItems(gpa: std.mem.Allocator, items: []PickerItem) void {
-        for (items) |it| {
-            gpa.free(it.label);
-            if (it.desc.len > 0) gpa.free(it.desc);
-        }
-        gpa.free(items);
-    }
 
     /// Per-frame snapshot: copies into ctx.arena (≤10 visible items).
     fn pickerSnapshot(self: *Model, arena: std.mem.Allocator) ?PickerSnapshot {
@@ -3934,11 +3904,6 @@ pub const Model = struct {
         return .idle;
     }
 
-    pub fn statusf(self: *Model, comptime fmt: []const u8, args: anytype) void {
-        var buf: [160]u8 = undefined;
-        const s = std.mem.print(&buf, fmt, args) catch return;
-        self.setStatusText(s);
-    }
 
     // ── permission dialog (thread-safe) ────────────────
     /// Called by the worker BEFORE running a tool that needs permission.
@@ -5205,16 +5170,6 @@ pub const Model = struct {
         self.redraw_requested.store(true, .seq_cst);
     }
 
-    /// A header line with an imposed base style (Zo's mood color).
-    pub fn pushBannerStyled(self: *Model, text: []const u8, base: md.Style) void {
-        const copy = self.allocator.dupe(u8, text) catch return;
-        self.lock();
-        defer self.unlock();
-        self.pending.append(self.allocator, .{ .kind = .banner, .text = copy, .base = base }) catch {
-            self.allocator.free(copy);
-        };
-        self.dirty = true;
-    }
 
     /// The opening screen: a hero, not a logo.
     ///
@@ -5482,15 +5437,6 @@ pub const Model = struct {
         return @intCast(m2.millisSince(started));
     }
 
-    /// The first `max` characters of the first queued prompt.
-    pub fn queuedFirst(self: *Model, max: usize) []const u8 {
-        self.lock();
-        defer self.unlock();
-        if (self.queue.items.len == 0) return "";
-        const t = self.queue.items[0].text;
-        if (t.len <= max) return t;
-        return t[0..max];
-    }
 
     pub fn isBusyFlag(self: *Model) bool {
         return self.isBusy();
@@ -5625,18 +5571,6 @@ pub const Model = struct {
         }
     }
 
-    /// Enqueues a paragraph ALREADY with its memory copied. `text` becomes the
-    /// model's. Releases the lock before touching anything else: the caller may
-    /// want to enqueue more things after it (and the mutex is not
-    /// reentrant).
-    fn pushPending(self: *Model, p: Pending) void {
-        self.lock();
-        defer self.unlock();
-        self.pending.append(self.allocator, p) catch {
-            self.allocator.free(p.text);
-        };
-        self.dirty = true;
-    }
 
     /// From the worker: hand the result of a `!` command over. Takes OWNERSHIP of
     /// both strings (they are freed here on failure and in `deinit` otherwise).
@@ -5820,10 +5754,6 @@ pub const Model = struct {
         self.dirty = true;
     }
 
-    /// Executed tool line (thread-safe; the worker calls it).
-    pub fn pushTool(self: *Model, text: []const u8) void {
-        self.pushKind(.tool, text);
-    }
 
     // ── tool calls in the timeline ─────────────────────────
     /// Header of a tool in progress: "⏺ Read(src/tui.zig)".
@@ -6872,10 +6802,6 @@ pub const Model = struct {
         return true;
     }
 
-    /// `Stack.init` needs the allocator and `Model.init` already has it.
-    pub fn initCheckpoints(self: *Model) void {
-        self.checkpoints = .init(self.allocator);
-    }
 
     /// Applies the list the `todo` tool sends and returns what the history has
     /// to say about it (`.same` when the list did not change, which is the
@@ -6927,11 +6853,6 @@ pub const Model = struct {
         }
     }
 
-    pub fn clearNetBaselines(self: *Model) void {
-        self.lock();
-        defer self.unlock();
-        self.clearNetBaselinesLocked();
-    }
 
     fn netBaselineFor(self: *Model, path: []const u8) ?[]const u8 {
         var i: usize = 0;
@@ -10714,12 +10635,6 @@ fn splitLines(arena: std.mem.Allocator, text: []const u8) [][]const u8 {
     return out.items;
 }
 
-/// Byte offset of the start of line `line`.
-fn lineStartOffset(lines: [][]const u8, line: usize) usize {
-    var off: usize = 0;
-    for (lines[0..@min(line, lines.len)]) |l| off += l.len + 1; // +1 for the '\n'
-    return off;
-}
 
 /// Paints a paragraph's lines, clipped to the visible window
 /// [first_visible, last_visible) mapped to rows [0, history_h).

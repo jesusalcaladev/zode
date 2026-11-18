@@ -317,11 +317,6 @@ pub fn face(kind: StatusKind) []const u8 {
     return frames.forKind(kind)[0].text;
 }
 
-/// Frame at index `frame` (wraps). Kept for callers that drive a tick.
-pub fn faceFrames(kind: StatusKind, frame: u64) []const u8 {
-    const track = frames.forKind(kind);
-    return track[frame % track.len].text;
-}
 
 /// The clock of one state. `started_ms` is the instant its track began, in
 /// MILLISECONDS: a seconds-based clock rounds every beat of these tracks

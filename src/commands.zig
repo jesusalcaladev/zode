@@ -4157,6 +4157,7 @@ fn updateErrorPhrase(err: selfupdate.InstallError) []const u8 {
         error.NoAssetForPlatform => "this platform has no release binary",
         error.DownloadFailed => "could not download it (network, GitHub, or no release yet)",
         error.BinaryDoesNotRun => "the downloaded binary does not run here; nothing was replaced",
+        error.BadChecksum => "SHA256 mismatch: the downloaded asset was not what the release published; nothing was replaced",
         error.NotWritable => "could not replace the running binary (permissions?)",
         error.UnsupportedPlatform => "no releases for this OS/arch",
     };

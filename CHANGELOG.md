@@ -12,12 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - complete the ecosystem - plugins, remote sessions, keybindings (phase13) [`acd62990`](https://github.com/jesusalcaladev/zode/commit/acd62990)
 - Phase 41 - terse output style and lossless prompt trims (tokens) [`f1a20944`](https://github.com/jesusalcaladev/zode/commit/f1a20944)
 - TUI key safety, docs and CI correctness (phases44-45) [`55368ae1`](https://github.com/jesusalcaladev/zode/commit/55368ae1)
+- close four more backlog items (45.2, 43.5, 43.8, 42.7) [`3fb4c1fc`](https://github.com/jesusalcaladev/zode/commit/3fb4c1fc)
 
 ### Bug Fixes
 
 - close six critical permission and token-leak holes (security) [`a2998bc7`](https://github.com/jesusalcaladev/zode/commit/a2998bc7)
 - complete Phase 40 medium items (12 of 13) (security) [`1285cbea`](https://github.com/jesusalcaladev/zode/commit/1285cbea)
-- close a real use-after-free found by the new regression test (compaction) [`21355f2a`](https://github.com/jesusalcaladev/zode/commit/21355f2a)
+- close a real use-after-free found by the new regression test (compaction) [`6e14a3a3`](https://github.com/jesusalcaladev/zode/commit/6e14a3a3)
 
 ### Chores
 

@@ -199,6 +199,7 @@ fn saveCache(ctx: Context, tag: []const u8, now: i64) void {
 const Release = struct {
     tag: []const u8,
     asset_url: ?[]const u8,
+    checksum_url: ?[]const u8 = null,
 };
 
 fn fetchRelease(ctx: Context) ?Release {
@@ -230,7 +231,7 @@ fn fetchRelease(ctx: Context) ?Release {
     const tag = json.object.get("tag_name") orelse return null;
     if (tag != .string or tag.string.len == 0) return null;
 
-    return .{ .tag = tag.string, .asset_url = assetUrlIn(json, ctx.alloc) };
+    return .{ .tag = tag.string, .asset_url = assetUrlIn(json, ctx.alloc), .checksum_url = checksumUrlIn(json, ctx.alloc) };
 }
 
 /// Fetch the newest release for the channel. Stable uses the single
@@ -301,6 +302,46 @@ fn assetUrlIn(json: std.json.Value, alloc: std.mem.Allocator) ?[]const u8 {
         return dl.string;
     }
     return null;
+}
+
+/// The SHA256SUMS asset of the same release, if it was published.
+fn checksumUrlIn(json: std.json.Value, alloc: std.mem.Allocator) ?[]const u8 {
+    _ = alloc;
+    const assets = json.object.get("assets") orelse return null;
+    if (assets != .array) return null;
+    for (assets.array.items) |item| {
+        if (item != .object) continue;
+        const name = item.object.get("name") orelse continue;
+        if (name != .string or !std.mem.eql(u8, name.string, "SHA256SUMS")) continue;
+        const dl = item.object.get("browser_download_url") orelse return null;
+        if (dl == .string) return dl.string;
+    }
+    return null;
+}
+
+/// The expected hex digest for `asset_name` in a SHA256SUMS file. Missing or
+/// malformed lines return null, so an older release without sums is tolerated
+/// while a present-but-wrong sum is fatal.
+pub fn expectedSum(sums: []const u8, asset_name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, sums, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0) continue;
+        var it = std.mem.tokenizeAny(u8, t, " \t");
+        const hex = it.next() orelse continue;
+        const name = it.next() orelse continue;
+        if (hex.len != 64) continue;
+        if (std.mem.eql(u8, name, asset_name)) return hex;
+    }
+    return null;
+}
+
+fn digestHex(bytes: []const u8, buf: *[128]u8) []const u8 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
+    const hex = std.fmt.bytesToHex(d, .lower);
+    @memcpy(buf[0..hex.len], &hex);
+    return buf[0..hex.len];
 }
 
 /// Is there a newer release than the one running?
@@ -388,6 +429,7 @@ pub const InstallError = error{
     NoAssetForPlatform,
     DownloadFailed,
     BinaryDoesNotRun,
+    BadChecksum,
     NotWritable,
     UnsupportedPlatform,
 };
@@ -413,6 +455,18 @@ pub fn installLatest(ctx: Context) InstallError![]const u8 {
     const download_url = release.asset_url orelse return error.NoAssetForPlatform;
 
     const data = download(ctx, download_url) orelse return error.DownloadFailed;
+
+    // A release that publishes SHA256SUMS gets its binary verified. Older
+    // releases have no sums asset and stay on the --version/--selftest probes.
+    if (release.checksum_url) |sums_url| {
+        const sums = download(ctx, sums_url) orelse return error.BadChecksum;
+        defer ctx.alloc.free(sums);
+        const asset_name = std.fs.path.basename(download_url);
+        const want = expectedSum(sums, asset_name) orelse return error.BadChecksum;
+        var hex_buf: [128]u8 = undefined;
+        const got = digestHex(data, &hex_buf);
+        if (!std.ascii.eqlIgnoreCase(want, got)) return error.BadChecksum;
+    }
 
     const exe = std.process.executablePathAlloc(ctx.io, ctx.alloc) catch return error.NotWritable;
     // A predictable `{exe}.new` is a symlink target for anyone who can write
@@ -621,4 +675,18 @@ test "self-update: the install guard refuses a downgrade and accepts a newer tag
     mayInstall("v0.3.0-beta.1", "v0.3.0") catch return error.UnexpectedRefusal;
     // A dev build has no number: installing a release is an explicit decision.
     mayInstall("dev", "v0.2.0") catch return error.UnexpectedRefusal;
+}
+
+test "self-update: SHA256SUMS lines are parsed with the right asset name" {
+    var h1_buf: [64]u8 = @splat('a');
+    var h2_buf: [64]u8 = @splat('b');
+    const h1 = h1_buf[0..];
+    const h2 = h2_buf[0..];
+    const sums = std.mem.concat(std.testing.allocator, u8, &.{ h1, "  zode-linux-x86_64\n", h2, "  SHA256SUMS\n" }) catch return error.OutOfMemory;
+    defer std.testing.allocator.free(sums);
+    try std.testing.expectEqualStrings(h1, expectedSum(sums, "zode-linux-x86_64").?);
+    try std.testing.expectEqualStrings(h2, expectedSum(sums, "SHA256SUMS").?);
+    try std.testing.expect(expectedSum(sums, "zode-macos-x86_64") == null);
+    // A short hash is not a checksum.
+    try std.testing.expect(expectedSum("aa  zode-linux-x86_64\n", "zode-linux-x86_64") == null);
 }
