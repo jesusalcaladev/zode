@@ -37,12 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-- cache rendered tool_use blocks across requests (41.5) (chat) [`abed48ea`](https://github.com/jesusalcaladev/zode/commit/abed48ea)
+- cache rendered tool_use blocks across requests (41.5) (chat) [`41fc4aef`](https://github.com/jesusalcaladev/zode/commit/41fc4aef)
 
 ### Tests
 
 - coverage for the three core gaps (phase43) [`4bae7558`](https://github.com/jesusalcaladev/zode/commit/4bae7558)
 - deterministic failed-spawn test (43.6) (compaction) [`6708c1da`](https://github.com/jesusalcaladev/zode/commit/6708c1da)
+- end-to-end smoke for --chat (43.7) (headless) [`d20d7d7a`](https://github.com/jesusalcaladev/zode/commit/d20d7d7a)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

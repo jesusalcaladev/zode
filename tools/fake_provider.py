@@ -85,6 +85,12 @@ SCENARIOS = {
         {"text": "bigdiff scenario finished"},
     ],
     # The same call, over and over: the repetition guard has to speak.
+    # Phase 43.7: a turn that finishes the way a real one should — the answer
+    # in send_user_message, which --chat prints to stdout as the durable result.
+    "headlesssmoke": [
+        {"tools": [{"name": "read", "args": {"path": "AGENTS.md"}}]},
+        {"tools": [{"name": "send_user_message", "args": {"message": "headless headlesssmoke scenario finished. done!"}}]},
+    ],
     "repeat": [
         {"tools": [{"name": "read", "args": {"path": "AGENTS.md"}}]},
         {"tools": [{"name": "read", "args": {"path": "AGENTS.md"}}]},

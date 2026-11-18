@@ -68,7 +68,13 @@ pub fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Envi
     // other's sessions in `/session`.
     agent.resolveSessionsDirIn(gpa, env);
     chat.io_global = io;
-    free_auto.attachIo(io); // el reloj de los cooldowns del free-auto
+    free_auto.attachIo(io); // the cool-down clock for free-model rotation
+    // The TUI initializes these from the env in runTui; the headless runner
+    // never did, so every `--chat` error (including the provider's own reason)
+    // was swallowed by models.dbg's `if (!dbg_flag) return`. A scripted run
+    // that fails has to SAY why.
+    chat.dbgInitEnv(env);
+    models.dbgInitEnv(env);
     models.dbg_io = io;
     defer agent.shutdownUserConfig();
     defer agent.shutdownBuffers(); // the 1 MiB body buffer (see `bodyBuf`)
