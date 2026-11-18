@@ -89,6 +89,7 @@ pub const json_escape = @import("lib/json_escape.zig");
 pub const textcase = @import("lib/textcase.zig");
 pub const frontmatter = @import("lib/frontmatter.zig");
 pub const configdir = @import("lib/configdir.zig");
+pub const tui_tests = @import("tui_tests.zig");
 pub const keybinds = @import("lib/keybinds.zig");
 pub const plugins = @import("lib/plugins.zig");
 pub const remote = @import("lib/remote.zig");

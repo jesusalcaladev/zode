@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Refactors
 
 - deduplicate core helpers (-722 net lines) (phase42) [`55e5db84`](https://github.com/jesusalcaladev/zode/commit/55e5db84)
-- finish 42.10, split headless runner, unify aliases (phase42) [`10b431d8`](https://github.com/jesusalcaladev/zode/commit/10b431d8)
+- finish 42.10, split headless runner, unify aliases (phase42) [`c38b5e3a`](https://github.com/jesusalcaladev/zode/commit/c38b5e3a)
+- split tui tests out of tui.zig (42.9 part 2) (phase42) [`14ee154a`](https://github.com/jesusalcaladev/zode/commit/14ee154a)
 
 ## [0.3.0-beta.1] - 2026-11-16
 
