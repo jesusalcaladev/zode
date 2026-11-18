@@ -39,7 +39,7 @@ const segsWidth = tui.segsWidth;
 const sessionInfo = tui.sessionInfo;
 const StatusKind = tui.StatusKind;
 const syncAutocomplete = tui.syncAutocomplete;
-const typeErasedEventHandler = tui.typeErasedEventHandler;
+const typeErasedEventHandler = @import("tui_events.zig").typeErasedEventHandler;
 
 const allText = tui.allText;
 const ask_other_label = tui.ask_other_label;

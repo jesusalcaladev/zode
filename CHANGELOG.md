@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - deduplicate core helpers (-722 net lines) (phase42) [`55e5db84`](https://github.com/jesusalcaladev/zode/commit/55e5db84)
 - finish 42.10, split headless runner, unify aliases (phase42) [`c38b5e3a`](https://github.com/jesusalcaladev/zode/commit/c38b5e3a)
 - split tui tests out of tui.zig (42.9 part 2) (phase42) [`df94f80a`](https://github.com/jesusalcaladev/zode/commit/df94f80a)
+- split event and draw dispatch into modules (42.9) (tui) [`047ae6d7`](https://github.com/jesusalcaladev/zode/commit/047ae6d7)
 
 ### Performance
 
@@ -43,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - coverage for the three core gaps (phase43) [`4bae7558`](https://github.com/jesusalcaladev/zode/commit/4bae7558)
 - deterministic failed-spawn test (43.6) (compaction) [`6708c1da`](https://github.com/jesusalcaladev/zode/commit/6708c1da)
-- end-to-end smoke for --chat (43.7) (headless) [`d20d7d7a`](https://github.com/jesusalcaladev/zode/commit/d20d7d7a)
+- end-to-end smoke for --chat (43.7) (headless) [`4bf7827b`](https://github.com/jesusalcaladev/zode/commit/4bf7827b)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

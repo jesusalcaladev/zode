@@ -3,6 +3,8 @@ const textcase = @import("lib/textcase.zig");
 const builtin = @import("builtin");
 
 const vaxis = @import("vaxis");
+const tui_events = @import("tui_events.zig");
+const tui_draw = @import("tui_draw.zig");
 const vxfw = vaxis.vxfw;
 const agent = @import("agent.zig");
 const chat = @import("chat.zig");
@@ -427,7 +429,7 @@ pub const Painter = struct {
 
     /// Fills a whole row with a 1-column grapheme (line, border).
     /// The grapheme must be a static literal (e.g. "─").
-    fn fillRow(self: *Painter, row: u16, g: []const u8, style: vaxis.Style) void {
+    pub fn fillRow(self: *Painter, row: u16, g: []const u8, style: vaxis.Style) void {
         if (row >= self.height) return;
         var c: u16 = 0;
         while (c < self.width) : (c += 1) {
@@ -458,7 +460,7 @@ const CellRun = struct {
     link: vaxis.Cell.Hyperlink = .{},
 };
 
-const PLine = struct {
+pub const PLine = struct {
     cells: []const CellRun,
     w: u16, // columns occupied
 };
@@ -700,7 +702,7 @@ fn diffRowIndent(cells: []const CellRun) u16 {
 /// Turns a paragraph (markdown already parsed) into lines of cells.
 /// All the memory comes out of `pa` (the paragraph's own arena or the frame
 /// arena).
-fn buildLines(
+pub fn buildLines(
     pa: std.mem.Allocator,
     ctx: vxfw.DrawContext,
     para: *Model.Para,
@@ -2026,8 +2028,6 @@ pub const Model = struct {
     diff_last_last: usize = 0,
     /// Differential render tracking: whether the live paragraph was active last frame.
     diff_last_live_active: bool = false,
-    /// Differential render tracking: forces a full redraw of history (first frame or after scroll).
-    diff_needs_full_redraw: bool = true,
     /// Toast notification: text shown when user copies to clipboard, and frames remaining.
     /// `copy_toast_buf` is Model-owned so the text slice stays valid across the
     /// frames the toast is drawn (a stack local here dangles - the `memaudit`
@@ -2121,7 +2121,7 @@ pub const Model = struct {
 
     const SelectionPoint = struct { row: u16, col: u16 };
 
-    const Para = struct {
+    pub const Para = struct {
         kind: md.Kind,
         /// The text, or the COMPRESSED text when the paragraph is cold.
         ///
@@ -3765,7 +3765,7 @@ pub const Model = struct {
 
 
     /// Per-frame snapshot: copies into ctx.arena (≤10 visible items).
-    fn pickerSnapshot(self: *Model, arena: std.mem.Allocator) ?PickerSnapshot {
+    pub fn pickerSnapshot(self: *Model, arena: std.mem.Allocator) ?PickerSnapshot {
         self.lock();
         defer self.unlock();
         if (!self.picker_active) return null;
@@ -4077,7 +4077,7 @@ pub const Model = struct {
     }
 
     /// Frees cache entry `i` and removes it (keeping order).
-    fn evictCached(self: *Model, i: usize) void {
+    pub fn evictCached(self: *Model, i: usize) void {
         if (i >= self.seg_cache.items.len) return;
         if (self.seg_cache.items[i].arena) |a| {
             a.deinit();
@@ -4500,7 +4500,7 @@ pub const Model = struct {
     /// started scrolling). With a cap of passes (4) in case a pathological case
     /// doesn't converge: the scroll stays at the closest instead of going in
     /// circles.
-    fn layoutFor(
+    pub fn layoutFor(
         self: *Model,
         ctx: vxfw.DrawContext,
         width: u16,
@@ -5886,7 +5886,7 @@ pub const Model = struct {
     }
 
     /// Same, but for when the caller ALREADY holds the lock.
-    fn toolRunMillisLocked(self: *const Model) u64 {
+    pub fn toolRunMillisLocked(self: *const Model) u64 {
         const tr = self.tool_run orelse return 0;
         if (!self.io_ready or tr.started_ns == 0) return 0;
         const now = std.Io.Timestamp.now(self.io, .real).nanoseconds;
@@ -7073,7 +7073,7 @@ pub const Model = struct {
     /// On the UI thread on purpose: `pushShellOut` is called from a worker, and
     /// the session's message list and its file handle are one thing with one
     /// owner. `agent.shellOutputArrived` does both the history and the session.
-    fn drainShellOut(self: *Model) void {
+    pub fn drainShellOut(self: *Model) void {
         self.lock();
         var batch = self.shell_out;
         self.shell_out = .empty;
@@ -7202,7 +7202,7 @@ pub const Model = struct {
     /// ReleaseSmall due to vaxis internals), we log and leave `tick_armed`
     /// false so the next event will retry. This prevents the tick chain from
     /// dying silently and leaving the app frozen.
-    fn armTick(self: *Model, ctx: *vxfw.EventContext) !void {
+    pub fn armTick(self: *Model, ctx: *vxfw.EventContext) !void {
         if (self.tick_armed) return;
         const ms = self.tickInterval();
         // Set armed AFTER successful registration, so a failure doesn't leave
@@ -7270,7 +7270,7 @@ pub const Model = struct {
     /// True when the face on screen is not the face the clock says it should
     /// be: a tick that lands on a new beat (or a new lean) has something to
     /// paint, and one that lands mid-beat does not.
-    fn mascotMoved(self: *Model) bool {
+    pub fn mascotMoved(self: *Model) bool {
         if (!self.face_painted) return true;
         if (self.no_animation or self.reduced_motion) return false;
         const p = self.mascot_animator.pose(self.nowMs());
@@ -7328,7 +7328,6 @@ pub const Model = struct {
         self.setAnchorLine(first);
         self.anchor = first;
         // Scrolling changes what is visible: full redraw needed next frame.
-        self.diff_needs_full_redraw = true;
         // Reaching the bottom re-arms the follow, so the next line that arrives
         // keeps coming at you instead of freezing the view where you happened to
         // land.
@@ -7392,7 +7391,6 @@ pub const Model = struct {
             self.setAnchorLine(state.anchor_line);
             self.anchor = state.anchor_line;
         }
-        self.diff_needs_full_redraw = true;
     }
 
     // ── the prompt rail ─────────────────────────────────────
@@ -7409,7 +7407,7 @@ pub const Model = struct {
     /// that overlap are dots you cannot hit. With the ladder, sending a prompt
     /// pushes the rail UP by one row and the dot you were aiming at does not
     /// move.
-    fn refreshPromptDots(self: *Model, width: u16, history_h: u16) void {
+    pub fn refreshPromptDots(self: *Model, width: u16, history_h: u16) void {
         self.prompt_dot_len = 0;
         if (!self.show_prompt_dots) {
             self.prompt_dot_hover = null;
@@ -7459,7 +7457,7 @@ pub const Model = struct {
     }
 
     /// The dot under the pointer, or null when the pointer is not on one.
-    fn promptDotAt(self: *const Model, m: vaxis.Mouse) ?PromptDot {
+    pub fn promptDotAt(self: *const Model, m: vaxis.Mouse) ?PromptDot {
         if (!self.show_prompt_dots) return null;
         if (self.prompt_dot_len == 0 or self.prompt_dot_col == 0) return null;
         if (m.row < 0 or m.col < 0) return null;
@@ -7477,7 +7475,7 @@ pub const Model = struct {
     /// Landing it exactly on row 0 would hide the line the reader just asked
     /// for behind a copy of itself, which is the one row of the prompt they
     /// least want to lose.
-    fn jumpToPrompt(self: *Model, d: PromptDot) void {
+    pub fn jumpToPrompt(self: *Model, d: PromptDot) void {
         if (d.para >= self.paras.items.len) return;
         self.scrollTo(d.line -| 1);
     }
@@ -7498,7 +7496,7 @@ pub const Model = struct {
         return n;
     }
 
-    fn snapshotSelectableHistory(self: *Model, surface: vxfw.Surface, rows: u16) !void {
+    pub fn snapshotSelectableHistory(self: *Model, surface: vxfw.Surface, rows: u16) !void {
         const height = @min(rows, surface.size.height);
         const width = surface.size.width;
         self.selectable_text.clearRetainingCapacity();
@@ -7535,7 +7533,7 @@ pub const Model = struct {
     /// with no other exit is a flag that can be stranded for the rest of the
     /// session, and a stranded drag flag turns every later mouse event into a
     /// scroll jump.
-    fn cancelMouseGestures(self: *Model) void {
+    pub fn cancelMouseGestures(self: *Model) void {
         self.scrollbar_dragging = false;
         self.selecting_text = false;
         self.selection_start = null;
@@ -7546,7 +7544,7 @@ pub const Model = struct {
         self.prompt_dot_hover = null;
     }
 
-    fn selectionPoint(self: *const Model, mouse: vaxis.Mouse) ?SelectionPoint {
+    pub fn selectionPoint(self: *const Model, mouse: vaxis.Mouse) ?SelectionPoint {
         if (mouse.row < 0 or mouse.col < 0) return null;
         const row = @as(u16, @intCast(mouse.row));
         const col = @as(u16, @intCast(mouse.col));
@@ -7554,7 +7552,7 @@ pub const Model = struct {
         return .{ .row = row, .col = @min(col, self.selectable_width - 1) };
     }
 
-    fn clampedSelectionPoint(self: *const Model, mouse: vaxis.Mouse) ?SelectionPoint {
+    pub fn clampedSelectionPoint(self: *const Model, mouse: vaxis.Mouse) ?SelectionPoint {
         if (mouse.row < 0 or mouse.col < 0 or self.selectable_rows == 0 or self.selectable_width == 0) return null;
         return .{
             .row = @min(@as(u16, @intCast(mouse.row)), self.selectable_rows - 1),
@@ -7587,7 +7585,7 @@ pub const Model = struct {
         return try out.toOwnedSlice(allocator);
     }
 
-    fn paintTextSelection(self: *const Model, surface: vxfw.Surface) void {
+    pub fn paintTextSelection(self: *const Model, surface: vxfw.Surface) void {
         const start = self.selection_start orelse return;
         const end = self.selection_end orelse return;
         const first = if (selectionPointLess(end, start)) end else start;
@@ -7628,7 +7626,7 @@ pub const Model = struct {
         self.requestRedraw();
     }
 
-    fn copySelectedText(self: *Model, ctx: *vxfw.EventContext) !void {
+    pub fn copySelectedText(self: *Model, ctx: *vxfw.EventContext) !void {
         // A PRESS followed by a RELEASE at the same point is a CLICK, not a
         // selection, and it used to fire OSC 52 anyway: `selectedText` on one
         // cell yields that one trimmed grapheme, which is non-empty, so every
@@ -7708,7 +7706,7 @@ pub const Model = struct {
 
     /// Runs what a chosen palette item means. Shared by the keyboard and the
     /// mouse so that clicking a row and pressing Enter on it cannot diverge.
-    fn applyPaletteAction(self: *Model, ctx: *vxfw.EventContext, act: palette.Action) !void {
+    pub fn applyPaletteAction(self: *Model, ctx: *vxfw.EventContext, act: palette.Action) !void {
         ctx.redraw = true;
         switch (act) {
             .none => {},
@@ -7787,8 +7785,8 @@ pub const Model = struct {
     pub fn widget(self: *Model) vxfw.Widget {
         return .{
             .userdata = self,
-            .eventHandler = typeErasedEventHandler,
-            .drawFn = typeErasedDrawFn,
+            .eventHandler = tui_events.typeErasedEventHandler,
+            .drawFn = tui_draw.typeErasedDrawFn,
         };
     }
 };
@@ -8067,7 +8065,7 @@ pub fn boundCommand(self: *const Model, gpa: std.mem.Allocator, key: vaxis.Key) 
     return (keybinds.Map{ .bindings = self.keybindings }).resolve(name);
 }
 
-fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
+pub fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
     const k = key;
 
     // Custom keybindings run here, AFTER every modal had its chance: the
@@ -8533,7 +8531,7 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
 
 /// Switches the popup's mode, freeing the previous mode's data. Every field
 /// change goes through here so no mode leaves state behind.
-fn setAcMode(self: *Model, mode: Autocomplete.Mode, prefix_len: usize) void {
+pub fn setAcMode(self: *Model, mode: Autocomplete.Mode, prefix_len: usize) void {
     if (self.ac.mode == .file and mode != .file) freeFileMatches(self);
     self.ac.active = mode != .none;
     self.ac.mode = mode;
@@ -8557,7 +8555,7 @@ fn freeFilePool(self: *Model) void {
 
 /// Reset autocomplete without leaking file_matches / file_pool. The old
 /// `self.ac = .{}` discarded owned strings without freeing them.
-fn resetAutocomplete(self: *Model) void {
+pub fn resetAutocomplete(self: *Model) void {
     freeFileMatches(self);
     freeFilePool(self);
     self.ac.active = false;
@@ -8677,7 +8675,7 @@ pub fn commandToken(key: []const u8) []const u8 {
 }
 
 /// Recomputes how many items match and where the selection is.
-fn recomputeMatches(self: *Model) void {
+pub fn recomputeMatches(self: *Model) void {
     const n = matchCount(self);
     if (n == 0) {
         self.ac.active = false;
@@ -8885,7 +8883,7 @@ fn inputTooLongRejected(self: *Model) void {
 /// One insert path for every bulk text that lands in the input: an OSC-52
 /// `.paste` event and an aggregated bracketed paste both come through here, so
 /// the modals keep their guard and the cap keeps its message.
-fn insertIntoInput(self: *Model, data: []const u8) void {
+pub fn insertIntoInput(self: *Model, data: []const u8) void {
     if (data.len == 0) return;
     if (self.pickerActive() or self.permActive()) return;
     if (self.ed.insert(data)) |_| {
@@ -8901,7 +8899,7 @@ fn insertIntoInput(self: *Model, data: []const u8) void {
 /// `paste_end`. The bytes of a paste reach us as ordinary keys, so the only
 /// thing to decide per key is which text it carries: `key.text` when the
 /// terminal reports it, the codepoint otherwise, and Enter as a newline.
-fn capturePasteKey(self: *Model, k: vaxis.Key) void {
+pub fn capturePasteKey(self: *Model, k: vaxis.Key) void {
     // A newline inside a paste reaches us twice over: terminals that report
     // Enter send the enter codepoint, and the raw 0x0A byte of a multi-line
     // selection is parsed as Ctrl+J (vaxis Parser: `0x0A => 'j' + ctrl`).
@@ -8931,777 +8929,7 @@ fn capturePasteKey(self: *Model, k: vaxis.Key) void {
 }
 
 // ── root widget handlers ─────────────────────────────────
-pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
-    const self: *Model = @ptrCast(@alignCast(ud));
-    // `/copy`: a text waiting for the clipboard leaves through the RENDER.
-    // It is flushed at the TOP of every event, so it goes out with the next
-    // tick even if the user does not touch anything (a tick is an event, and
-    // it carries an EventContext).
-    self.flushCopyPending(ctx);
-    switch (event) {
-        .key_press => |key| {
-            // Between `paste_start` and `paste_end` a key is CONTENT, not a
-            // command: no submit, no shortcut, no modal navigation.
-            // Escape is the escape hatch: a lost `paste_end` (11-line pastes
-            // left the TUI swallowing every key, Ctrl+P included) would
-            // otherwise trap all input in the paste buffer forever.
-            if (self.pasting) {
-                if (key.matches(vaxis.Key.escape, .{})) {
-                    self.pasting = false;
-                    insertIntoInput(self, self.paste_buf.items);
-                    self.paste_buf.clearRetainingCapacity();
-                    ctx.redraw = true;
-                    return;
-                }
-                capturePasteKey(self, key);
-                return;
-            }
-            // A rejected-input note refers to the buffer as it was; once the
-            // user presses another key it is stale.
-            self.input_too_long = false;
-            self.input_err = "";
-            // Ctrl+C: first clears the input, the second press exits (so
-            // half-typed text is never lost in one go).
-            if (key.matches('c', .{ .ctrl = true })) {
-                // A modal owns Ctrl+C too: closing it is the expected action.
-                // With empty input this branch used to QUIT the app from inside
-                // a picker or the palette, losing the work on screen.
-                if (self.anyModalActive()) {
-                    if (try self.closeTopModal(ctx)) return;
-                }
-                if (self.hasInput()) {
-                    self.ed.clear();
-                    resetAutocomplete(self);
-                    // The draft dies whole: an image staged for a discarded
-                    // message must not ride on the next one.
-                    self.draft_images.clear(self.allocator);
-                    ctx.redraw = true;
-                } else {
-                    ctx.quit = true;
-                }
-                return;
-            }
-            // Ctrl+D DOES NOT QUIT, and it used to.
-            //
-            // With an empty input it was EOF (`ctx.quit = true`), and the empty
-            // input is the NORMAL state when you scroll: you scroll up to read
-            // something, press ctrl+d to come back down, and zode exits. `/help`
-            // documents "ctrl+u / ctrl+d = scroll half a page" and the status bar
-            // says "ctrl+c exits", so the app contradicted itself and the cheapest
-            // way out was a key advertised as a scroll.
-            //
-            // Ctrl+C is the exit, which is what both places say.
-            // Transcript screen (33.4): captures input while open.
-            if (self.transcriptViewActive()) {
-                if (self.transcriptViewHandleKey(key)) {
-                    self.flushCopyPending(ctx);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-            // Modal diff viewer (33.18): captures input while open.
-            if (self.diffViewerActive()) {
-                if (self.diffViewerHandleKey(key)) {
-                    self.flushCopyPending(ctx);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-            // Transcript search bar (33.13): captures input while typing query.
-            if (self.transcriptSearchActive()) {
-                if (self.searchBarHandleKey(key)) {
-                    self.flushCopyPending(ctx);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-            // Ctrl+, — the Settings screen (internal config). Distinct from
-            // Ctrl+P/T so it cannot be mistaken for the model picker again.
-            if (key.matches(',', .{ .ctrl = true })) {
-                if (self.settings_active) {
-                    self.settingsClose();
-                } else {
-                    self.settingsOpen();
-                }
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            // The Settings screen captures every key while it is open.
-            if (self.settings_active) {
-                if (self.settingsHandleKey(key)) {
-                    self.flushCopyPending(ctx);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-            // Modal picker active: captures ALL input (before global shortcuts so
-            // session-picker chords like Ctrl+A/B/V/S work; Ctrl+C quit is above).
-            if (self.pickerActive()) {
-                if (self.pickerHandleKey(key)) {
-                    self.flushCopyPending(ctx);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-            // Ctrl+P: command palette (commands and models in two columns).
-            // Toggle: pressing it while the commands palette is open closes it,
-            // so a stuck-open palette is escapable with the same key.
-            if (key.matches('p', .{ .ctrl = true })) {
-                if (self.pal.active and self.pal.mode == .commands) {
-                    self.closePalette();
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-                agent.openCommandPalette(self);
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            if (key.matches('t', .{ .ctrl = true })) {
-                if (self.pal.active and self.pal.mode == .models) {
-                    self.closePalette();
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-                agent.openModelPaletteAsync(self);
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            // An open palette OWNS its keys. Dispatch here, BEFORE the global
-            // shortcuts below: otherwise Ctrl+R expands a tool instead of
-            // refreshing the model catalog, and Ctrl+L wipes the transcript
-            // behind the modal. Both are documented palette keys (44.1/44.2).
-            if (self.pal.active) {
-                if (try self.paletteKey(ctx, key)) {
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-            // Ctrl+A: connect a provider. The palette footer announced it and
-            // did nothing, which is worse than not announcing it.
-            if (key.matches('a', .{ .ctrl = true })) {
-                agent.openConnectPalette(self);
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            // Ctrl+L: clear the view.
-            if (key.matches('l', .{ .ctrl = true })) {
-                self.clearHistory();
-                ctx.redraw = true;
-                return;
-            }
-            // Ctrl+R: expand/collapse the last tool's result.
-            if (key.matches('r', .{ .ctrl = true }) and !self.pal.active) {
-                if (self.toggleLastTool()) {
-                    ctx.redraw = true;
-                } else {
-                    self.cache_from = 0;
-                    ctx.redraw = true;
-                }
-                return;
-            }
-            // Phase 3: hunk navigation on the last diff (alt+] next, alt+[ prev).
-            if (key.matches(']', .{ .alt = true })) {
-                if (self.navigateLastDiffHunk(1)) ctx.redraw = true;
-                return;
-            }
-            if (key.matches('[', .{ .alt = true })) {
-                if (self.navigateLastDiffHunk(-1)) ctx.redraw = true;
-                return;
-            }
-            // Ctrl+V: stage the clipboard's IMAGE for the next message.
-            if (key.matches('v', .{ .ctrl = true })) {
-                agent.attachClipboardImage(self);
-                ctx.redraw = true;
-                return;
-            }
-            // Ctrl+G: edit the current prompt in $VISUAL/$EDITOR.
-            if (key.matches('g', .{ .ctrl = true })) {
-                agent.openExternalEditor(self);
-                syncAutocomplete(self);
-                ctx.redraw = true;
-                return;
-            }
-            // Ctrl+F: transcript search (33.13).
-            if (key.matches('f', .{ .ctrl = true })) {
-                if (self.transcriptSearchActive()) self.closeTranscriptSearch() else self.openTranscriptSearch();
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            // Ctrl+O: transcript screen (33.4).
-            if (key.matches('o', .{ .ctrl = true })) {
-                self.toggleTranscriptView();
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            // Ctrl+P palette open: captures ALL input, scroll included.
-            if (self.pal.active) {
-                if (try self.paletteKey(ctx, key)) {
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-            // An open question WITH options: the panel is the menu, so the arrows
-            // move the panel's own highlight and Enter takes it.
-            //
-            // It has to sit here, above the editor and above the `/` and `@`
-            // popups: with a question open those popups mean nothing (there is no
-            // prompt being written) and, worse, Enter with the `@` popup open
-            // would accept a completion instead of answering the question. ESC is
-            // handled further down and means "you decide".
-            if (self.askNeedsChoice()) {
-                if (key.matches(vaxis.Key.up, .{})) {
-                    self.askMove(-1);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-                if (key.matches(vaxis.Key.down, .{})) {
-                    self.askMove(1);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-                if (key.matches(vaxis.Key.enter, .{})) {
-                    _ = self.askAnswerSelected();
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-            // `/` autocompletion or `@` file completion open: navigate and accept.
-            if (self.ac.active and matchCount(self) > 0) {
-                if (key.matches(vaxis.Key.up, .{})) {
-                    if (self.ac.sel > 0) self.ac.sel -= 1;
-                    recomputeMatches(self);
-                    ctx.redraw = true;
-                    return;
-                }
-                if (key.matches(vaxis.Key.down, .{})) {
-                    const n = matchCount(self);
-                    if (self.ac.sel + 1 < n) self.ac.sel += 1;
-                    recomputeMatches(self);
-                    ctx.redraw = true;
-                    return;
-                }
-                // Tab and Enter (no modifiers) accept the highlight: with the
-                // popup open, sending a bare "mod" is not what the user wants,
-                // they want /model.
-                //
-                // BUT if what is typed is already a COMPLETE command, Enter
-                // SENDS it instead of completing again. Before it didn't:
-                // "/help" + Enter only rewrote "/help " and sent nothing, so
-                // you had to press it twice and it looked like the scroll had
-                // nothing to show. And the other way round didn't either:
-                // "/model" completed to a different command because the popup
-                // sorted that one first and the match was only looked for there.
-                //
-                // In FILE mode Enter always accepts (a path is never "complete
-                // enough to send": it is a mention inside a sentence).
-                const plain_enter = key.matches(vaxis.Key.enter, .{}) and
-                    !key.mods.shift and !key.mods.alt and !key.mods.ctrl;
-                if (key.matches(vaxis.Key.tab, .{}) or plain_enter) {
-                    // If what is typed is exactly the command, Enter SENDS.
-                    // The popup is closed and it leaves the block WITHOUT
-                    // `return` so the key keeps going down to the editor, which
-                    // does the submit. With `return` it was lost: "/help" +
-                    // Enter only rewrote "/help " and sent nothing.
-                    if (plain_enter and isExactMatch(self)) {
-                        resetAutocomplete(self);
-                        ctx.redraw = true;
-                    } else {
-                        if (acceptAutocomplete(self)) {
-                            ctx.redraw = true;
-                            try self.armTick(ctx);
-                        }
-                        return;
-                    }
-                } else {
-                    // Escape closes the popup without deleting what was typed.
-                    if (key.matches(vaxis.Key.escape, .{})) {
-                        setAcMode(self, .none, 0);
-                        ctx.redraw = true;
-                        return;
-                    }
-                }
-            }
 
-            // Per-message targeting (33.12): Shift+↑/↓ targets previous/next message.
-            if (key.codepoint == vaxis.Key.up and key.mods.shift and !key.mods.ctrl and !key.mods.alt) {
-                if (self.targetPrevMessage()) {
-                    self.pushInfo("targeted message · Shift+↑/↓ move, y copy, Esc clear");
-                } else {
-                    self.pushInfo("no previous message to target");
-                }
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            if (key.codepoint == vaxis.Key.down and key.mods.shift and !key.mods.ctrl and !key.mods.alt) {
-                if (self.targetNextMessage()) {
-                    self.pushInfo("targeted message · Shift+↑/↓ move, y copy, Esc clear");
-                } else {
-                    self.pushInfo("no next message to target");
-                }
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            // Copy targeted message action (33.12).
-            if (self.message_target_para != null and !self.hasInput() and !key.mods.ctrl and !key.mods.alt) {
-                if (key.codepoint == 'y' or key.codepoint == 'c') {
-                    if (self.targetedMessageText()) |text| {
-                        commands.copyTargetedText(self, text);
-                    } else {
-                        self.pushInfo("nothing to copy");
-                    }
-                    self.clearMessageTarget();
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-
-            // With an empty editor, the arrows belong to the history rather
-            // than to an invisible cursor. Ask choices and open pickers have
-            // already consumed their own arrows above.
-            if (!self.hasInput() and !self.permActive()) {
-                if (key.matches(vaxis.Key.up, .{})) {
-                    self.scrollBy(1);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-                if (key.matches(vaxis.Key.down, .{})) {
-                    self.scrollBy(-1);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-                if (key.matches(vaxis.Key.home, .{})) {
-                    self.scrollBy(1_000_000);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-                if (key.matches(vaxis.Key.end, .{})) {
-                    self.scrollBy(-1_000_000);
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
-
-            // ESC. Three things it can mean, and the ORDER is the whole design:
-            //
-            // 1. an open QUESTION -> "I am not answering that", the agent decides
-            //    on its own and the turn carries on. Not a cancel.
-            // 2. a foreground tool -> kill the child process. Before, ESC only
-            //    set the HTTP cancel flag, which does nothing to a `zig build`
-            //    already running inside `process.run`: the worker stayed blocked
-            //    for the rest of `timeout_seconds` and the command kept using the
-            //    CPU. This is the single most misleading thing ESC did.
-            // 3. otherwise -> abort the turn's stream.
-            if (key.matches(vaxis.Key.escape, .{})) {
-                if (self.askActive()) {
-                    self.declineAsk();
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-                if (self.message_target_para != null) {
-                    self.clearMessageTarget();
-                    self.pushInfo("message target cleared");
-                    ctx.redraw = true;
-                    try self.armTick(ctx);
-                    return;
-                }
-                const killed = agent.killForeground();
-                if (self.permActive()) self.answerPermission(.deny);
-                if (killed > 0) {
-                    agent.setStatusWithZoFmt(self, .warn, "killed {d} running command{s}", .{
-                        killed,
-                        if (killed == 1) @as([]const u8, "") else @as([]const u8, "s"),
-                    });
-                }
-                chat.cancel_current.store(true, .seq_cst);
-                if (self.session) |sp| sp.bumpEscs();
-                // The face follows the fact: a cancelled turn is `warn`, not
-                // `done`. Set here (the UI thread) and cleared by the next
-                // `streamStart`, so the mark belongs to THIS turn.
-                self.cancelled = true;
-                // Background jobs go too: ESC means "stop", and leaving a build
-                // running in the background after the user pressed ESC is how you
-                // get a laptop that is warm for the next ten minutes. Before,
-                // ESC only MARKED the jobs (`requestKillAll`) and the kill ran
-                // at app exit, so the build kept burning CPU for the whole
-                // session — "ESC did nothing", one level down. `killNow` marks
-                // and kills in one pass, on this thread, which is the one
-                // allowed to touch `Child.kill`.
-                const bg_killed = if (self.io_ready) self.bg.killNow(self.io) else self.bg.requestKillAll();
-                if (bg_killed > 0) {
-                    agent.setStatusWithZoFmt(self, .warn, "killed {d} background command{s}", .{
-                        bg_killed,
-                        if (bg_killed == 1) @as([]const u8, "") else @as([]const u8, "s"),
-                    });
-                }
-                // Nothing to kill but a turn in flight: the legend says the ESC
-                // landed, so the key never looks like it did nothing.
-                if (killed == 0 and bg_killed == 0 and self.isBusyFlag()) {
-                    agent.setStatusWithZo(self, .warn, "stopping\u{2026}");
-                }
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            // Permission dialog active: y/s/a/n decide, rest ignored.
-            if (self.permActive()) {
-                const cp = key.codepoint;
-                if (cp == 'y' or cp == 'Y') {
-                    self.answerPermission(.allow);
-                } else if (cp == 's' or cp == 'S') {
-                    // Phase 25: run a flagged bash command in a sandbox, when
-                    // one is available. Not the only answer — an alternative
-                    // to granting full permissions.
-                    if (self.permSandboxAvailable()) self.answerPermission(.allow_sandbox);
-                } else if (cp == 'a' or cp == 'A') {
-                    // Only when the option is on the table. A question that
-                    // must not become a standing permission does not show it,
-                    // and a key that answers an invisible option is a trap.
-                    if (self.permAllowAlways()) self.answerPermission(.allow_always);
-                } else if (cp == 'n' or cp == 'N') {
-                    self.answerPermission(.deny);
-                }
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            // Shift+Tab cycles the visible Build / accept-edits / Plan modes.
-            //
-            // Chosen because it is the key nothing else in a terminal uses, and
-            // because every other coding agent already uses it for this, so it
-            // does not have to be learned twice.
-            //
-            // It works with text in the input on purpose: you often decide to
-            // switch AFTER typing the prompt ("actually, look first"), and a mode
-            // you can only enter with an empty box is a mode you use once.
-            if (key.matches(vaxis.Key.tab, .{ .shift = true })) {
-                agent.cyclePermMode(self);
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-
-            // ── history scroll ──
-            // PageUp/PageDown move a PAGE (the whole window, minus one line so
-            // you can see what came before and what comes after). Before they
-            // moved 5 fixed rows, which in a 40-row terminal did not feel like
-            // scrolling.
-            // Ctrl+U / Ctrl+D do half a page, like in less.
-            const k = key;
-            const page: usize = @max(3, self.hist_rows -| 1);
-            const half: usize = @max(2, self.hist_rows / 2);
-            if (k.matches(vaxis.Key.page_up, .{}) or
-                (k.codepoint == 'k' and k.mods.shift) or
-                (k.matches('u', .{ .ctrl = true })))
-            {
-                const step = if (k.matches('u', .{ .ctrl = true })) half else page;
-                self.scrollBy(@intCast(step));
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            if (k.matches(vaxis.Key.page_down, .{}) or k.codepoint == 6 or
-                (k.codepoint == 'j' and k.mods.shift) or
-                (k.matches('d', .{ .ctrl = true })))
-            {
-                const step = if (k.matches('d', .{ .ctrl = true })) half else page;
-                self.scrollBy(-@as(isize, @intCast(step)));
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-
-            // Everything else goes to the input editor.
-            if (try editorKey(self, ctx, k)) {
-                try self.armTick(ctx);
-                return;
-            }
-            ctx.redraw = true;
-        },
-        .tick => {
-            // The tick always rearms (1.5).
-            //
-            // Before it only rearmed "if there is work", and `busy`/`dirty`
-            // have windows where both are false (e.g. between `streamEnd` and
-            // `pushToolStart`, with a session write(2) and a DEFLATE-9 in
-            // between). A tick landing there left `App.timers` EMPTY, and since
-            // the worker has neither a pointer to the `EventContext` nor to
-            // the event queue, there was no way to request a frame: the screen
-            // stayed dead until a key was pressed, the wheel moved or the
-            // window was resized.
-            //
-            // The cost of always rearming is one timer every 120 ms at idle,
-            // which only repaints if something changed; the alternative is an
-            // app that goes dead with no explanation.
-            self.tick_armed = false;
-            self.motion_tick_count +%= 1;
-            // Phase 37: sample RSS about once per second (the tick fires every
-            // ~120 ms). The ring is fixed and allocation-free, so this is safe
-            // from the UI thread and gives /diag a growth history.
-            if (self.motion_tick_count % 8 == 0 and self.io_ready) {
-                self.diag_seq +%= 1;
-                var s = diag_mod.sample(self.io);
-                s.seq = self.diag_seq;
-                self.diag_monitor.push(s);
-            }
-            // Phase 19: a parked turn may need a scheduled prompt or a periodic
-            // check-in even when no model iteration is running. The same door
-            // (appendHarnessPrompt) is used; both are suppressed while busy.
-            agent.drainScheduleNotifications(self);
-            const a = self.activity();
-            const asked = self.redraw_requested.swap(false, .seq_cst);
-            // `mascotMoved` and not "there is an animation": at rest the face
-            // changes once every couple of seconds, and the tick fires eight
-            // times a second in between. The face is the ONLY thing that moves
-            // when the app is otherwise idle, so without this the idle track
-            // (blinks, exhale, yawn) was only ever painted when a key happened
-            // to arrive — which is why it read as a frozen glyph.
-            // Phase 4: mascot motion repaints are disabled by reduced/no animation.
-            const mascot_moved = self.mascotMoved();
-            if (mascot_moved) self.mascot_motion_repaints +%= 1;
-            // Phase 32.1: advance the three-way count pill by +1 per tick so it
-            // animates toward the target like the tps rolling window.
-            const verify_moved = self.verify_counter.tick();
-            if (verify_moved) self.dirty = true;
-            if (asked or a.busy or a.dirty or a.perm or a.picker or self.pal.active or mascot_moved or verify_moved) {
-                ctx.redraw = true;
-            }
-            // The queue is drained here and not by the worker: `startChat`
-            // enqueues when busy, and the worker thread has no `EventContext`
-            // to start the next turn with, so until now a queued prompt was
-            // shown in the footer and never ran. The tick is the UI thread
-            // waking up anyway, and the turn has just ended by then.
-            if (self.takeQueuedWhenIdle()) |turn| {
-                agent.startTurn(self, turn.text, turn.mode, turn.bash_allow_rules, turn.expand_cmdsubst) catch |err| {
-                    self.pushInfoFmt("error: {t}", .{err});
-                };
-                self.allocator.free(turn.text);
-                ctx.redraw = true;
-            }
-            // The model catalogue on disk refreshes itself, quietly, about
-            // every quarter hour — only while idle, by the worker that already
-            // does the startup warmup. The palette never waits on the network
-            // for a list the user expected to be current.
-            agent.maybeRefreshCatalog(self);
-            agent.maybeRefreshModelPalette(self);
-            try self.armTick(ctx);
-        },
-        .init => {
-            ctx.redraw = true; // first frame without waiting for a key
-            try self.armTick(ctx);
-        },
-        .focus_in => {
-            self.focused = true;
-            ctx.redraw = true;
-            try self.armTick(ctx);
-        },
-        // Losing focus ends any gesture. Both flags had exactly ONE exit, a
-        // `.release` that reaches this handler, and three ways to not get one:
-        // the window losing focus (the release goes to the window you clicked),
-        // the pointer leaving the surface (vaxis's `mouse_leave` carries no
-        // coordinates), and a release that vxfw drops before it reaches us
-        // because it landed outside the PREVIOUS frame's surface.
-        //
-        // A stranded `scrollbar_dragging` is the loud one: the flag makes every
-        // later `.drag` in the history `return` early after a `scrollTo`, so a
-        // text drag could never start a selection again and the first drag
-        // anywhere jumped the scroll to wherever the pointer happened to be.
-        .focus_out => {
-            self.focused = false;
-            self.cancelMouseGestures();
-            ctx.redraw = true;
-        },
-        .mouse_leave => {
-            self.cancelMouseGestures();
-            ctx.redraw = true;
-        },
-        .paste_start => {
-            self.pasting = true;
-            self.paste_buf.clearRetainingCapacity();
-        },
-        .paste_end => {
-            self.pasting = false;
-            // Route bracketed paste to the active key prompt (provider connect),
-            // otherwise insert into the composer. Newlines/control chars are
-            // filtered by the key buffer so a pasted API key stays valid.
-            if (self.pal.active and self.pal.mode == .key_prompt) {
-                self.pal.appendKeyText(self.paste_buf.items);
-            } else {
-                insertIntoInput(self, self.paste_buf.items);
-            }
-            self.paste_buf.clearRetainingCapacity();
-            ctx.redraw = true;
-        },
-        .paste => |data| {
-            // OSC-52 clipboard paste (the terminal already aggregated it).
-            if (self.pal.active and self.pal.mode == .key_prompt) {
-                self.pal.appendKeyText(data);
-            } else {
-                insertIntoInput(self, data);
-            }
-            ctx.redraw = true;
-        },
-        .mouse => |m| {
-            // A modal owns the mouse while it is open: every event goes to it
-            // and the transcript behind it does not scroll, select or drag.
-            // Before, the wheel fell through to the history and the modal just
-            // sat there while the text behind it moved.
-            if (self.pal.active) {
-                const r = palette.handleMouse(&self.pal, self.frame_w, self.frame_h, m);
-                if (r.changed) ctx.redraw = true;
-                if (std.meta.activeTag(r.action) != .none) try self.applyPaletteAction(ctx, r.action);
-                return;
-            }
-            // The prompt rail's hover. It is read on motion only (not on drag:
-            // a drag belongs to the gesture in progress) and it fills the dot
-            // under the pointer, which is the only thing saying it is clickable.
-            // Skip while overlays own the surface so hover never gets stranded.
-            if (m.type == .motion and !self.scrollbar_dragging and !self.selecting_text and
-                !self.pal.active and !self.askActive() and !self.permActive())
-            {
-                const hot: ?usize = if (self.promptDotAt(m)) |d| d.para else null;
-                if (hot != self.prompt_dot_hover) {
-                    self.prompt_dot_hover = hot;
-                    ctx.redraw = true;
-                }
-                return;
-            }
-            if (m.type == .motion and self.prompt_dot_hover != null and
-                (self.pal.active or self.askActive() or self.permActive()))
-            {
-                self.prompt_dot_hover = null;
-                ctx.redraw = true;
-                return;
-            }
-            if (self.scrollbar_dragging) {
-                switch (m.type) {
-                    .drag => {
-                        if (m.row >= 0 and @as(usize, @intCast(m.row)) < self.hist_rows) {
-                            self.scrollTo(scrollbarOffset(
-                                @intCast(m.row),
-                                self.hist_rows,
-                                self.max_offset,
-                            ));
-                        }
-                        ctx.redraw = true;
-                        return;
-                    },
-                    .release => {
-                        if (m.row >= 0 and @as(usize, @intCast(m.row)) < self.hist_rows) {
-                            self.scrollTo(scrollbarOffset(
-                                @intCast(m.row),
-                                self.hist_rows,
-                                self.max_offset,
-                            ));
-                        }
-                        self.scrollbar_dragging = false;
-                        ctx.redraw = true;
-                        return;
-                    },
-                    else => {},
-                }
-            }
-            if (self.selecting_text) {
-                switch (m.type) {
-                    .drag => {
-                        if (self.clampedSelectionPoint(m)) |point| self.selection_end = point;
-                        ctx.redraw = true;
-                        return;
-                    },
-                    .release => {
-                        if (self.clampedSelectionPoint(m)) |point| self.selection_end = point;
-                        self.selecting_text = false;
-                        try self.copySelectedText(ctx);
-                        ctx.redraw = true;
-                        return;
-                    },
-                    else => {},
-                }
-            }
-            if (m.type == .press and m.button == .left and
-                !self.pal.active and !self.askActive() and !self.permActive())
-            {
-                // The rail comes FIRST: its column is inside the selectable
-                // area, and a click there has to jump to a prompt instead of
-                // starting a text selection of one character.
-                if (self.promptDotAt(m)) |d| {
-                    self.jumpToPrompt(d);
-                    ctx.redraw = true;
-                    return;
-                }
-                if (self.max_offset > 0 and m.col >= 0 and m.row >= 0 and
-                    @as(usize, @intCast(m.col)) == self.selectable_width -| 1 and
-                    @as(usize, @intCast(m.row)) < self.hist_rows)
-                {
-                    self.scrollbar_dragging = true;
-                    self.scrollTo(scrollbarOffset(
-                        @intCast(m.row),
-                        self.hist_rows,
-                        self.max_offset,
-                    ));
-                    ctx.redraw = true;
-                    return;
-                }
-                if (self.selectionPoint(m)) |point| {
-                    self.selection_start = point;
-                    self.selection_end = point;
-                    self.selecting_text = true;
-                    ctx.redraw = true;
-                    return;
-                }
-            }
-            // The wheel arrives as button 64/65 with type=press.
-            if (m.type != .press) return;
-            if (m.button == .left and
-                m.row >= 0 and @as(u16, @intCast(m.row)) == self.scroll_bottom_row and
-                m.col >= 0 and @as(u16, @intCast(m.col)) >= self.scroll_bottom_start and
-                @as(u16, @intCast(m.col)) < self.scroll_bottom_end)
-            {
-                self.scrollBy(-1_000_000);
-                ctx.redraw = true;
-                try self.armTick(ctx);
-                return;
-            }
-            switch (m.button) {
-                // CAREFUL: `self.scroll` is a usize. `self.scroll -= 3` with
-                // the scroll at 0 underflows and brings the app down (integer
-                // overflow -> panic), which is what happened scrolling down
-                // with the wheel while at the very top. `scrollBy` is what
-                // saturates at 0.
-                .wheel_up => self.scrollBy(3),
-                .wheel_down => self.scrollBy(-3),
-                else => return,
-            }
-            ctx.redraw = true;
-        },
-        .winsize => ctx.redraw = true,
-        else => {},
-    }
-}
 
 // ── drawing helpers ────────────────────────────────────────
 /// Called on the FIRST frame only, from `tui`, when `ZODE_DBG_BOOT` is set.
@@ -9711,521 +8939,18 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
 /// with something in it. Measuring after `app.run` instead — which is where this
 /// mark started — measures when the user QUIT, and it printed "first paint" on a
 /// line whose number was the length of the session.
-fn firstPaintMark() void {
+pub fn firstPaintMark() void {
     const env = agent.environ_global orelse return;
     const on = env.get("ZODE_DBG_BOOT") orelse return;
     if (on.len == 0 or std.mem.eql(u8, on, "0")) return;
     agent.bootMark("first frame drawn");
 }
 
-fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
-    const self: *Model = @ptrCast(@alignCast(ud));
-    // ZODE_CRASH_TEST=1: die with the alternate screen ACTIVE (vaxis owns it
-    // by now), so the crash path runs with something real to give back.
-    if (self.crash_test) @panic("crash test requested (ZODE_CRASH_TEST)");
-    if (!self.boot_painted) {
-        self.boot_painted = true;
-        firstPaintMark();
-    }
 
-    const width: u16 = @intCast(ctx.max.width orelse ctx.min.width);
-    const height: u16 = @intCast(ctx.max.height orelse ctx.min.height);
-    // The modal's geometry is derived from these, and a mouse event carries no
-    // size: the hit test uses what was last painted, which is what the user is
-    // pointing at.
-    self.frame_w = width;
-    self.frame_h = height;
-    if (height < 6 or width < 12) {
-        // An empty surface in a small split pane looks like a frozen app. Paint
-        // one clipped line that says what is wrong, then return — no composer,
-        // no modal geometry, no event work until the pane grows.
-        if (height == 0 or width == 0) return vxfw.Surface.empty(self.widget());
-        const tiny_size: vxfw.Size = .{ .width = width, .height = height };
-        var tiny = try vxfw.Surface.init(ctx.arena, self.widget(), tiny_size);
-        var tp = Painter{ .surface = &tiny, .arena = ctx.arena, .ctx = ctx, .width = width, .height = height };
-        _ = tp.putText(0, 0, "zode: terminal too small (min 12x6)", theme.warn);
-        return tiny;
-    }
-
-    const size: vxfw.Size = .{ .width = width, .height = height };
-    var surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);
-    var p = Painter{
-        .surface = &surface,
-        .arena = ctx.arena,
-        .ctx = ctx,
-        .width = width,
-        .height = height,
-    };
-
-    // ── bottom-up layout ──
-    //
-    //   row height-1                       the footer's row (the mascot)
-    //   rows ..input_top+input_h-1         prompt, no box, grows upward
-    //   row  rule_row                      one hairline
-    //   rows rule_row-ac..plan             only when relevant
-    //   rows 0..history_h                  the conversation, and nothing else
-    //
-    // The composer is ONE object: the prompt rows and the footer's row share
-    // the same sunken surface, and the footer's row is the LAST row of the
-    // terminal. There is nothing under the input.
-    //
-    // This used to be a banner of 5 rows, a rule, a BORDERED input box of 3
-    // rows, a blank, a status row and another row for the usage column: eleven
-    // rows of furniture before the first word. Six of them were permanent, and
-    // the banner was a drawing that never changed and never would.
-    const max_input_lines: u16 = 8;
-    const text_w: u16 = if (width > 4) width - 4 else 1;
-
-    // The state, read ONCE per frame: it is what the footer's face and legend
-    // are painted from, and nothing else paints a state any more.
-    //
-    // There used to be TWO widgets for it (the activity strip above the
-    // hairline and the mascot in the row under the input) and they said the
-    // same thing in two places: the row under the input held a face and
-    // nothing else, so on screen it read as a stray emoticon in the corner of
-    // an otherwise empty row.
-    const act = self.activity();
-    const queued = self.queuedCount();
-
-    // Keep a compact live summary near the input; the complete checklist is
-    // emitted into the scrollable history when the model updates the plan.
-    const pl_now = self.planCopy();
-    const plan_rows: u16 = if (pl_now.isEmpty()) 0 else 1;
-
-    // Autocompletion popup: only if there are matches.
-    const ac_rows: u16 = if (self.ac.active and matchCount(self) > 0)
-        @as(u16, @intCast(@min(matchCount(self), self.ac.max_visible) + 1))
-    else
-        0;
-
-    // The composer is ONE object: the text rows plus ONE footer row, both
-    // inside the same sunken surface. The footer is the mascot, the legend and
-    // the session's own numbers; there is no separate status row under the
-    // input any more, and nothing under the well at all.
-    //
-    // `chrome` is the hairline and the optional workspace rows and NOTHING
-    // else: the input has no top and no bottom border, so it costs exactly
-    // the rows it is using.
-    const chrome: u16 = 1 + ac_rows + plan_rows; // hairline, autocomplete, plan
-    const avail: u16 = if (height > chrome + 2) height - chrome - 2 else 1;
-    const ed_w: u16 = if (text_w > 0) text_w else 1;
-    const input_h: u16 = @max(@min(@as(u16, @intCast(@min(self.ed.displayLines(ed_w, editorMeasurer(&p)), max_input_lines))), avail), 1);
-    // The footer is ALWAYS reserved, even when it has nothing to say: a row
-    // that appears and disappears with the state is a row that makes the input
-    // jump, and the input is the one thing the user is looking at.
-    const well_h: u16 = input_h + 1;
-    const input_top: u16 = if (height > well_h + 1) height - well_h else 1;
-    const rule_row: u16 = if (input_top > 0) input_top - 1 else 0;
-    const workspace_top = rule_row -| ac_rows -| plan_rows;
-    const history_h: u16 = @max(workspace_top, 1);
-    // The key handler needs the height to jump a whole page.
-    self.hist_rows = history_h;
-
-    // ── drain pending ──
-    self.drainPending();
-    // The results of the user's own `!` commands. Same rule as everything else
-    // that comes from a worker: the UI thread takes them and appends the session
-    // message, because the session is not thread-safe.
-    self.drainShellOut();
-
-    // Invalidates the cache if the width changed (the lines already come
-    // wrapped) or if a paragraph was edited in-place (^R expands a tool
-    // result).
-    if (self.cache_width != width) {
-        self.clearSegCache();
-        self.cache_width = width;
-        self.cache_from = null;
-    } else if (self.cache_from) |from| {
-        // Drops the paragraphs from `from` onwards. CAREFUL: `from` is a
-        // HISTORY index, not a cache one (the cache is a window, so its
-        // indices are offset: that is why we look it up by `para_idx`).
-        var i: usize = 0;
-        while (i < self.seg_cache.items.len) {
-            if (self.seg_cache.items[i].para_idx >= from) {
-                self.evictCached(i);
-            } else {
-                i += 1;
-            }
-        }
-        self.cache_from = null;
-    }
-
-    // ── layout of the live paragraph (redone every frame) ──
-    //
-    // The SNAPSHOT is taken with the lock held and the PARSE OUTSIDE (1.6):
-    // before, ALL of `stream_buf` was parsed (markdown + highlighter +
-    // grapheme widths) on every frame and with the model lock held, so the
-    // worker (which puts a `streamDelta` per token) competed with draw on
-    // every token and the lock became a bottleneck. Copying is a memcpy;
-    // parsing is not.
-    //
-    // INVARIANT: whatever `live_src` points at when the lock is released is
-    // owned by `ctx.arena` and outlives the frame's parse. The `CellRun`s store
-    // the grapheme BY VALUE but with a pointer to its bytes, and painting
-    // happens later, so a stack buffer or a model-owned buffer would be read
-    // after it died (the `&[_]u8{c}` family AGENTS.md keeps paying for).
-    var live_src: []const u8 = &.{};
-    var live_is_tool = false;
-    var tool_buf: [128]u8 = undefined;
-    {
-        self.lock();
-        defer self.unlock();
-        if (self.streaming and self.stream_buf.items.len > 0) {
-            // THE COPY IS INSIDE THE CRITICAL SECTION, and that is the whole
-            // point of it.
-            //
-            // It used to be: take a slice under the lock, unlock, and copy ten
-            // lines later at the parse site. In between the worker could
-            // `stream_buf.appendSlice(...)`, which reallocates and FREES the
-            // old buffer — so the copy could read freed memory, and what came
-            // out was arbitrary bytes fed to the UTF-8 parser and then to the
-            // renderer. Narrow window, but the only path in the history that
-            // could put genuinely random bytes on screen.
-            live_src = ctx.arena.dupe(u8, self.stream_buf.items) catch "";
-        }
-        // Feedback for the tool in progress. Without this, a 30s `bash` leaves
-        // the last row frozen at `⏺ bash(...)` and there is no way to tell if
-        // the process is still alive or if the app has hung: the clock is the
-        // only thing that answers "is it stuck?".
-        //
-        // No need to concatenate with the streaming: they never coexist (a
-        // tool runs with the stream closed), so the clock line REPLACES the
-        // live paragraph instead of adding to it.
-        if (self.tool_run) |tr| {
-            // The ELAPSED TIME goes IN THE HEADER LINE, not only in the strip.
-            //
-            // The strip is one row and it is at most 80 columns: with a long
-            // command, a model name and a session counter, its clock was the
-            // first thing pushed off the right edge. So the question the user
-            // actually asks — "has it been running 4 seconds or is it stuck?" —
-            // had to be answered from a row that was not on screen.
-            //
-            // The argument is clipped for the same reason it is clipped in the
-            // header: a `bash` argument is whatever the model wrote.
-            //
-            // The clock is read under the lock, and it MOVES: `toolRunMillis`
-            // takes the lock now (it used to read `self.tool_run` unlocked,
-            // which was a use-after-free against `toolRunEnd` and made this
-            // number read 0 — see the comment there).
-            const ms = self.toolRunMillisLocked();
-            var arg_buf: [96]u8 = undefined;
-            const arg_shown = textcap.clipInto(tr.arg, 48, &arg_buf);
-            const secs = ms / 1000;
-            const line = if (ms == 0)
-                if (tr.arg.len == 0)
-                    std.mem.print(&tool_buf, "*{s}* running", .{tr.name}) catch ""
-                else
-                    std.mem.print(&tool_buf, "*{s}*({s}) running", .{ tr.name, arg_shown }) catch ""
-            else if (tr.arg.len == 0)
-                std.mem.print(&tool_buf, "*{s}* running · {d}.{d}s", .{ tr.name, secs, (ms % 1000) / 100 }) catch ""
-            else
-                std.mem.print(&tool_buf, "*{s}*({s}) running · {d}.{d}s", .{ tr.name, arg_shown, secs, (ms % 1000) / 100 }) catch "";
-            // Copied here, while `tool_buf` is certainly alive and `tr.name` /
-            // `tr.arg` cannot be freed under us: `toolRunEnd` frees them from
-            // the worker thread as soon as it runs.
-            live_src = ctx.arena.dupe(u8, line) catch "";
-            live_is_tool = true;
-        }
-        // The spinner advances with `workingLocked` and NOT with `busy`: during
-        // a tool, `busy` is already false (the stream closed) and without this
-        // the face kept the same expression for the whole `bash`, which is
-        // exactly when you most need to notice the app is alive.
-        if (self.workingLocked()) self.spinner_frame +%= 1;
-    }
-
-    // The footer is the single owner of phase and elapsed time. Do not repeat
-    // its clock in the history while waiting for the first token.
-    const live_kind: md.Kind = if (live_is_tool) .tool_res else .assistant;
-    var live_active = false;
-    const hist_margin: u16 = historyMargin(width);
-    const wrap_width: u16 = if (width > hist_margin * 2 + 1)
-        width - hist_margin * 2 - 1
-    else if (width > 1)
-        width - 1
-    else
-        width;
-
-    var live_lines: []const PLine = &.{};
-    if (live_src.len > 0) {
-        // Streaming text is rebuilt from the current snapshot each frame so
-        // incomplete markdown (unclosed fences, partial structures) keeps
-        // rendering as it arrives. We force redraw while live content is shown.
-        self.diff_needs_full_redraw = true;
-        // `live_src` is already frame-arena owned (see the invariant above), so
-        // there is nothing to copy here any more.
-        var live_para = Model.Para{
-            .kind = live_kind,
-            .text = live_src,
-            .lang = if (live_kind == .diff) "zig" else "",
-        };
-        live_lines = buildLines(ctx.arena, ctx, &live_para, wrap_width, self.nerd_icons) catch &.{};
-        live_active = live_lines.len > 0;
-    }
-
-    // ── scroll: 0 = anchored at the bottom ──
-    //
-    // `layoutFor` leaves the cache window covering what is visible (so deep
-    // scrolling re-parses on demand, which is what the old comment claimed and
-    // was not true) and returns the visible range already stabilized.
-    //
-    // Reserve one column for the scrollbar, even while it is inactive, so text
-    // never jumps when the history first becomes scrollable.
-    self.wrap_w = wrap_width;
-    const vis = try self.layoutFor(
-        ctx,
-        wrap_width,
-        if (live_active) live_lines.len else 0,
-        history_h,
-    );
-    const first_visible = vis.first;
-    const last_visible = vis.last;
-    // Publishes what was painted, so the `↓ N` indicator and the tests read the
-    // same numbers the screen shows. `live_h` goes here too: it is the one input
-    // `currentMaxOffset` cannot compute on its own, and the key handlers clamp
-    // against it (without it, a PageUp before the first frame does nothing).
-    self.first_visible = first_visible;
-    self.max_offset = vis.max_offset;
-    self.live_h = if (live_active) live_lines.len else 0;
-
-    // Clear the transcript area up to the hairline, INCLUDING the rows a plan
-    // or autocomplete popup reserves (history_h stops short of `rule_row`
-    // there), so no row keeps the previous frame's pixels.
-    //
-    // On the TERMINAL's background and not on `well_bg`: a panel that is
-    // almost black looks like a second, wrong black next to the terminal's
-    // own, and on a black terminal the whole transcript read as a gray block
-    // with the user's own background nowhere in sight. The history is the
-    // page; only a well that MEANS something (a tool result, a code block, a
-    // modal) is allowed to be a surface.
-    {
-        var clear_row: u16 = 0;
-        while (clear_row < rule_row) : (clear_row += 1) {
-            p.fillRange(0, width, clear_row, " ", .{});
-        }
-    }
-
-    // ── paints only the visible lines ──
-    //
-    // `line_cursor` is the ABSOLUTE position of the first line: the window's
-    // `.offset` (`cache_lo`) plus what the cached paragraphs before it carry.
-    //
-    // The `pad` is the opening hero's air. It is measured against the CONTENT's
-    // real height and NOT against `last_visible - first_visible`: that range is
-    // already clamped to the viewport, so it is `history_h` whenever the
-    // content is short, and the first version of this compared the content
-    // against itself and always decided there was no room.
-    const content_lines = self.heightPrefix(self.paras.items.len) + live_lines.len;
-    const hero = heroFrame(self, wrap_width + 2 * hist_margin, history_h, content_lines);
-    const pad = hero.pad;
-    // ── paint cached paragraphs ──
-    // Use `heightPrefix(para_idx)` for the absolute line position of each
-    // cached paragraph. This correctly handles gaps in the cache (virtual
-    // scroll means not every paragraph is parsed).
-    for (self.seg_cache.items) |c| {
-        const para_abs_start = self.heightPrefix(c.para_idx);
-        if (para_abs_start >= last_visible) break;
-        if (para_abs_start + c.height <= first_visible) continue;
-        // The cached entry is the WHOLE paragraph (separator row counted in
-        // already, see `layoutOne`), so its first line sits exactly at the
-        // paragraph's absolute start.
-        drawLines(&p, c.lines, para_abs_start, first_visible, history_h, pad, hero.x_off);
-    }
-    // ── paint live paragraph ──
-    // Its absolute position is the total height of all closed paragraphs.
-    if (live_active) {
-        const live_abs_start = self.heightPrefix(self.paras.items.len);
-        drawLines(&p, live_lines, live_abs_start, first_visible, history_h, pad, hero.x_off);
-    }
-
-    // ── update differential tracking state ──
-    self.diff_last_first = first_visible;
-    self.diff_last_last = last_visible;
-    self.diff_last_live_active = live_active;
-    self.diff_needs_full_redraw = false;
-    drawHistoryScrollbar(&p, width, history_h, first_visible, vis.max_offset);
-    // ── prompt rail (dots) ── computed every frame so the mouse handler has
-    // current data, but only painted when show_prompt_dots is enabled (off by
-    // default: not polished enough yet).
-    self.refreshPromptDots(width, history_h);
-    // The sticky header and the pill go OVER the transcript, and that is the
-    // editor's own convention (a sticky line covers the content under it).
-    // Reserving a row for them would move the text under the reader's eyes
-    // every time they appeared, and the transcript is what they are reading.
-    drawStickyHeader(&p, self, width, ctx.arena);
-    drawNewMessagesPill(&p, self, width, history_h);
-    try self.snapshotSelectableHistory(surface, history_h);
-    drawPromptTimeline(&p, self);
-    self.paintTextSelection(surface);
-
-    // The session's numbers are NOT painted here any more: they live in the
-    // composer's footer, next to the mascot, because there is no row under
-    // the input any more.
-    //
-    // What used to be here was a status row that answered "what model am I
-    // talking to" with a face on its left and the model's name glued to its
-    // right, and nothing in between: on screen it read as a stray emoticon in
-    // the corner of an empty row, which is what the user called ugly. The
-    // strip above the hairline said the SAME thing again ("thinking",
-    // "streaming"), so the state was in two places and the numbers were in a
-    // third.
-    //
-    // There is now ONE state surface, inside the composer, and it carries all
-    // of it: the mascot, the legend and the session's own numbers.
-
-    // ── `ask`: the model asked something ──
-    //
-    // The picker is opened HERE, on the UI thread, and not by the worker that
-    // raised the question. That is not a style choice: the model catalog worker once
-    // filled the palette while the UI thread was drawing it, with no lock on the
-    // palette's own state, and the app segfaulted. The worker leaves the question
-    // in the `Model`; the draw is what turns it into a picker.
-    // ── modal picker (opencode style, centered) ──
-    if (self.pickerSnapshot(ctx.arena)) |ps| {
-        drawPicker(&p, width, height, ps);
-    }
-    // ── modal diff viewer (33.18) ──
-    if (self.diffViewerActive()) {
-        drawDiffViewer(&p, self, width, height);
-    }
-    // ── transcript screen (33.4) ──
-    if (self.transcriptViewActive()) {
-        drawTranscriptView(&p, self, width, height);
-    }
-    // ── transcript search bar (33.13) ──
-    if (self.transcriptSearchActive()) {
-        drawTranscriptSearchBar(&p, self, width, height);
-    }
-
-    // ── permission dialog (modal over the history, at the bottom) ──
-    var perm_tool: []const u8 = "";
-    var perm_detail: []const u8 = "";
-
-    // ── the plan, when there is one ──
-    if (plan_rows > 0) {
-        drawPlanBlock(&p, workspace_top, width, pl_now);
-    }
-
-    // ── `/` autocompletion (directly above the prompt) ──
-    if (ac_rows > 0) {
-        drawAutocomplete(&p, self, input_top - ac_rows, width, ac_rows);
-    }
-
-    // ── the hairline ──
-    //
-    // ONE row, full width, `line_bright`: it is what replaces the input's box.
-    // A box is two extra rows and four more glyphs to say "text goes here", and
-    // the thing it is really saying is "this is the boundary of the page" —
-    // which is what a rule says, for one row instead of three.
-    //
-    // It is NOT painted when the permission dialog is up: the modal is a
-    // centred box with a clean background, and a full-width rule under it
-    // points at a boundary the dialog is ignoring.
-    if (!self.permActive()) p.fillRow(rule_row, "─", theme.rule);
-
-    // Determine accent bar color based on state (reuse `act` from layout)
-    const bar_style = if (act.ask) theme.warn else if (act.busy) theme.brand else theme.input_bar;
-
-    drawInput(&p, &surface, self, input_top, width, input_h, rule_row, bar_style);
-
-    // ── the footer's row: the ONE state surface ──
-    //
-    // It is the last row of the composer's own well, so the bottom of the app
-    // is ONE object: the sunken surface with the prompt in it and the mascot
-    // under it. Nothing hangs below the input any more.
-    drawStateFooter(&p, input_top + input_h, width, self, act, queued, ctx.arena);
-
-    // ── permission dialog: centered MODAL ──
-    //
-    // Before it was 4 lines glued right above the input box, in the middle of
-    // the normal flow: with a full history they were half hidden or covered,
-    // and the app looked HUNG waiting for something nobody could see. Now it is
-    // a centered box with a border, a clean background and big options: there
-    // is no way not to see it.
-    if (self.permView(&perm_tool, &perm_detail)) {
-        drawPermissionModal(
-            &p,
-            width,
-            height,
-            perm_tool,
-            perm_detail,
-            self.permRule(),
-            self.permAllowAlways(),
-            self.permSandboxAvailable(),
-            self.permSuggestion(),
-        );
-    }
-
-    // ── `ask`: the question itself ──
-    //
-    // Drawn ABOVE the permission modal and BELOW the palette, and the reason is
-    // priority: an `ask` and a permission cannot be open at the same time (a
-    // question is asked by the model between tool calls, and the permission for
-    // the NEXT tool only comes after the answer), but the palette can be open
-    // over a question — you pressed ctrl+p while waiting — and then the palette
-    // must win, because it is what you are typing into.
-    if (self.askSnapshot(ctx.arena)) |snap| {
-        if (!self.pal.active) drawAskPanel(&p, width, history_h, snap, self.askMillis());
-    }
-
-    // ── modal palette (Ctrl+P): last, on top of everything ──
-    //
-    // Before drawing: if the worker left new models, the palette is reloaded
-    // with them. This happens HERE, on the UI thread, which is the palette's
-    // only owner. Only in models mode: a late catalog worker must not clobber
-    // the commands list the user is looking at.
-    if (self.pal.active and self.pal.mode == .models) {
-        if (self.takePendingItems()) |items| {
-            self.pal.setItemsOwned(items, &agent.model_groups);
-        }
-    } else {
-        // Drop stale pending items so they do not leak into the next open.
-        if (self.takePendingItems()) |items| {
-            palette.freeItems(self.allocator, items);
-        }
-    }
-    if (self.pal.active) {
-        palette.draw(&p, &surface, &self.pal, width, height, self.catalogNotice(ctx.arena));
-    }
-
-    // ── copy toast: top-right, rounded border, ~2 seconds ──
-    var notif_y: u16 = 2;
-    if (self.copy_toast_frames > 0) {
-        self.copy_toast_frames -= 1;
-        drawCopyToast(&p, width, height, self.copy_toast_text);
-        notif_y += 4;
-    }
-
-    // ── transient notifications (33.9): top-right stack, absolutely positioned ──
-    {
-        var i: usize = 0;
-        while (i < self.notification_len) {
-            if (self.notifications[i].frames == 0) {
-                // Remove expired: shift left.
-                var j = i + 1;
-                while (j < self.notification_len) : (j += 1) {
-                    self.notifications[j - 1] = self.notifications[j];
-                }
-                self.notification_len -= 1;
-                continue;
-            }
-            self.notifications[i].frames -= 1;
-            drawNotificationToast(&p, width, height, self.notifications[i].slice(), notif_y);
-            notif_y +|= 4;
-            i += 1;
-        }
-    }
-
-    // ── Settings screen: FULL-SURFACE, painted last so nothing overlaps it ──
-    if (self.settings_active) {
-        drawSettingsScreen(&p, self, width, height);
-    }
-
-    return surface;
-}
 
 /// Copy toast: small rounded box in the top-right corner that appears for
 /// ~2 seconds after the user copies selected text to the clipboard.
-fn drawCopyToast(p: *Painter, width: u16, height: u16, text: []const u8) void {
+pub fn drawCopyToast(p: *Painter, width: u16, height: u16, text: []const u8) void {
     if (width < 10 or height < 4) return;
     const pad: u16 = 2;
     const text_w: u16 = if (text.len > 40) 40 else @intCast(text.len);
@@ -10242,7 +8967,7 @@ fn drawCopyToast(p: *Painter, width: u16, height: u16, text: []const u8) void {
 }
 
 /// 33.9: transient notification toast, absolutely positioned at (top-right, y).
-fn drawNotificationToast(p: *Painter, width: u16, height: u16, text: []const u8, y: u16) void {
+pub fn drawNotificationToast(p: *Painter, width: u16, height: u16, text: []const u8, y: u16) void {
     if (width < 10 or height < 4) return;
     const pad: u16 = 2;
     const toast_h: u16 = 3;
@@ -10273,7 +8998,7 @@ fn drawNotificationToast(p: *Painter, width: u16, height: u16, text: []const u8,
 /// caret is, which is the entire job.
 ///
 /// The terminal cursor is anchored at the real editor position.
-fn drawInput(
+pub fn drawInput(
     p: *Painter,
     surface: *vxfw.Surface,
     self: *Model,
@@ -10547,7 +9272,7 @@ fn putMatchPath(p: *Painter, col: u16, row: u16, path: []const u8, positions: []
 }
 
 /// List of commands matching what was typed after the `/`.
-fn drawAutocomplete(
+pub fn drawAutocomplete(
     p: *Painter,
     self: *const Model,
     top: u16,
@@ -10641,7 +9366,7 @@ fn splitLines(arena: std.mem.Allocator, text: []const u8) [][]const u8 {
 /// Side margin of the history, in columns.
 ///
 /// Layout reserves it on both sides; painting uses it as the left edge.
-fn historyMargin(width: u16) u16 {
+pub fn historyMargin(width: u16) u16 {
     return if (width > 8) 2 else 0;
 }
 
@@ -10682,7 +9407,7 @@ pub fn scrollbarOffset(row: usize, track_rows: usize, max_offset: usize) usize {
 /// **It only appears when the reader is away from the bottom.** At the bottom
 /// the prompt is right there in the transcript, and covering the answer while
 /// the model is writing would be a cost with no benefit.
-fn drawStickyHeader(
+pub fn drawStickyHeader(
     p: *Painter,
     self: *const Model,
     width: u16,
@@ -10747,7 +9472,7 @@ fn stickyPrompt(self: *const Model) ?[]const u8 {
 /// cost: a control that is on its own row moves the transcript every time it
 /// appears, and the transcript is what the reader is reading. The footer
 /// keeps the clickable "↓ N new", so nothing is lost by covering a line.
-fn drawNewMessagesPill(
+pub fn drawNewMessagesPill(
     p: *Painter,
     self: *const Model,
     width: u16,
@@ -10779,7 +9504,7 @@ fn drawNewMessagesPill(
     _ = p.putText(x + 1, y, label, st);
 }
 
-fn drawHistoryScrollbar(
+pub fn drawHistoryScrollbar(
     p: *Painter,
     width: u16,
     track_rows: u16,
@@ -10811,7 +9536,7 @@ fn drawHistoryScrollbar(
 /// The filled dot with no pointer on it is the prompt of the turn being read,
 /// the one the sticky header names. The two together answer "where am I"
 /// without covering a line of the transcript.
-fn drawPromptTimeline(p: *Painter, self: *const Model) void {
+pub fn drawPromptTimeline(p: *Painter, self: *const Model) void {
     if (!self.show_prompt_dots) return;
     if (self.prompt_dot_len == 0 or self.prompt_dot_col == 0) return;
     const active = stickyPromptPara(self);
@@ -10868,7 +9593,7 @@ pub fn expandWideCells(surface: *vxfw.Surface, row: u16, width: u16) void {
     }
 }
 
-fn drawLines(
+pub fn drawLines(
     p: *Painter,
     lines: []const PLine,
     line_offset: usize,
@@ -10921,7 +9646,7 @@ fn drawLines(
 /// The width is `hero_content_w` and not "however wide this line happens to
 /// be", because a block whose left edge moves when one of its strings is one
 /// character wider is not a block — it is text that happens to be near a rule.
-fn heroFrame(m: *const Model, width: u16, history_h: u16, content_lines: usize) struct { pad: u16, x_off: u16 } {
+pub fn heroFrame(m: *const Model, width: u16, history_h: u16, content_lines: usize) struct { pad: u16, x_off: u16 } {
     if (!onlyHero(m)) return .{ .pad = 0, .x_off = 0 };
     if (content_lines >= history_h) return .{ .pad = 0, .x_off = 0 };
     const avail = @as(u16, width) -| 2 * historyMargin(width);
@@ -11067,7 +9792,7 @@ fn drawRoundedBox(
     p.putStable(x + w - 1, y + h - 1, "╯", 1, border_style);
 }
 
-fn drawPermissionModal(
+pub fn drawPermissionModal(
     p: *Painter,
     width: u16,
     height: u16,
@@ -11340,7 +10065,7 @@ fn drawPermissionModalCompact(
 /// When there is a queue the queued prompts are shown too, so you know what is
 /// coming next instead of having to remember it.
 /// A compact plan summary; the complete checklist is kept in the history.
-fn drawPlanBlock(p: *Painter, top: u16, width: u16, pl: plan_mod.Plan) void {
+pub fn drawPlanBlock(p: *Painter, top: u16, width: u16, pl: plan_mod.Plan) void {
     p.fillRow(top, " ", .{});
     // Frame the plan as a distinct block above the input, so it is easy to
     // spot that there is a todo list and to see which step is active.
@@ -11385,7 +10110,7 @@ fn drawPlanBlock(p: *Painter, top: u16, width: u16, pl: plan_mod.Plan) void {
 /// Without options this panel IS the interface: the question, a hint line, and
 /// the input box right below the screen edge already in answer mode. Drawing a
 /// box around "type your answer" as well would be two boxes saying the same thing.
-fn drawAskPanel(
+pub fn drawAskPanel(
     p: *Painter,
     width: u16,
     height: u16,
@@ -11747,7 +10472,7 @@ fn wrapOneLine(
 /// It is the bridge that makes the input's wrap and the input's paint the SAME
 /// wrap: `vaxis.unicode` for what a grapheme is and `p.measure` (which is
 /// `ctx.stringWidth`) for how wide it is on THIS terminal.
-fn editorMeasurer(p: *const Painter) ed.Measurer {
+pub fn editorMeasurer(p: *const Painter) ed.Measurer {
     return .{ .ctx = @ptrCast(p), .step = graphemeStep };
 }
 
@@ -11810,7 +10535,7 @@ fn graphemeStep(ctx: *const anyopaque, text: []const u8, i: usize) ed.Step {
 /// the throughput, then the context gauge, and the model last), because a
 /// half-drawn face is a drawing bug and a missing model is a command away
 /// (`/model`).
-fn drawStateFooter(
+pub fn drawStateFooter(
     p: *Painter,
     row: u16,
     width: u16,
@@ -12198,7 +10923,7 @@ fn drawStateFooter(
     }
 }
 
-fn drawTranscriptSearchBar(p: *Painter, m: *const Model, width: u16, height: u16) void {
+pub fn drawTranscriptSearchBar(p: *Painter, m: *const Model, width: u16, height: u16) void {
     if (!m.search_bar_active) return;
     const box_w: u16 = @min(width -| 4, 80);
     if (box_w < 20 or height < 3) return;
@@ -12211,7 +10936,7 @@ fn drawTranscriptSearchBar(p: *Painter, m: *const Model, width: u16, height: u16
     _ = p.putClipped(x0 + 1, y0, label, box_w -| 2, theme.selected);
 }
 
-fn drawTranscriptView(p: *Painter, m: *Model, width: u16, height: u16) void {
+pub fn drawTranscriptView(p: *Painter, m: *Model, width: u16, height: u16) void {
     if (!m.transcript_view_active) return;
     const box_w: u16 = if (width > 8) width - 4 else width;
     const box_h: u16 = if (height > 4) height - 2 else height;
@@ -12305,7 +11030,7 @@ fn drawTranscriptView(p: *Painter, m: *Model, width: u16, height: u16) void {
     }
 }
 
-fn drawDiffViewer(p: *Painter, m: *const Model, width: u16, height: u16) void {
+pub fn drawDiffViewer(p: *Painter, m: *const Model, width: u16, height: u16) void {
     const n = m.file_intel_len;
     if (n == 0) return;
 
@@ -12587,7 +11312,7 @@ fn verifycountsCountdown(m: *Model, buf: []u8) []const u8 {
     return std.mem.print(buf, "· {s}", .{text}) catch "";
 }
 
-fn drawSettingsScreen(p: *Painter, m: *Model, width: u16, height: u16) void {
+pub fn drawSettingsScreen(p: *Painter, m: *Model, width: u16, height: u16) void {
     if (width < 40 or height < 12) return;
     const secs = configmenu.all_sections;
     const sec = secs[@min(m.settings_section, secs.len - 1)];
@@ -12672,7 +11397,7 @@ fn drawSettingsScreen(p: *Painter, m: *Model, width: u16, height: u16) void {
     _ = p.putText(2, height - 1, "Esc: close · changes apply now and are saved to config.json", theme.ink3);
 }
 
-fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
+pub fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void {
     const is_sessions = ps.tag == sessions_picker_tag;
     // Bottom-anchored modal pane (33.5): keeps 2 transcript rows visible above a ▔ divider.
     const box_w: u16 = if (width > 2) width else 20;
