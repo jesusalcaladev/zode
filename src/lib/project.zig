@@ -91,8 +91,8 @@ pub const Info = struct {
     ///
     /// Deliberately NOT reported: dirty state, ahead/behind, the last commit.
     /// Every one of those needs reading the index or spawning git, and a line that
-    /// is wrong when it is stale is worse than no line. `bash git status` is one
-    /// iteration away whenever the model actually needs it.
+    /// is wrong when it is stale is worse than no line. The git_* tools are one
+    /// call away whenever the model actually needs it.
     pub fn promptLines(self: *const Info, out: []u8) []const u8 {
         var w: std.Io.Writer = .fixed(out);
         w.print("Working directory: {s}\n", .{self.cwd()}) catch return out[0..0];
@@ -103,10 +103,12 @@ pub const Info = struct {
                 w.print("Git repository: {s} (you are in a subdirectory of it)", .{repo}) catch {};
             }
             if (self.branch()) |b| w.print(" · branch {s}", .{b}) catch {};
-            // `git status` and `git diff` BY NAME, and not "you have a shell": a
-            // model that does not know git answers "what changed" with `ls` and
-            // `cat`, which is both slower and wrong.
-            w.writeAll(" — git is available through bash: git status, git diff and git log are how you answer questions about what changed and what the history says.\n") catch {};
+            // Git is available: a model that does not know it answers "what
+            // changed" with ls and cat. But point at the git_* tools, not bash —
+            // this line lands AFTER the routing table, so telling it to use
+            // bash git status here made the last instruction read contradict
+            // the rule it just read.
+            w.writeAll(" — git is available (the git_* tools above: `git status`, `git diff`, `git log`).\n") catch {};
         }
         return w.buffered();
     }
@@ -554,4 +556,21 @@ test "the fixtures live under .zig-cache, not in the repo the user is looking at
         error.FileNotFound,
         std.Io.Dir.cwd().openDir(std.testing.io, rel, .{}),
     );
+}
+
+test "promptLines: git is named, but points at git_* tools, not bash" {
+    // This line is composed LAST, after the routing table. Saying "git is
+    // available through bash" here used to contradict the rule the model had
+    // just read (prefer git_status/git_diff/git_log) in the SAME prompt.
+    var info: Info = .{};
+    const root = "/tmp/zode-git-line-test";
+    @memcpy(info.root_buf[0..root.len], root);
+    info.root_len = root.len;
+    info.root_len = root.len;
+    var lines: [512]u8 = undefined;
+    const text = info.promptLines(&lines);
+    try std.testing.expect(std.mem.indexOf(u8, text, "git status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "git diff") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "git_* tools above") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "through bash") == null);
 }

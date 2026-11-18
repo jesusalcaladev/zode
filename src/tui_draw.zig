@@ -86,8 +86,9 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
     const plan_rows: u16 = if (pl_now.isEmpty()) 0 else 1;
 
     // Autocompletion popup: only if there are matches.
-    const ac_rows: u16 = if (self.ac.active and tui.matchCount(self) > 0)
-        @as(u16, @intCast(@min(tui.matchCount(self), self.ac.max_visible) + 1))
+    const ac_matches: usize = if (self.ac.active) tui.matchCount(self) else 0;
+    const ac_rows: u16 = if (ac_matches > 0)
+        @as(u16, @intCast(@min(ac_matches, self.ac.max_visible) + 1))
     else
         0;
 

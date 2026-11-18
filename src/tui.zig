@@ -350,13 +350,23 @@ pub const Painter = struct {
 
     /// Like `putStable`, but with an OSC 8 hyperlink.
     pub fn putStableLinked(self: *Painter, col: u16, row: u16, g: []const u8, w: u8, style: vaxis.Style, link: vaxis.Cell.Hyperlink) void {
+        // Resolve once per call; the bulk painters below resolve once per
+        // STRING/ROW and call the resolved variant directly, so a 200-column
+        // hairline does not redo the RGB→ANSI256 ladder 200 times per frame.
+        self.putStableLinkedResolved(col, row, g, w, theme.resolve(style), link);
+    }
+
+    /// The same as `putStableLinked`, but `style` is ALREADY resolved for the
+    /// current terminal capabilities (via `theme.resolve`). Only call this
+    /// from loops that resolve once and then paint many cells with that style.
+    fn putStableLinkedResolved(self: *Painter, col: u16, row: u16, g: []const u8, w: u8, style: vaxis.Style, link: vaxis.Cell.Hyperlink) void {
         // A control byte must NEVER reach a cell: vaxis emits grapheme bytes
         // raw, so a `\r`, `\n`, ESC or DEL from tool output or streamed text
         // breaks the frame (interleaved text, weird glyphs, broken layout).
         // The width measured it as 1, so it slipped past the clipping below.
         // Render it as a visible replacement instead of dropping it silently.
         if (isControlGrapheme(g)) {
-            self.putStableLinked(col, row, "\u{fffd}", 1, style, link);
+            self.putStableLinkedResolved(col, row, "\u{fffd}", 1, style, link);
             return;
         }
         if (col >= self.width or row >= self.height or col + w > self.width) return;
@@ -367,7 +377,8 @@ pub const Painter = struct {
             // convert rgb→256 (it sends `38;2;r;g;b` whatever the terminal
             // said), so a 256-color terminal got a byte sequence it does not
             // understand, and what it did with it was undefined.
-            .style = theme.resolve(style),
+            // `style` is already resolved by the caller; see putStableLinked.
+            .style = style,
             .link = link,
         });
     }
@@ -385,13 +396,14 @@ pub const Painter = struct {
     pub fn putText(self: *Painter, col: u16, row: u16, text: []const u8, style: vaxis.Style) u16 {
         if (text.len == 0 or col >= self.width or row >= self.height) return col;
         const stable = self.arena.dupe(u8, text) catch return col;
+        const resolved = theme.resolve(style);
         var it = vaxis.unicode.graphemeIterator(stable);
         var c = col;
         while (it.next()) |g| {
             const b = g.bytes(stable);
             const gw = self.measure(b);
             if (c + gw > self.width) break;
-            self.putStable(c, row, b, gw, style);
+            self.putStableLinkedResolved(c, row, b, gw, resolved, .{});
             c += gw;
         }
         return c;
@@ -414,6 +426,7 @@ pub const Painter = struct {
     ) u16 {
         if (text.len == 0 or max_cols == 0 or col >= self.width or row >= self.height) return col;
         const stable = self.arena.dupe(u8, text) catch return col;
+        const resolved = theme.resolve(style);
         var it = vaxis.unicode.graphemeIterator(stable);
         var c: u16 = 0;
         while (it.next()) |g| {
@@ -421,7 +434,7 @@ pub const Painter = struct {
             const gw = self.measure(b);
             if (c + gw > max_cols) break;
             if (col + c + gw > self.width) break;
-            self.putStable(col + c, row, b, gw, style);
+            self.putStableLinkedResolved(col + c, row, b, gw, resolved, .{});
             c += gw;
         }
         return col + c;
@@ -431,18 +444,20 @@ pub const Painter = struct {
     /// The grapheme must be a static literal (e.g. "─").
     pub fn fillRow(self: *Painter, row: u16, g: []const u8, style: vaxis.Style) void {
         if (row >= self.height) return;
+        const resolved = theme.resolve(style);
         var c: u16 = 0;
         while (c < self.width) : (c += 1) {
-            self.putStable(c, row, g, 1, style);
+            self.putStableLinkedResolved(c, row, g, 1, resolved, .{});
         }
     }
 
     /// Fills `[c0, c1)` of a row. For modal backgrounds and selection.
     pub fn fillRange(self: *Painter, c0: u16, c1: u16, row: u16, g: []const u8, style: vaxis.Style) void {
         if (row >= self.height) return;
+        const resolved = theme.resolve(style);
         var c = c0;
         while (c < @min(c1, self.width)) : (c += 1) {
-            self.putStable(c, row, g, 1, style);
+            self.putStableLinkedResolved(c, row, g, 1, resolved, .{});
         }
     }
 };

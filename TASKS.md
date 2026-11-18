@@ -116,6 +116,16 @@ IDs are grouped by track so they can be worked in any order inside a track.
 
 ---
 
+## Phase 46 — ⚡ Optimization pass (completed)
+
+- [x] 🟠 **46.1 Resolve the color ladder once per paint call.** `Painter.putStableLinked` resolved the style for EVERY cell: a 200-column hairline or a transcript clear redid the RGB→ANSI256 distance math 200 times per frame on 256-color terminals. Added `putStableLinkedResolved` and switched `putText`, `putClipped`, `fillRow`, `fillRange` to resolve once per string/row. No color behavior change (the resolved style is the same value; `ui-frame` covers the render).
+- [x] 🟠 **46.2 Copy the tool schema only when it actually changes.** `toolsJsonFilteredFor` rebuilt a ~63 KB schema in a per-request arena on EVERY iteration, even with no deny rules and the default style. It now returns the comptime blob directly (pointer-identical, test pinned); the build path is still used for deny rules and terse. ~63 KB × 12 iterations/turn no longer copied.
+- [x] 🟠 **46.3 Tighten the three longest tool descriptions without losing a rule.** `bash` 2051→1599 B, `task` 2065→1444 B, `notebook_edit` 1610→1100 B: ~1.6 KB (~400 tokens) saved on EVERY request in the default style. A cross-tool test pins every load-bearing needle (NO PROMPTS, SAFETY, run_in_background, 16 KB, SAME message, live completion progress, RESUME/FORK, numbered outline, k+1, PRESERVED).
+- [x] 🟡 **46.4 Fix the git instruction contradiction.** The location line is composed AFTER the routing table and said "git is available through bash", directly contradicting the rule the model had just read to prefer `git_*` tools. It now names the tools while keeping the `git status`/`git diff` needles the prompt tests pin. Test added in `src/lib/project.zig`.
+- [x] 🟡 **46.5 Stop computing the autocomplete match count twice per frame.** `tui_draw.zig` called `tui.matchCount(self)` twice for the same popup decision; compute once.
+
+---
+
 ## Suggested order
 
 1. **Security first:** 40.1 → 40.2 → 40.3 → 40.4 → 40.5 → 40.6.

@@ -1224,14 +1224,19 @@ pub fn toolsJsonReadOnly() []const u8 {
 /// Built at RUNTIME from `defs` because the deny rules come from permission
 /// files the user can edit mid-session; the comptime `blob` above cannot see
 /// them. The returned slice is owned by `gpa`.
-pub fn toolsJsonFiltered(gpa: std.mem.Allocator, denied: []const []const u8) ![]u8 {
+pub fn toolsJsonFiltered(gpa: std.mem.Allocator, denied: []const []const u8) ![]const u8 {
     return toolsJsonFilteredFor(gpa, denied, false);
 }
 
 /// The deny-filtered schema, optionally with the `terse` style's short
 /// descriptions. The filtered path is runtime because deny rules are editable
 /// mid-session, so the terse replacement here is runtime too.
-pub fn toolsJsonFilteredFor(gpa: std.mem.Allocator, denied: []const []const u8, terse: bool) ![]u8 {
+pub fn toolsJsonFilteredFor(gpa: std.mem.Allocator, denied: []const []const u8, terse: bool) ![]const u8 {
+    // Common case: no deny rules and the default style. The whole ~63 KB
+    // schema is already a comptime blob; copying it into a per-request arena
+    // (12 times a turn, once per iteration) bought nothing. Return the blob.
+    if (!terse and denied.len == 0) return toolsJsonBlob;
+
     var deny_all = false;
     for (denied) |dn| {
         if (std.mem.eql(u8, dn, "*")) {
@@ -1239,10 +1244,7 @@ pub fn toolsJsonFilteredFor(gpa: std.mem.Allocator, denied: []const []const u8, 
             break;
         }
     }
-    if (deny_all) {
-        const empty = try gpa.dupe(u8, "[]");
-        return empty;
-    }
+    if (deny_all) return "[]";
 
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(gpa, "[");
@@ -1676,7 +1678,9 @@ test "toolsJsonFiltered: with no denies it returns every tool" {
     const arena = arena_state.allocator();
 
     const filtered = try toolsJsonFiltered(arena, &[_][]const u8{});
-    defer arena.free(filtered);
+    // Fast path: the no-deny, default-style schema IS the comptime blob —
+    // not a per-request copy of it.
+    try std.testing.expect(filtered.ptr == toolsJson().ptr);
 
     try std.testing.expect(std.mem.eql(u8, filtered, toolsJson()));
     // A couple of known tools are present.
@@ -1706,7 +1710,6 @@ test "toolsJsonFiltered: a deny-all star removes every tool" {
     const arena = arena_state.allocator();
 
     const filtered = try toolsJsonFiltered(arena, &[_][]const u8{ "*" });
-    defer arena.free(filtered);
 
     try std.testing.expectEqualStrings("[]", filtered);
     try std.testing.expect(std.mem.indexOf(u8, filtered, "\"read\"") == null);
@@ -1797,4 +1800,33 @@ test "terse schemas: deny filtering still works with short descriptions" {
     const out = try toolsJsonFilteredFor(a, &.{"bash"}, true);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"bash\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"name\":\"read\"") != null);
+}
+
+test "shortened full descriptions: no rule was dropped to save tokens" {
+    // The three longest tool descriptions were tightened (Phase 46). Shorter
+    // is only a saving if EVERY rule survives — these needles are the rules,
+    // not a style preference. A future edit that drops one fails this test.
+    const Needle = struct { schema: []const u8, words: []const []const u8 };
+    const cases = [_]Needle{
+        .{
+            .schema = bash_prompt.json,
+            .words = &.{ "NO PROMPTS", "non-interactive", "SAFETY", "--no-verify", "one-line description", "run_in_background", "bash_output", "16 KB", "fix the cause" },
+        },
+        .{
+            .schema = task_prompt.json,
+            .words = &.{ "SUBAGENT", "SAME message", "live completion progress", "/task-parallel", "ROLES:", "RESUME/FORK:", "24k budget", "run_in_background" },
+        },
+        .{
+            .schema = notebook_edit_prompt.json,
+            .words = &.{ "numbered outline", "new_source", "0-based index", "k+1", "PRESERVED:", "NOT touched" },
+        },
+    };
+    for (cases) |c| {
+        for (c.words) |word| {
+            if (std.mem.indexOf(u8, c.schema, word) == null) {
+                std.debug.print("shortened description lost the rule: {s}\n", .{word});
+                return error.RuleMissing;
+            }
+        }
+    }
 }
