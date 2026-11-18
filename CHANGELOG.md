@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - bring the board up to date and close the quality gaps (tasks) [`2f3254d5`](https://github.com/jesusalcaladev/zode/commit/2f3254d5)
 - new improvement backlog from a six-track code audit (tasks) [`a674eb1b`](https://github.com/jesusalcaladev/zode/commit/a674eb1b)
+- record the two remaining deferrals with their real blockers (tasks) [`7e132370`](https://github.com/jesusalcaladev/zode/commit/7e132370)
 
 ### Refactors
 
@@ -39,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 
 - cache rendered tool_use blocks across requests (41.5) (chat) [`41fc4aef`](https://github.com/jesusalcaladev/zode/commit/41fc4aef)
-- cache the streaming paragraph render (41.8) (tui) [`d9c70a07`](https://github.com/jesusalcaladev/zode/commit/d9c70a07)
+- cache the streaming paragraph render (41.8) (tui) [`bd606574`](https://github.com/jesusalcaladev/zode/commit/bd606574)
 
 ### Tests
 
