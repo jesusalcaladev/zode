@@ -259,15 +259,11 @@ pub fn elideForBudget(
 pub fn compactBgFn(c: *CompactBgCtx) void {
     const gpa = c.gpa;
     defer gpa.destroy(c);
-    defer {
-        for (c.msgs) |m| {
-            gpa.free(m.content);
-            if (m.tool_calls_json) |j| gpa.free(j);
-            if (m.tool_call_id) |v| gpa.free(v);
-            if (m.tool_name) |v| gpa.free(v);
-        }
-        gpa.free(c.msgs);
-    }
+    // Do NOT free c.msgs here: elideTier shallow-copies the structs, so the
+    // result still points at these bytes. The deep copy stays alive for the
+    // process (bounded by compaction count) and the result owns it until
+    // tryCollectBg hands it over. Freeing it here was the deep-copy UAF.
+    _ = &c.msgs;
     const budget = budgetFor(c.env, c.model_ctx);
     const cmode = effectiveMode(c.env, null);
     const res = elideForBudget(gpa, c.msgs, budget, c.env, c.model_ctx, cmode);
@@ -331,6 +327,16 @@ pub fn tryLaunchBg(
         .model_ctx = model_ctx,
     };
     const t = std.Thread.spawn(.{}, compactBgFn, .{ctx_ptr}) catch {
+        // The thread never ran, so compactBgFn's deferred cleanup will not
+        // happen: free the deep copy here or every failed spawn leaks a turn's
+        // messages (43.6).
+        for (msgs_owned) |m| {
+            gpa.free(m.content);
+            if (m.tool_calls_json) |j| gpa.free(j);
+            if (m.tool_call_id) |v| gpa.free(v);
+            if (m.tool_name) |v| gpa.free(v);
+        }
+        gpa.free(msgs_owned);
         gpa.destroy(ctx_ptr);
         while (!state.mtx.tryLock()) std.Thread.yield() catch {};
         state.running = false;
@@ -1387,4 +1393,38 @@ test "Phase 7: trimToBoundary is a no-op without boundary" {
     };
     const trimmed = try compaction.trimToBoundary(arena, &msgs);
     try std.testing.expectEqual(msgs.len, trimmed.len);
+}
+
+test "compaction: a background result survives the caller's arena being freed" {
+    // The regression behind git 04584f9: tryLaunchBg used to hand the thread a
+    // slice into the turn arena. When that arena died the thread read garbage.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const a = arena_state.allocator();
+    const marker = "deep-copy survivor 8f3a";
+    var msgs = std.ArrayList(chat.ChatMessage).empty;
+    try msgs.append(a, .{ .role = "user", .content = try a.dupe(u8, marker) });
+
+    var state = CompactBgState{};
+    const gpa = std.heap.page_allocator; // the worker frees with the same allocator
+    try std.testing.expect(tryLaunchBg(&state, gpa, msgs.items, null, 128_000));
+
+    // The source arena is gone while the worker may still be running.
+    arena_state.deinit();
+
+    var result: ?CompactBgResult = null;
+    for (0..500) |_| {
+        result = tryCollectBg(&state);
+        if (result != null) break;
+        std.Thread.yield() catch {};
+    }
+    const r = result orelse return error.BackgroundNeverFinished;
+    defer {
+        for (r.msgs) |m| gpa.free(m.content);
+        gpa.free(r.msgs);
+    }
+    var found = false;
+    for (r.msgs) |m| {
+        if (std.mem.indexOf(u8, m.content, marker) != null) found = true;
+    }
+    try std.testing.expect(found);
 }
