@@ -245,12 +245,28 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
         // rendering as it arrives. We force redraw while live content is shown.
         // `live_src` is already frame-arena owned (see the invariant above), so
         // there is nothing to copy here any more.
-        var live_para = tui.Model.Para{
-            .kind = live_kind,
-            .text = live_src,
-            .lang = if (live_kind == .diff) "zig" else "",
-        };
-        live_lines = tui.buildLines(ctx.arena, ctx, &live_para, wrap_width, self.nerd_icons) catch &.{};
+        // Phase 41.8: reparse ONLY when the text or the wrap width changed.
+        // The cached cells point at text copied into the MODEL's arena, never
+        // at the frame arena that dies on every tick — otherwise a cached
+        // grapheme would be a dangling slice (the exact class memaudit blocks).
+        const h = std.hash.Wyhash.hash(0, live_src);
+        if (h == self.live_hash and wrap_width == self.live_width and self.live_lines.len > 0) {
+            live_lines = self.live_lines;
+        } else {
+            self.live_lines_arena.deinit();
+            self.live_lines_arena = std.heap.ArenaAllocator.init(self.allocator);
+            const pa = self.live_lines_arena.allocator();
+            const stable_src = pa.dupe(u8, live_src) catch live_src;
+            var live_para = tui.Model.Para{
+                .kind = live_kind,
+                .text = stable_src,
+                .lang = if (live_kind == .diff) "zig" else "",
+            };
+            live_lines = tui.buildLines(pa, ctx, &live_para, wrap_width, self.nerd_icons) catch &.{};
+            self.live_lines = live_lines;
+            self.live_hash = h;
+            self.live_width = wrap_width;
+        }
         live_active = live_lines.len > 0;
     }
 

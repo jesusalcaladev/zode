@@ -34,11 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - deduplicate core helpers (-722 net lines) (phase42) [`55e5db84`](https://github.com/jesusalcaladev/zode/commit/55e5db84)
 - finish 42.10, split headless runner, unify aliases (phase42) [`c38b5e3a`](https://github.com/jesusalcaladev/zode/commit/c38b5e3a)
 - split tui tests out of tui.zig (42.9 part 2) (phase42) [`df94f80a`](https://github.com/jesusalcaladev/zode/commit/df94f80a)
-- split event and draw dispatch into modules (42.9) (tui) [`047ae6d7`](https://github.com/jesusalcaladev/zode/commit/047ae6d7)
+- split event and draw dispatch into modules (42.9) (tui) [`c52b7a38`](https://github.com/jesusalcaladev/zode/commit/c52b7a38)
 
 ### Performance
 
 - cache rendered tool_use blocks across requests (41.5) (chat) [`41fc4aef`](https://github.com/jesusalcaladev/zode/commit/41fc4aef)
+- cache the streaming paragraph render (41.8) (tui) [`d9c70a07`](https://github.com/jesusalcaladev/zode/commit/d9c70a07)
 
 ### Tests
 

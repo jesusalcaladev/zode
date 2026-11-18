@@ -2028,6 +2028,14 @@ pub const Model = struct {
     diff_last_last: usize = 0,
     /// Differential render tracking: whether the live paragraph was active last frame.
     diff_last_live_active: bool = false,
+    /// Phase 41.8: cached render of the streaming paragraph. `live_src` is
+    /// re-copied into `live_lines_arena` every time the text CHANGES, so the
+    /// cached cells never point at a previous frame's arena.
+    live_lines_arena: std.heap.ArenaAllocator = undefined,
+    live_lines: []const PLine = &.{},
+    live_hash: u64 = 0,
+    live_width: u16 = 0,
+    live_inited: bool = false,
     /// Toast notification: text shown when user copies to clipboard, and frames remaining.
     /// `copy_toast_buf` is Model-owned so the text slice stays valid across the
     /// frames the toast is drawn (a stack local here dangles - the `memaudit`
@@ -2381,6 +2389,8 @@ pub const Model = struct {
             .paras = .empty,
             .pending = .empty,
             .seg_cache = .empty,
+            .live_lines_arena = std.heap.ArenaAllocator.init(allocator),
+            .live_inited = true,
             // The checkpoint stack needs the allocator when it is created (it is
             // who holds the memory of the snapshots). It could be left
             // `undefined` and set in `deinit`, but then any test that calls
@@ -2402,6 +2412,7 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        if (self.live_inited) self.live_lines_arena.deinit();
         // Custom keybindings are owned by the model's allocator.
         if (self.keybindings.len > 0) {
             keybinds.freeBindings(self.allocator, self.keybindings);
