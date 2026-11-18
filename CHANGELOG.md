@@ -35,10 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - finish 42.10, split headless runner, unify aliases (phase42) [`c38b5e3a`](https://github.com/jesusalcaladev/zode/commit/c38b5e3a)
 - split tui tests out of tui.zig (42.9 part 2) (phase42) [`df94f80a`](https://github.com/jesusalcaladev/zode/commit/df94f80a)
 
+### Performance
+
+- cache rendered tool_use blocks across requests (41.5) (chat) [`abed48ea`](https://github.com/jesusalcaladev/zode/commit/abed48ea)
+
 ### Tests
 
 - coverage for the three core gaps (phase43) [`4bae7558`](https://github.com/jesusalcaladev/zode/commit/4bae7558)
-- deterministic failed-spawn test (43.6) (compaction) [`38133d8b`](https://github.com/jesusalcaladev/zode/commit/38133d8b)
+- deterministic failed-spawn test (43.6) (compaction) [`6708c1da`](https://github.com/jesusalcaladev/zode/commit/6708c1da)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

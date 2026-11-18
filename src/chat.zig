@@ -1646,6 +1646,100 @@ fn buildBodyAnthropic(
     return buildBodyAnthropicCapped(buf, model, messages, effort, tools_json, 0);
 }
 
+/// Rendered tool_use blocks, cached by the pointer of the source JSON string
+/// (Phase 41.5). Session messages own that string for their whole lifetime, so
+/// the pointer is a stable key and the pure rendering is done once instead of
+/// on every request. A fixed array avoids a module-global container with
+/// allocator state; values live in page_allocator for the process lifetime.
+const TcEntry = struct { key: usize = 0, rendered: []const u8 = &.{} };
+var tc_cache: [64]TcEntry = @splat(.{});
+var tc_cache_len: usize = 0;
+var tc_cache_mu: std.atomic.Mutex = .unlocked;
+
+fn tcKey(json: []const u8, cache_control: bool) usize {
+    return @intFromPtr(json.ptr) ^ @as(usize, @intFromBool(cache_control));
+}
+
+fn cachedToolUses(json: []const u8, cache_control: bool) ?[]const u8 {
+    const key = tcKey(json, cache_control);
+    while (!tc_cache_mu.tryLock()) std.Thread.yield() catch {};
+    defer tc_cache_mu.unlock();
+    for (tc_cache[0..tc_cache_len]) |e| {
+        if (e.key == key) return e.rendered;
+    }
+    return null;
+}
+
+fn storeToolUses(json: []const u8, cache_control: bool, rendered: []const u8) void {
+    const owned = std.heap.page_allocator.dupe(u8, rendered) catch return;
+    while (!tc_cache_mu.tryLock()) std.Thread.yield() catch {};
+    defer tc_cache_mu.unlock();
+    const key = tcKey(json, cache_control);
+    for (tc_cache[0..tc_cache_len]) |*e| {
+        if (e.key == key) {
+            const old = e.rendered;
+            e.rendered = owned;
+            std.heap.page_allocator.free(old);
+            return;
+        }
+    }
+    if (tc_cache_len >= tc_cache.len) {
+        std.heap.page_allocator.free(owned);
+        return;
+    }
+    tc_cache[tc_cache_len] = .{ .key = key, .rendered = owned };
+    tc_cache_len += 1;
+}
+
+fn renderToolUses(
+    alloc: std.mem.Allocator,
+    json: []const u8,
+    cache_control: bool,
+) !?[]u8 {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, alloc, json, .{}) catch return null;
+    if (parsed != .array) return null;
+    var aw = std.Io.Writer.Allocating.init(alloc);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    var first = true;
+    for (parsed.array.items, 0..) |tc, ti| {
+        if (tc != .object) continue;
+        const fnv = tc.object.get("function") orelse continue;
+        if (fnv != .object) continue;
+        const idv = tc.object.get("id");
+        const namev = fnv.object.get("name");
+        if (idv == null or idv.? != .string) continue;
+        if (namev == null or namev.? != .string) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"type\":\"tool_use\",\"id\":\"");
+        try jsonEscape(w, idv.?.string);
+        try w.writeAll("\",\"name\":\"");
+        try jsonEscape(w, namev.?.string);
+        try w.writeAll("\",\"input\":");
+        var input_written = false;
+        if (fnv.object.get("arguments")) |av| {
+            if (av == .string) {
+                const obj = std.json.parseFromSliceLeaky(std.json.Value, alloc, av.string, .{}) catch null;
+                if (obj) |ov| {
+                    if (ov == .object) {
+                        try writeJsonValue(w, ov);
+                        input_written = true;
+                    }
+                }
+            }
+        }
+        if (!input_written) try w.writeAll("{}");
+        if (ti == parsed.array.items.len - 1 and cache_control) {
+            try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
+        }
+        try w.writeByte('}');
+    }
+    if (first) return null;
+    var list = aw.toArrayList();
+    return try list.toOwnedSlice(alloc);
+}
+
 fn buildBodyAnthropicCapped(
     buf: []u8,
     model: []const u8,
@@ -1784,46 +1878,15 @@ fn buildBodyAnthropicCapped(
                 try w.writeAll("\"}");
                 wrote_text = true;
             }
-            const pcs = std.json.parseFromSliceLeaky(std.json.Value, arena, m.tool_calls_json.?, .{}) catch null;
-            if (pcs) |pv| {
-                if (pv == .array) {
-                    for (pv.array.items, 0..) |tc, ti| {
-                        if (tc != .object) continue;
-                        const fnv = tc.object.get("function") orelse continue;
-                        if (fnv != .object) continue;
-                        const idv = tc.object.get("id");
-                        const namev = fnv.object.get("name");
-                        if (idv == null or idv.? != .string) continue;
-                        if (namev == null or namev.? != .string) continue;
-                        if (wrote_text) try w.writeAll(",");
-                        wrote_text = true;
-                        try w.writeAll("{\"type\":\"tool_use\",\"id\":\"");
-                        try jsonEscape(&w, idv.?.string);
-                        try w.writeAll("\",\"name\":\"");
-                        try jsonEscape(&w, namev.?.string);
-                        try w.writeAll("\",\"input\":");
-                        var input_written = false;
-                        if (fnv.object.get("arguments")) |av| {
-                            if (av == .string) {
-                                const obj = std.json.parseFromSliceLeaky(std.json.Value, arena, av.string, .{}) catch null;
-                                if (obj) |ov| {
-                                    if (ov == .object) {
-                                        try writeJsonValue(&w, ov);
-                                        input_written = true;
-                                    }
-                                }
-                            }
-                        }
-                        if (!input_written) try w.writeAll("{}");
-                        // cache_control on the last tool_use of a message that is
-                        // marked stable: the provider reads the cache up to here
-                        // and only writes what comes after.
-                        if (ti == pv.array.items.len - 1 and m.cache_control) {
-                            try w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\"}");
-                        }
-                        try w.writeAll("}");
-                    }
-                }
+            if (cachedToolUses(m.tool_calls_json.?, m.cache_control)) |cached| {
+                if (wrote_text) try w.writeAll(",");
+                wrote_text = true;
+                try w.writeAll(cached);
+            } else if (try renderToolUses(arena, m.tool_calls_json.?, m.cache_control)) |rendered| {
+                if (wrote_text) try w.writeAll(",");
+                wrote_text = true;
+                try w.writeAll(rendered);
+                storeToolUses(m.tool_calls_json.?, m.cache_control, rendered);
             }
             if (!wrote_text) {
                 try w.writeAll("{\"type\":\"text\",\"text\":\"\"}");
@@ -3080,4 +3143,24 @@ test "Anthropic body: a long conversation stays under the four-breakpoint ceilin
     var buf: [16384]u8 = undefined;
     const body = try buildBodyMessages(&buf, "claude-test", &msgs, .low, tools, .anthropic);
     try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}"));
+}
+
+test "tool-use cache: a repeated message renders byte-identical output" {
+    // The cache is keyed by the tool_calls_json pointer. Building the same
+    // body twice must produce identical bytes — a cached render that drifted
+    // would change the provider's prompt-cache prefix silently.
+    const tc = "[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"src/main.zig\\\"}\"}}]";
+    var wire = [_]ChatMessage{.{
+        .role = "assistant",
+        .content = "",
+        .tool_calls_json = tc,
+    }};
+    var buf1: [64 * 1024]u8 = undefined;
+    var buf2: [64 * 1024]u8 = undefined;
+    const first = try buildBodyMessagesCapped(&buf1, "m", &wire, .medium, "", .anthropic, 1000);
+    const second = try buildBodyMessagesCapped(&buf2, "m", &wire, .medium, "", .anthropic, 1000);
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.indexOf(u8, second, "tool_use") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "src/main.zig") != null);
+    _ = &tc;
 }
