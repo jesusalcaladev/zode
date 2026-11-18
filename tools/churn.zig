@@ -279,6 +279,17 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h") or std.mem.eql(u8, cmd, "help")) {
+        std.debug.print(
+            "churn - zode release/beta flow\n" ++
+            "  churn add <type> <scope> <description>   record a changeset\n" ++
+            "  churn version [--beta|--stable]          print the next version (dry run)\n" ++
+            "  churn changelog                          regenerate [Unreleased] from git log\n" ++
+            "  churn release [--beta] [--push]          cut the release (push is explicit)\n",
+            .{},
+        );
+        return;
+    }
     const rest = args[2..];
     const code: u8 = if (std.mem.eql(u8, cmd, "add"))
         cmdAdd(gpa, io, rest)

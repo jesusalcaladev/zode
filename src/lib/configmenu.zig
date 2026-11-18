@@ -37,7 +37,7 @@ pub const Section = enum {
             .context_cache => "Window, compaction and cache economics",
             .agent => "Iterations, parallelism and verification",
             .permissions => "What the agent may do without asking",
-            .appearance => "Presentation and keybindings",
+            .appearance => "Presentation (keybindings: /keybinds)",
             .agents => "Reusable agents on disk and the default for task",
         };
     }

@@ -157,6 +157,54 @@ get_asset_url() {
     echo "$url"
 }
 
+# Verify the downloaded asset against SHA256SUMS from the same release.
+# Absent checksums are tolerated for OLD releases published before the workflow
+# generated them; a PRESENT but mismatching sum is always fatal.
+verify_checksum() {
+    local file="$1"
+    local name="$2"
+    local version="$3"
+    local sums
+    sums=$(mktemp)
+    # The sums file lives alongside the binaries in the same release.
+    local sums_url
+    sums_url=$(curl -fsSL "$GITHUB_API/releases/tags/$version" 2>/dev/null \
+        | grep -o '"browser_download_url": *"[^"]*"' | cut -d'"' -f4 \
+        | grep '/SHA256SUMS$' | head -1 || true)
+    if [[ -z "$sums_url" ]]; then
+        rm -f "$sums"
+        log_verbose "No SHA256SUMS in this release (older release); skipping"
+        return 0
+    fi
+    if ! curl -fsSL "$sums_url" -o "$sums"; then
+        rm -f "$sums"
+        log_warn "Could not download SHA256SUMS; skipping verification"
+        return 0
+    fi
+    local expected actual
+    expected=$(grep -E "  ${name}$" "$sums" | head -1 | awk '{print $1}')
+    if [[ -z "$expected" ]]; then
+        rm -f "$sums"
+        log_warn "No checksum for $name in SHA256SUMS; skipping"
+        return 0
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum "$file" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 "$file" | awk '{print $1}')
+    else
+        rm -f "$sums"
+        log_warn "No sha256sum or shasum available; skipping verification"
+        return 0
+    fi
+    rm -f "$sums"
+    if [[ "$actual" != "$expected" ]]; then
+        log_error "SHA256 mismatch for $name (expected $expected, got $actual)"
+        return 1
+    fi
+    log_success "SHA256 verified for $name"
+}
+
 # Check if already installed with same version
 check_existing() {
     local version="$1"
@@ -207,6 +255,13 @@ install_binary() {
         fi
     fi
 
+    # An asset whose bytes changed in transit (or on the server) must not be
+    # installed, even if it happens to answer --version.
+    if ! verify_checksum "$tmp_file" "$asset_name" "$VERSION"; then
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
     chmod +x "$tmp_file"
 
     # The one check that catches a binary built for another machine. A release
@@ -219,11 +274,21 @@ install_binary() {
         exit 1
     fi
 
-    # Atomic install: write to temp then rename
-    local tmp_install
+    # Atomic install with a rollback copy. A bad asset that passes --version
+    # but fails later must not leave the user with no working binary.
+    local tmp_install backup_path
     tmp_install=$(mktemp "$INSTALL_DIR/.${BINARY_NAME}.XXXXXX")
+    backup_path="${binary_path}.bak"
     mv "$tmp_file" "$tmp_install"
-    mv "$tmp_install" "$binary_path"
+    if [ -f "$binary_path" ]; then
+        cp -p "$binary_path" "$backup_path" || true
+    fi
+    if ! mv "$tmp_install" "$binary_path"; then
+        rm -f "$tmp_install"
+        if [ -f "$backup_path" ]; then mv "$backup_path" "$binary_path"; fi
+        log_error "could not install the binary"
+        exit 1
+    fi
 
     log_success "installed $binary_path"
 }
@@ -322,10 +387,18 @@ main() {
 
     # Verify installation
     local installed_version
-    installed_version=$("$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null | head -1) || {
-        log_warn "Could not verify the installed binary"
-        exit 0
-    }
+    if ! installed_version=$("$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null | head -1); then
+        # Restore the previous binary: a failed verify is a FAILED install.
+        if [ -f "$INSTALL_DIR/$BINARY_NAME.bak" ]; then
+            mv -f "$INSTALL_DIR/$BINARY_NAME.bak" "$INSTALL_DIR/$BINARY_NAME"
+            log_warn "verification failed; restored the previous binary"
+        else
+            rm -f "$INSTALL_DIR/$BINARY_NAME"
+            log_warn "verification failed; removed the broken binary"
+        fi
+        log_error "installation failed"
+        exit 1
+    fi
     log_success "$installed_version is ready — run 'zode' to start"
 }
 

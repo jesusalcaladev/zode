@@ -169,7 +169,7 @@ pub fn build(b: *std.Build) void {
     debug_step.dependOn(&debug_exe.step);
     debug_step.dependOn(&install_debug.step);
 
-    // tool_test binario temporal
+    // tool_test: temporary binary for the headless tool smoke
     const tt_mod = b.createModule(.{
         .root_source_file = b.path("src/bin/tool_test.zig"),
         .target = target,
@@ -194,7 +194,7 @@ pub fn build(b: *std.Build) void {
     const tt = b.addExecutable(.{ .name = "tool_test", .root_module = tt_mod });
     const tt_run = b.addRunArtifact(tt);
     tt_run.addArgs(run_args);
-    const tt_step = b.step("tool-test", "Prueba las tools headless");
+    const tt_step = b.step("tool-test", "Headless tool smoke test");
     tt_step.dependOn(&tt_run.step);
 
     // Free-auto probe: which providers have a key, how many free models each

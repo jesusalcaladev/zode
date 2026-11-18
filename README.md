@@ -139,6 +139,8 @@ See [`docs/settings.md`](docs/settings.md) for the full provider table and `conf
 | [`docs/commands.md`](docs/commands.md) | Every slash command and what it does |
 | [`docs/usage.md`](docs/usage.md) | How to use zode, end to end (run → model → task → verify) |
 | [`docs/architecture.md`](docs/architecture.md) | How streaming, compaction, permissions, subagents, MCP, self-update work |
+| [`docs/releasing.md`](docs/releasing.md) | Release/beta runbook: tag, publish, install pinned builds |
+| [`docs/RULES-ZODE-TUI.md`](docs/RULES-ZODE-TUI.md) | TUI/runtime invariants (required reading before changing the TUI) |
 | `AGENTS.md` | Code conventions for contributors and AI coding agents |
 
 Load a `.env` without exporting every line by hand:
@@ -193,7 +195,7 @@ Configure provider/model the same way as normal zode usage (`ZODE_PROVIDER`, `ZO
 
 ## Verification workflow
 
-- `zig build test` — the primary gate (800+ tests).
+- `zig build test` — the primary gate (2000+ tests).
 - `tools/pty_smoke.py` — real pty smoke test (startup, banner, input, scroll, no panic).
 - `zig build ui-frame` — design harness: renders scenes with real `drawFn` + `Model`.
 - `zig build debug` — must produce symbolized binary (`.symtab`, `.debug_info`).

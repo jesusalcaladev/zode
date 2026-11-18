@@ -1,12 +1,11 @@
-# Slash commands — complete reference
+# Slash commands
 
-Type any of these in the TUI input line, or run them headless with:
+Type any of these in the TUI input line. Slash commands are dispatched by the
+TUI palette; `--chat` takes plain text only (it sends `"/context"` literally).
+The generated list of all commands is in
+[`docs/commands-generated.md`](commands-generated.md).
 
-```bash
-./zig-out/bin/zode --chat "/command args"
-```
-
-Every command listed here is documented with its syntax, what it does, and how to use it.
+Every command in the generated reference comes from the TUI command table with its syntax, what it does, and how to use it.
 
 ---
 
@@ -282,7 +281,8 @@ Manage the visible todo list.
 
 ### `/help`
 
-Show available commands.
+Show available commands. The complete, generated list of all 75 commands is in
+[`docs/commands-generated.md`](commands-generated.md).
 
 ### `/update`
 
@@ -302,12 +302,17 @@ Quit the application.
 
 | Key | Action |
 |---|---|
-| `Ctrl+C` | Interrupt / clear input (double-press to exit) |
-| `Ctrl+D` | Exit |
+| `Ctrl+C` | Clear input; press again on empty input to quit (Esc interrupts the turn) |
+| `Ctrl+D` | Scroll half a page down |
 | `Ctrl+L` | Redraw screen |
 | `Ctrl+T` | Model palette (providers | models) |
 | `Ctrl+P` | Command palette |
-| `Ctrl+R` | Expand/collapse last tool result (or refresh history) |
+| `Ctrl+A` | Connect a provider |
+| `Ctrl+V` | Attach the clipboard image to the next message |
+| `Ctrl+,` | Settings screen |
+| `?` | Shortcut list (empty input) |
+| `F2/F3/F4/F5` | Custom bindings: help / context / sessions / tasks |
+| `Ctrl+R` | Expand/collapse last tool result (or refresh the model palette) |
 | `Ctrl+O` | Transcript / history |
 | `↑` / `↓` | Navigate picker rows |
 | `Enter` | Select / submit |

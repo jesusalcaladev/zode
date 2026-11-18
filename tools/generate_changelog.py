@@ -20,11 +20,12 @@ Defaults to writing CHANGELOG.md in the repo root.
 
 import os
 import re
+from pathlib import Path
 import subprocess
 import sys
 from collections import OrderedDict
 
-REPO_ROOT = os.getcwd()  # run from repo root; the hook runs in the repo root too
+REPO_ROOT = str(Path(__file__).resolve().parents[1])  # works from any cwd
 
 GITHUB_BASE = "https://github.com/jesusalcaladev/zode/commit/"
 

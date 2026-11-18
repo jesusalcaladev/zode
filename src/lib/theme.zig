@@ -89,8 +89,11 @@ pub const brand_deep: vaxis.Style = .{};
 // once a whole screen is full of both.
 
 pub const ok: vaxis.Style = rgb(0x4c, 0xc7, 0x6b);
-pub const warn: vaxis.Style = rgb(0xf5, 0xa5, 0x24);
-pub const err: vaxis.Style = rgb(0xf0, 0x64, 0x5b);
+// Non-colour attributes too: under NO_COLOR the three severities must not
+// collapse into identical plain text (44.7). warn is BOLD, err is UNDERLINED;
+// ok stays plain, so a reader can still tell them apart with colour disabled.
+pub const warn: vaxis.Style = .{ .bold = true, .fg = .{ .rgb = .{ 0xf5, 0xa5, 0x24 } } };
+pub const err: vaxis.Style = .{ .ul_style = .single, .fg = .{ .rgb = .{ 0xf0, 0x64, 0x5b } } };
 
 /// Selection: foreground emphasis only (terminal background always shows through).
 ///
@@ -539,7 +542,9 @@ pub fn styleToAnsi256(st: vaxis.Style) vaxis.Style {
 /// - Otherwise: converts RGB to ANSI 256
 pub fn resolveStyle(st: vaxis.Style, c: Caps) vaxis.Style {
     if (c.no_color) {
-        return .{ .bold = st.bold, .italic = st.italic, .strikethrough = st.strikethrough };
+        // Keep the non-colour attributes: an underlined error and a bold
+        // warning still read differently with NO_COLOR set.
+        return .{ .bold = st.bold, .italic = st.italic, .strikethrough = st.strikethrough, .ul_style = st.ul_style };
     }
     if (c.rgb) {
         return st;
@@ -885,3 +890,13 @@ test "detectCaps: the environment decides, and the default is truecolor" {
     try std.testing.expect(!c.rgb); // 256color, and no truecolor claim
 }
 
+
+test "theme: severity stays distinguishable under NO_COLOR" {
+    const no_col = Caps{ .no_color = true };
+    const o = resolveStyle(ok, no_col);
+    const w = resolveStyle(warn, no_col);
+    const e = resolveStyle(err, no_col);
+    try std.testing.expect(!o.bold and o.ul_style == .off);
+    try std.testing.expect(w.bold and w.ul_style == .off);
+    try std.testing.expect(!e.bold and e.ul_style == .single);
+}

@@ -14,19 +14,21 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0
-      - name: Build debug
+      - name: Build default (ReleaseSmall + strip)
         run: zig build
       - name: Build release
         run: zig build -Doptimize=ReleaseSafe
       - name: Test
         run: zig build test
-        env:
-          ZODE_NO_WARMUP: "1"
       - name: Memory-safety audit
         run: zig build memaudit
-      - name: Smoke (optional, needs pty)
+      - name: Debug symbols (required)
         run: |
-          if [ -f tools/pty_smoke.py ]; then python3 tools/pty_smoke.py || true; fi
+          zig build debug
+          readelf -SW zig-out/bin/zode-debug | grep -q .debug_info
+          readelf -SW zig-out/bin/zode-debug | grep -q .symtab
+      - name: TUI smoke (required)
+        run: zig build pty-check
 
   # Also test with version flag
   build-with-version:

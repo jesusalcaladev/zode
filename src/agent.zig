@@ -2997,7 +2997,7 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "task-parallel")) {
         commands_mod.cmdTaskParallel(m, arg);
     } else if (std.mem.eql(u8, cmd, "undo")) {
-        commands_mod.cmdUndo(m);
+        commands_mod.cmdUndo(m, arg);
     } else if (std.mem.eql(u8, cmd, "rewind")) {
         commands_mod.cmdRewind(m, arg);
     } else if (std.mem.eql(u8, cmd, "clean")) {
@@ -3175,8 +3175,12 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         } else {
             m.pushInfo("usage: /which-cmd <name>");
         }
-    } else if (std.mem.eql(u8, cmd, "new-session")) {
+    } else if (std.mem.eql(u8, cmd, "new-session") or std.mem.eql(u8, cmd, "new")) {
         newSession(m);
+    } else if (std.mem.eql(u8, cmd, "reset")) {
+        commands_mod.cmdClear(m);
+    } else if (std.mem.eql(u8, cmd, "connect")) {
+        openConnectPalette(m);
     } else if (std.mem.eql(u8, cmd, "branch")) {
         branchSession(m, arg);
     } else if (std.mem.eql(u8, cmd, "resume")) {

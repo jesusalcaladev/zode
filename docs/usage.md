@@ -22,7 +22,8 @@ Good for scripts, CI, or anything without a terminal:
 ./zig-out/bin/zode --models             # list available models of the active provider
 ```
 
-`--chat` accepts a slash command too: `./zig-out/bin/zode --chat "/context"`.
+`--chat` takes plain text. Slash commands are TUI-only (the palette dispatches
+them); `--chat "/context"` sends the literal text `"/context"` to the model.
 
 ## 2. Configure (one line is enough)
 
@@ -164,8 +165,12 @@ Project-level `zig build test` is the primary gate (800+ tests); `tools/pty_smok
 
 | Key | Action |
 |---|---|
-| `Ctrl+C` | Interrupt / clear input (double-press to exit) |
-| `Ctrl+D` | Exit |
+| `Ctrl+C` | Clear input; press again on empty input to quit (Esc interrupts the turn) |
+| `Ctrl+D` | Scroll half a page down |
+| `Ctrl+A` | Connect a provider |
+| `Ctrl+V` | Attach a clipboard image |
+| `Ctrl+,` | Settings screen |
+| `?` | Shortcut list |
 | `Ctrl+L` | Redraw screen |
 | `Ctrl+T` | Model palette (providers \| models) |
 | `Ctrl+P` | Command palette |

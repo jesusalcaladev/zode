@@ -2993,6 +2993,49 @@ pub const Model = struct {
         return self.picker_active;
     }
 
+    /// Is any modal surface currently on top of the composer? Used so global
+    /// keys (Ctrl+C especially) do not quit the app while a picker is open.
+    pub fn anyModalActive(self: *Model) bool {
+        return self.pal.active or self.pickerActive() or self.transcript_view_active or
+            self.search_bar_active or self.diff_viewer_active or self.settings_active;
+    }
+
+    /// Close the topmost modal. Returns false when there was none. The order
+    /// is the reverse of the key handler's modal checks.
+    pub fn closeTopModal(self: *Model, ctx: *vxfw.EventContext) !bool {
+        if (self.pal.active) {
+            self.closePalette();
+            ctx.redraw = true;
+            return true;
+        }
+        if (self.pickerActive()) {
+            self.closePicker();
+            ctx.redraw = true;
+            return true;
+        }
+        if (self.transcript_view_active) {
+            self.closeTranscriptView();
+            ctx.redraw = true;
+            return true;
+        }
+        if (self.search_bar_active) {
+            self.closeTranscriptSearch();
+            ctx.redraw = true;
+            return true;
+        }
+        if (self.diff_viewer_active) {
+            self.closeDiffViewer();
+            ctx.redraw = true;
+            return true;
+        }
+        if (self.settings_active) {
+            self.settingsClose();
+            ctx.redraw = true;
+            return true;
+        }
+        return false;
+    }
+
     pub fn settingsOpen(self: *Model) void {
         self.settings_active = true;
         self.settings_section = 0;
@@ -7254,6 +7297,9 @@ pub const Model = struct {
             }
             // Log to stderr for post-mortem (only in ReleaseSmall this path is hit).
             std.debug.print("zode: tick registration failed: {}\n", .{err});
+            // The alt screen hides stderr. A dead tick timer looks like a
+            // frozen app, so say it where the user is looking.
+            self.pushNotification("redraw clock failed - press a key to refresh");
         };
     }
 
@@ -8996,6 +9042,12 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             // Ctrl+C: first clears the input, the second press exits (so
             // half-typed text is never lost in one go).
             if (key.matches('c', .{ .ctrl = true })) {
+                // A modal owns Ctrl+C too: closing it is the expected action.
+                // With empty input this branch used to QUIT the app from inside
+                // a picker or the palette, losing the work on screen.
+                if (self.anyModalActive()) {
+                    if (try self.closeTopModal(ctx)) return;
+                }
                 if (self.hasInput()) {
                     self.ed.clear();
                     resetAutocomplete(self);
@@ -9103,6 +9155,17 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 try self.armTick(ctx);
                 return;
             }
+            // An open palette OWNS its keys. Dispatch here, BEFORE the global
+            // shortcuts below: otherwise Ctrl+R expands a tool instead of
+            // refreshing the model catalog, and Ctrl+L wipes the transcript
+            // behind the modal. Both are documented palette keys (44.1/44.2).
+            if (self.pal.active) {
+                if (try self.paletteKey(ctx, key)) {
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
             // Ctrl+A: connect a provider. The palette footer announced it and
             // did nothing, which is worse than not announcing it.
             if (key.matches('a', .{ .ctrl = true })) {
@@ -9118,7 +9181,7 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 return;
             }
             // Ctrl+R: expand/collapse the last tool's result.
-            if (key.matches('r', .{ .ctrl = true })) {
+            if (key.matches('r', .{ .ctrl = true }) and !self.pal.active) {
                 if (self.toggleLastTool()) {
                     ctx.redraw = true;
                 } else {
@@ -9751,7 +9814,17 @@ fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Err
     // pointing at.
     self.frame_w = width;
     self.frame_h = height;
-    if (height < 6 or width < 12) return vxfw.Surface.empty(self.widget());
+    if (height < 6 or width < 12) {
+        // An empty surface in a small split pane looks like a frozen app. Paint
+        // one clipped line that says what is wrong, then return — no composer,
+        // no modal geometry, no event work until the pane grows.
+        if (height == 0 or width == 0) return vxfw.Surface.empty(self.widget());
+        const tiny_size: vxfw.Size = .{ .width = width, .height = height };
+        var tiny = try vxfw.Surface.init(ctx.arena, self.widget(), tiny_size);
+        var tp = Painter{ .surface = &tiny, .arena = ctx.arena, .ctx = ctx, .width = width, .height = height };
+        _ = tp.putText(0, 0, "zode: terminal too small (min 12x6)", theme.warn);
+        return tiny;
+    }
 
     const size: vxfw.Size = .{ .width = width, .height = height };
     var surface = try vxfw.Surface.init(ctx.arena, self.widget(), size);

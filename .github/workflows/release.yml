@@ -29,6 +29,19 @@ jobs:
         with:
           version: 0.17.0
 
+      # A tag must match the version in build.zig.zon. Without this guard a
+      # churn bump can be forgotten and a `v0.3.0-beta.1` tag ships a binary
+      # whose package metadata still says the previous version.
+      - name: Version consistency
+        run: |
+          ZON_VERSION=$(grep -oP '\.version = "\K[^"]+' build.zig.zon)
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "tag=$TAG_VERSION  zon=$ZON_VERSION"
+          test "$TAG_VERSION" = "$ZON_VERSION" || {
+            echo "ERROR: tag and build.zig.zon disagree; run churn version first" >&2
+            exit 1
+          }
+
       # `-Dcpu=baseline` IS NOT OPTIONAL HERE.
       #
       # With no `-Dtarget`, `zig build` compiles for the CPU OF THE RUNNER. The
@@ -99,13 +112,49 @@ jobs:
           echo "asset_name=$ASSET_NAME" >> $GITHUB_OUTPUT
           echo "platform=$PLATFORM" >> $GITHUB_OUTPUT
 
-      - name: Upload to Release
+      # Assets are uploaded to GitHub Actions first. The publish job below is
+      # the ONLY place that creates the release: a matrix job that fails used
+      # to publish a partial asset set with fail-fast disabled.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: asset-${{ matrix.target }}
+          path: ${{ steps.binary.outputs.asset_name }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish release (all four assets or nothing)
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify all four assets and write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          for a in zode-linux-x86_64 zode-linux-aarch64 zode-macos-x86_64 zode-macos-aarch64; do
+            test -s "$a" || { echo "missing asset: $a" >&2; exit 1; }
+          done
+          sha256sum zode-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Upload install.sh alongside the assets
+        run: cp install.sh dist/install.sh
+      - name: Create the release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.binary.outputs.asset_name }}
+          files: |
+            dist/zode-*
+            dist/SHA256SUMS
+            dist/install.sh
           generate_release_notes: true
           draft: false
-          # A semver prerelease tag (v0.2.1-beta.2) is published AS a prerelease:
+          # A semver prerelease tag (v0.3.0-beta.1) is published AS a prerelease:
           # GitHub's "latest release" is what install.sh and the self-update check
           # ask for, and a beta must never take that slot from the last stable.
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -125,18 +174,3 @@ jobs:
         with:
           version: ${{ matrix.zig_version }}
       - run: zig build test
-        env:
-          ZODE_NO_WARMUP: "1"
-
-  # Build and upload install.sh as well
-  install-script:
-    name: Upload install.sh
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Upload install.sh to Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: install.sh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -55,6 +55,11 @@ Compiled providers and the environment variable that holds each key:
 | `zai` | `ZODE_ZAI_KEY`, `ZAI_API_KEY` | GLM, no `/models` endpoint (documented ids only) |
 | `zai-coding` | `ZODE_ZAI_CODING_KEY` | Subscription key, **not** the API key |
 | `nvidia` | `ZODE_NVIDIA_KEY`, `NVIDIA_API_KEY` | Hosted NIM; output capped at 16k |
+| `cerebras` | `ZODE_CEREBRAS_KEY` | Fast inference |
+| `together` | `ZODE_TOGETHER_KEY` | Hosted open models |
+| `fireworks` | `ZODE_FIREWORKS_KEY` | Hosted open models |
+| `deepinfra` | `ZODE_DEEPINFRA_KEY` | Hosted open models |
+| `sambanova` | `ZODE_SAMBANOVA_KEY` | Hosted open models |
 | `local` | *(no key)* | Ollama / LM Studio on `localhost:11434` |
 
 Anything else is a provider you defined in `config.json` (see §8).
@@ -123,6 +128,8 @@ under 160k".
 | fallback window | `128000` | Used when neither of the above says anything. |
 | `ZODE_COMPACT_PCT` | `80` | The **budget**: this percentage of the window. Clamped to `10..95`. |
 | `ZODE_COMPACT` | `elide` | What compaction may do when unset: `off`, `elide` (default), `full` (§ below). |
+| `ZODE_COMPACT_BG_PCT` | window-based | "Warm" threshold: start the tier-2 summary in the background at this % of the window. |
+| `ZODE_COMPACT_HOT_PCT` | window-based | "Hot" threshold: the request waits for the summary at this %. |
 | `ZODE_RECENT_WINDOW` | `8` | Messages kept verbatim. Clamped to `2..200`. Counts **messages**, so one tool round can be several of them. |
 
 The two tiers, applied until the request is under budget:
@@ -173,10 +180,7 @@ The smallest of the three wins.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ZODE_MAX_TOOL_OUTPUT` | `1M` | Byte cap for one tool's output. Bare numbers and `K` / `M` / `G`. Hard-capped at `10M`. |
-| `ZODE_MAX_RESULT_CHARS` | `50000` | Above this, a result is written to `sessions/<id>/tool-results/` and the model gets a preview plus the path. |
-| `ZODE_MAX_RESULT_BYTES` | `400000` | How much of an oversized result is stored on disk. |
-| `ZODE_MAX_RESULTS_PER_MESSAGE_CHARS` | `200000` | Total result text allowed in one message. |
-| `ZODE_SUMMARY_MAX_LEN` | `50` | Length of the per-result summary line shown to the model. |
+| `ZODE_MAX_TOOL_OUTPUT` (see above) drives the runtime caps in `src/lib/resultcap.zig`: a single result over 50,000 chars is spilled to a recoverable file, with a 200,000-char per-message budget. Those four limits are compile-time constants — the old env names below did not exist and were removed from this table. |
 
 Lowering `ZODE_MAX_TOOL_OUTPUT` is the cheapest way to cut tokens on a noisy
 project: a `grep` that dumps 4 MB is the bulk of the next request.
@@ -309,6 +313,11 @@ minimal `GET /sessions`, `GET /sessions/<id>`, `PUT /sessions/<id>` contract.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ZODE_AUTO_CHECK` | `1` | Typecheck after edits (`check` tool) |
+| `ZODE_MEMORY_EXTRACT` | `1` | Best-effort extraction of durable facts after a turn; `0` disables it |
+| `ZODE_LSP_INIT_TIMEOUT_MS` | `30000` | How long to wait for a language server's `initialize` |
+| `ZODE_TERM_QUERY_MS` | vaxis default | Terminal capability query timeout; `0` leaves vaxis's own default |
+| `ZODE_AUTH_MASTER_KEY` | *(unset)* | Base64 master key for encrypted `auth.json` (advanced) |
+| `ZODE_AUTH_PASSPHRASE` | *(unset)* | Passphrase for the protected master key (advanced) |
 | `ZODE_AUTO_BG` | `1` | Move known-slow verifications to the background |
 | `ZODE_YES` | `0` | Autoconfirm destructive commands (the TUI answer, not `/yolo`) |
 | `ZODE_FREE_AUTO` | `0` | Start in free-model rotation (`/free-auto`) |

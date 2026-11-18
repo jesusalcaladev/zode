@@ -78,7 +78,7 @@ Everything below carried over from 0.16 unchanged:
 
 ```bash
 zig build                        # debug
-zig build -Doptimize=ReleaseSafe # release (~8.5MB, 1.6MB stripped)
+zig build -Doptimize=ReleaseSafe # release (~2.2MB stripped); `zig build debug` for symbols
 zig test src/chat.zig            # SSE parser tests
 ./zig-out/bin/zode --models      # list models (headless, no TTY needed)
 ./zig-out/bin/zode --chat "txt"  # headless streaming chat

@@ -2724,7 +2724,7 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
     .{ .key = "ctrl+l", .desc = "clear the view (the session file is untouched)" },
     .{ .key = "ctrl+r", .desc = "expand / collapse the last tool result or diff" },
     .{ .key = "ctrl+v", .desc = "attach the clipboard image to your next message" },
-    .{ .key = "ctrl+c", .desc = "quit" },
+    .{ .key = "ctrl+c", .desc = "clear input; press again on empty input to quit (Esc interrupts the turn)" },
     .{ .key = "ctrl+u / ctrl+d", .desc = "scroll half a page" },
     .{ .key = "page up / down", .desc = "scroll a page" },
     .{ .key = "shift+enter", .desc = "newline (enter sends)" },
@@ -2732,6 +2732,13 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
     .{ .key = "esc", .desc = "stop the turn, kill a running command, or answer a question with \"you decide\"" },
     .{ .key = "tab", .desc = "complete a `/` command" },
     .{ .key = "↑ / ↓", .desc = "command history (empty line keeps the draft)" },
+    .{ .key = "ctrl+,", .desc = "open the Settings screen" },
+    .{ .key = "?", .desc = "show this shortcut list (on an empty input)" },
+    .{ .key = "ctrl+g", .desc = "edit the prompt in $VISUAL/$EDITOR" },
+    .{ .key = "ctrl+f", .desc = "search the transcript" },
+    .{ .key = "ctrl+o", .desc = "open the transcript screen" },
+    .{ .key = "alt+] / alt+[", .desc = "next / previous diff hunk" },
+    .{ .key = "f2 / f3 / f4 / f5", .desc = "custom bindings: help / context / sessions / tasks" },
 };
 
 /// `key` comes with the leading slash. The order is the order of appearance in
@@ -2748,7 +2755,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/reload-cmds", .desc = "reload user commands from disk", .palette_visible = false },
     .{ .key = "/which-cmd", .desc = "show where a user command comes from", .key_hint = "name", .palette_visible = false },
     .{ .key = "/free-auto", .desc = "rotate the FREE models of every provider you have a key for, and keep going when one runs out" },
-    .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objetivo> | clear" },
+    .{ .key = "/goal", .desc = "set the objective the turn may not stop short of", .key_hint = "<objective> | clear" },
     .{ .key = "/init", .desc = "analyse the codebase and write AGENTS.md" },
     .{ .key = "/commit", .desc = "create a git commit with verified context (scoped git allowlist)", .key_hint = "[instructions]" },
     .{ .key = "/pr", .desc = "create or update a PR with merge-base diff (idempotent, scoped allowlist)", .key_hint = "[instructions]" },
@@ -2757,7 +2764,6 @@ pub const commands = [_]Cmd{
     .{ .key = "/security-review", .desc = "security-focused review of current changes (read-only)", .key_hint = "[focus]" },
     .{ .key = "/iter", .desc = "iteration budget: /iter [n] (min 8, max 200) or /iter to show current" },
     .{ .key = "/undo", .desc = "restore the files the last turn changed" },
-    .{ .key = "/rewind", .desc = "undo the last N turns' file changes: /rewind | /rewind N", .key_hint = "N" },
     .{ .key = "/rewind", .desc = "undo the last N turns' file changes: /rewind | /rewind N", .key_hint = "N" },
     .{ .key = "/clean", .desc = "purge zode leftovers (dry run; /clean yes applies)", .palette_visible = false },
     .{ .key = "/yolo", .desc = "bypass: allow everything, ask nothing (your questions are answered for you and said in the summary)" },
@@ -3553,7 +3559,25 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
     }
 }
 
-pub fn cmdUndo(m: *tui.Model) void {
+pub fn cmdUndo(m: *tui.Model, arg: ?[]const u8) void {
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    const confirmed = std.ascii.eqlIgnoreCase(a, "yes");
+    if (!confirmed and !agent.yolo) {
+        const cp = m.checkpoints.last();
+        if (cp == null) {
+            agent.pushInfo(m, "nothing to undo: no turn has changed any file yet");
+            return;
+        }
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.writeAll("undo: DRY RUN - the last turn changed:\n") catch {};
+        for (cp.?.files[0..cp.?.len]) |f| {
+            w.print("  {s}{s}\n", .{ if (f.existed) "" else "new: ", f.pathOf() }) catch {};
+        }
+        w.writeAll("use /undo yes to apply") catch {};
+        agent.pushInfo(m, w.buffered());
+        return;
+    }
     var cp = m.takeCheckpointOwned() orelse {
         agent.pushInfo(m, "nothing to undo: no turn has changed any file yet");
         return;
@@ -4184,11 +4208,13 @@ const runtime_state = @import("agent/runtime_state.zig");
 /// `/rewind [N]`: undo the last N turns' file changes (35.12).
 /// Without N, lists available checkpoints.
 pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
-    const n_turns: usize = if (arg) |a| blk: {
-        const t = std.mem.trim(u8, a, " \t\r\n");
-        if (t.len == 0) break :blk 0;
-        break :blk std.fmt.parseInt(usize, t, 10) catch 0;
-    } else 0;
+    var confirmed = false;
+    var n_turns: usize = 0;
+    if (arg) |a| {
+        var it = std.mem.tokenizeAny(u8, a, " \t");
+        if (it.next()) |tok| n_turns = std.fmt.parseInt(usize, tok, 10) catch 0;
+        if (it.next()) |tok| confirmed = std.ascii.eqlIgnoreCase(tok, "yes");
+    }
 
     if (n_turns == 0) {
         const count = m.checkpoints.len;
@@ -4225,6 +4251,25 @@ pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
     }
     if (n_turns > count) {
         agent.pushInfoFmt(m, "rewind: only {d} checkpoint{s} available", .{ count, if (count == 1) "" else "s" });
+        return;
+    }
+
+    if (!confirmed and !agent.yolo) {
+        var buf: [2048]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        w.print("rewind: DRY RUN for the last {d} turn(s):\n", .{n_turns}) catch {};
+        var kk: usize = 0;
+        var idx = m.checkpoints.items.len;
+        while (kk < n_turns and idx > 0) {
+            idx -= 1;
+            const cp = &m.checkpoints.items[idx];
+            for (cp.files[0..cp.len]) |f| {
+                w.print("  {s}{s}\n", .{ if (f.existed) "" else "new: ", f.pathOf() }) catch {};
+            }
+            kk += 1;
+        }
+        w.print("use /rewind {d} yes to apply", .{n_turns}) catch {};
+        agent.pushInfo(m, w.buffered());
         return;
     }
 

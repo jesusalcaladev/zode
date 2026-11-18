@@ -68,8 +68,8 @@ directly — the binary is installed there.
    zig build churn -Drun-args="version --beta"
    ```
 
-   Expect `current: 0.2.0` → `next: 0.2.1-beta.1` (or `beta.N+1` when the
-   current version is already a beta).
+   Expect `current: 0.3.0-beta.1` → `next: 0.3.0-beta.2` (or the next minor
+   core when you are promoting a stable line).
 
 3. Cut and push:
 

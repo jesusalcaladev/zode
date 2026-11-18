@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - complete the ecosystem - plugins, remote sessions, keybindings (phase13) [`acd62990`](https://github.com/jesusalcaladev/zode/commit/acd62990)
 - Phase 41 - terse output style and lossless prompt trims (tokens) [`f1a20944`](https://github.com/jesusalcaladev/zode/commit/f1a20944)
+- TUI key safety, docs and CI correctness (phases44-45) [`3e4dfb24`](https://github.com/jesusalcaladev/zode/commit/3e4dfb24)
 
 ### Bug Fixes
 
@@ -34,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
-- coverage for the three core gaps (phase43) [`bf50359d`](https://github.com/jesusalcaladev/zode/commit/bf50359d)
+- coverage for the three core gaps (phase43) [`4bae7558`](https://github.com/jesusalcaladev/zode/commit/4bae7558)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

@@ -12,16 +12,39 @@ Thanks for your interest in `zode`. It is a pure Zig code harness, built to be f
 
 1. **Fork + branch**: create a descriptive branch (`feat/rol`, `fix/scroll`, etc.).
 2. **Keep "pure Zig std"**: no mandatory `libc`, only `libvaxis` as an optional external dependency.
-3. **Keep tests green**: `zig build test` must pass. There are 800+ tests; if you add a file, add its test.
+3. **Keep tests green**: `zig build test` must pass. There are 2000+ tests; if you add a file, add its test.
 4. **Document with AGENTS.md in mind**: comments and test names should be in English; identifiers are never translated.
 5. **No TODOs**: `AGENTS.md` explicitly forbids them.
 
+## Testing
+
+| Command | What it checks |
+|---|---|
+| `zig build test` | Everything; `-Dtest-filter=name` runs one test group |
+| `zig build test -Dlive` | Live-provider tests (needs keys) |
+| `zig build test -De2e` | End-to-end scenarios |
+| `zig build pty-check` | The pty smoke scripts |
+| `zig build ui-frame` | Renders real scenes with real draw functions |
+| `zig build memaudit` | Static audit for use-after-free patterns |
+| `zig build churn -Drun-args="version --beta"` | A runnable step with arguments (`-Drun-args`) |
+
+Pure logic goes in `src/lib/` with inline tests and an import in `src/test_all.zig`
+(otherwise its tests never run). TUI tests live in `src/tui_tests.zig`.
+
+Phase 13 modules have reference harnesses in `tools/`: `remote_server.py` for
+`/remote`, `fake_mcp.py` for MCP. See `tools/README.md`.
+
+## Build steps
+
+`zig build --help` lists all steps. The main ones: `build` (default ReleaseSmall),
+`debug` (symbolized binary), `tool-test`, `check-probe`, `shell-probe`,
+`roster-probe`, `lsp-probe`, `ui-frame`, `pty-check`, `diag`, `memaudit`, `churn`.
+
 ## Areas that need help
 
-- `task` / subagents (priority 1 in the roadmap)
-- MCP over stdio (priority 2)
-- `@file` mentions (priority 4)
-- Skills (`.zode/skills/`)
+- Windows support (the crash and terminal paths are POSIX-only today)
+- Checksum verification in the release/install chain
+- Command-reference coverage in `docs/commands.md`
 - End-to-end against Anthropic with your own key
 
 ## Code rules
