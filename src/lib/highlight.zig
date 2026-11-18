@@ -315,6 +315,14 @@ test "a string with an escape and no closing does not crash" {
     const line = "const s = \"a\\\"b";
     const segs = try highlightLine(arena, line, "zig");
     try std.testing.expectEqualStrings(line, try joinedText(arena, segs));
+    // A highlighter that returned every byte as plain text would also pass the
+    // preservation check. The escaped tail must be a string segment, not code.
+    var saw_string = false;
+    for (segs) |sg| {
+        if (sg.text.len == 0) continue;
+        if (std.mem.indexOf(u8, sg.text, "a\\\"b") != null) saw_string = true;
+    }
+    try std.testing.expect(saw_string);
 }
 
 test "a C block comment on one line" {

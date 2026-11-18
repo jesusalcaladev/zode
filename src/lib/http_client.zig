@@ -330,10 +330,63 @@ fn parseLocation(head: anytype, out: []u8) ?[]const u8 {
     return null;
 }
 
-test "json escape helper" {
-    _ = struct {
-        pub fn jsonStringify(s: []const u8, w: anytype) !void {
-            try std.json.Stringify.encodeJsonString(s, .{}, w);
-        }
-    };
+/// A minimal stand-in for `receiveHead` result: the two helpers above only
+/// need `status` and `iterateHeaders`, so header parsing is testable without a
+/// socket. This replaces a vacuous test that instantiated a struct and never
+/// called it (it passed no matter what the HTTP layer did).
+const FakeHead = struct {
+    status: std.http.Status = .ok,
+    headers: []const std.http.Header = &.{},
+
+    fn iterateHeaders(self: *const FakeHead) HeaderIterator {
+        return .{ .items = self.headers };
+    }
+};
+
+const HeaderIterator = struct {
+    items: []const std.http.Header,
+    i: usize = 0,
+    fn next(self: *HeaderIterator) ?std.http.Header {
+        if (self.i >= self.items.len) return null;
+        defer self.i += 1;
+        return self.items[self.i];
+    }
+};
+
+test "http_client: JSON strings are escaped exactly" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try std.json.Stringify.encodeJsonString("a\"b\n\tc\\d\x01", .{}, &w);
+    try std.testing.expectEqualStrings("\"a\\\"b\\n\\tc\\\\d\\u0001\"", w.buffered());
+}
+
+test "http_client: retry-after and location are read from headers" {
+    var head = FakeHead{ .headers = &.{
+        .{ .name = "Retry-After", .value = " 42 " },
+    } };
+    try std.testing.expectEqual(@as(?u16, 42), parseRetryAfter(&head));
+
+    head = FakeHead{ .status = .found, .headers = &.{
+        .{ .name = "Location", .value = " https://example.com/next " },
+    } };
+    var loc_buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("https://example.com/next", parseLocation(&head, &loc_buf).?);
+
+    // A non-3xx must never be followed, even with a Location header.
+    head.status = .ok;
+    try std.testing.expect(parseLocation(&head, &loc_buf) == null);
+
+    // A location too long for the buffer is refused whole, not truncated.
+    head.status = .found;
+    var tiny: [4]u8 = undefined;
+    try std.testing.expect(parseLocation(&head, &tiny) == null);
+}
+
+test "http_client: a malformed URL fails before opening a socket" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var client: Http = .init(std.testing.allocator, threaded.io());
+    defer client.deinit();
+    try std.testing.expectError(error.InvalidUrl, client.get("not a url", null));
+    try std.testing.expectError(error.InvalidUrl, client.get("http://", null));
 }

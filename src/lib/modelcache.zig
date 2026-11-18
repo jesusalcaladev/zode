@@ -520,3 +520,36 @@ test "modelcache: a catalog older than 5 minutes is stale, a fresh one is not" {
     try std.testing.expect(!isStale(io, now + 10));
     try std.testing.expectEqual(@as(i64, 300), max_age_seconds);
 }
+
+test "modelcache: the write is atomic and leaves no temp file behind" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const home = home_buf[0..try tmp.dir.realPath(io, &home_buf)];
+    var env: std.process.Environ.Map = .init(a);
+    defer env.deinit();
+    try env.put("HOME", home);
+
+    var path_buf: [512]u8 = undefined;
+    const path = cachePath(&env, &path_buf, "atomic-test").?;
+    const dir = std.fs.path.dirname(path).?;
+    try tmp.dir.createDirPath(io, dir);
+
+    // A stale temp file from an older crashed write must not survive.
+    const tmp_path = try std.fmt.allocPrint(arena, "{s}.tmp", .{path});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = "stale" });
+
+    const list = [_]models.Model{.{ .id = "m1", .context_length = 8192, .is_free = false, .owned_by = "zode" }};
+    write(io, &env, "atomic-test", "http://example.invalid/v1", &list);
+
+    // The temp was consumed by the rename, and the final file parses.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(io, tmp_path, a, .limited(16)));
+    const parsed = read(io, &env, arena, "atomic-test", "http://example.invalid/v1");
+    try std.testing.expect(parsed != null);
+    try std.testing.expectEqualStrings("m1", parsed.?.models[0].id);
+}

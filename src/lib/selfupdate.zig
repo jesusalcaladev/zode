@@ -398,13 +398,18 @@ pub const InstallError = error{
 /// The order is what makes this safe: download → write a temp file NEXT TO the
 /// target (same filesystem, so the rename is atomic) → RUN it → rename over. A
 /// binary that does not run on this machine never replaces the one that does.
-pub fn installLatest(ctx: Context) InstallError![]const u8 {
-    const release = fetchRelease(ctx) orelse return error.DownloadFailed;
-    // A `dev` build has no number to compare, and updating it to a release is a
-    // decision the user just made by typing the command.
-    if (Version.parse(current_version) != null and !newerThan(release.tag, current_version)) {
+/// The downgrade guard, separated from the network so it is testable.
+/// A `dev` build has no number to compare, and updating it to a release is a
+/// decision the user just made by typing the command.
+pub fn mayInstall(current: []const u8, candidate_tag: []const u8) InstallError!void {
+    if (Version.parse(current) != null and !newerThan(candidate_tag, current)) {
         return error.AlreadyNewest;
     }
+}
+
+pub fn installLatest(ctx: Context) InstallError![]const u8 {
+    const release = fetchRelease(ctx) orelse return error.DownloadFailed;
+    try mayInstall(current_version, release.tag);
     const download_url = release.asset_url orelse return error.NoAssetForPlatform;
 
     const data = download(ctx, download_url) orelse return error.DownloadFailed;
@@ -606,4 +611,14 @@ test "a dev build never needs a network check" {
     try std.testing.expect(!isValidVersion(current_version));
     try std.testing.expect(check(ctx, false) == null);
     try std.testing.expect(check(ctx, true) == null);
+}
+
+test "self-update: the install guard refuses a downgrade and accepts a newer tag" {
+    try std.testing.expectError(error.AlreadyNewest, mayInstall("v0.3.0-beta.1", "v0.2.0"));
+    try std.testing.expectError(error.AlreadyNewest, mayInstall("v0.3.0", "v0.3.0"));
+    try std.testing.expectError(error.AlreadyNewest, mayInstall("v0.3.0", "v0.3.0-beta.1"));
+    mayInstall("v0.2.0", "v0.3.0-beta.1") catch return error.UnexpectedRefusal;
+    mayInstall("v0.3.0-beta.1", "v0.3.0") catch return error.UnexpectedRefusal;
+    // A dev build has no number: installing a release is an explicit decision.
+    mayInstall("dev", "v0.2.0") catch return error.UnexpectedRefusal;
 }

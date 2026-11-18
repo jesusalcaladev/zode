@@ -664,3 +664,45 @@ fn TurnStats_isReadOnlyTool(name: []const u8) bool {
     // mirror TurnStats.isReadOnlyTool used in agent; avoid importing agent.
     return std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "glob") or std.mem.eql(u8, name, "grep") or std.mem.eql(u8, name, "list") or std.mem.eql(u8, name, "webfetch") or std.mem.eql(u8, name, "websearch") or std.mem.eql(u8, name, "lsp");
 }
+
+// ── behavioral tests (Phase 43.2) ───────────────────────────────────────────
+
+test "tool_exec: a task batch ends after the consecutive task calls" {
+    const Call = TurnCtx.Call;
+    const calls = [_]Call{
+        .{ .id = "1", .name = "task", .args_json = "{}" },
+        .{ .id = "2", .name = "task", .args_json = "{}" },
+        .{ .id = "3", .name = "read", .args_json = "{}" },
+        .{ .id = "4", .name = "task", .args_json = "{}" },
+    };
+    try std.testing.expectEqual(@as(usize, 2), taskBatchEnd(&calls, 0));
+    try std.testing.expectEqual(@as(usize, 2), taskBatchEnd(&calls, 1));
+    try std.testing.expectEqual(@as(usize, 4), taskBatchEnd(&calls, 2));
+    try std.testing.expectEqual(@as(usize, 4), taskBatchEnd(&calls, 3));
+}
+
+test "tool_exec: protected paths force a decision even with no matching rule" {
+    const no_rules = permrules.Set{};
+    // A safe subject has no policy opinion.
+    try std.testing.expect(permDecisionWithPolicy(no_rules, "read", &.{"src/main.zig"}) == null);
+    // A git hook is dangerous, so the harness must ask instead of silently
+    // proceeding — the same verdict the main agent path applies.
+    if (permDecisionWithPolicy(no_rules, "write", &.{".git/hooks/pre-commit"})) |d| {
+        try std.testing.expectEqual(permrules.Action.ask, d.action);
+    } else return error.ExpectedDecision;
+}
+
+test "tool_exec: waitForBatch returns when the counter reaches zero" {
+    var pending = std.atomic.Value(usize).init(0);
+    // Zero already: must return without waiting (no sleep on the main thread).
+    waitForBatch(&pending, 5);
+    pending.store(0, .seq_cst);
+    waitForBatch(&pending, 5);
+}
+
+test "tool_exec: background and read-only classification helpers" {
+    try std.testing.expect(startedBackground("started in the background as job 1"));
+    try std.testing.expect(!startedBackground("done"));
+    try std.testing.expect(TurnStats_isReadOnlyTool("grep"));
+    try std.testing.expect(!TurnStats_isReadOnlyTool("bash"));
+}

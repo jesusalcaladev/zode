@@ -1083,3 +1083,37 @@ fn sanitizePattern(subject: []const u8, buf: []u8) []const u8 {
     if (n == 0) return "*";
     return buf[0..n];
 }
+// ── pure protocol tests (Phase 43.1) ────────────────────────────────────────
+
+test "acp: tool kinds are announced so the client can render calls" {
+    try std.testing.expectEqualStrings("read", acpToolKind("read"));
+    try std.testing.expectEqualStrings("read", acpToolKind("grep"));
+    try std.testing.expectEqualStrings("edit", acpToolKind("edit"));
+    try std.testing.expectEqualStrings("move", acpToolKind("rename"));
+    try std.testing.expectEqualStrings("execute", acpToolKind("bash"));
+    try std.testing.expectEqualStrings("fetch", acpToolKind("web_fetch"));
+    try std.testing.expectEqualStrings("plan", acpToolKind("todo"));
+    try std.testing.expectEqualStrings("other", acpToolKind("unknown-tool"));
+}
+
+test "acp: a chunk line is valid JSON-RPC with escaped text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const line = try writeMessageChunkLine(a, "s1", "agent_message_chunk", "a \"quote\"\nand a tab\t");
+    try std.testing.expect(std.mem.endsWith(u8, line, "\n"));
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, line, .{});
+    try std.testing.expectEqualStrings("2.0", parsed.object.get("jsonrpc").?.string);
+    try std.testing.expectEqualStrings("session/update", parsed.object.get("method").?.string);
+    const params = parsed.object.get("params").?.object;
+    try std.testing.expectEqualStrings("s1", params.get("sessionId").?.string);
+    const content = params.get("update").?.object.get("content").?.object;
+    try std.testing.expectEqualStrings("a \"quote\"\nand a tab\t", content.get("text").?.string);
+}
+
+test "acp: an always-allow pattern cannot inject a closing paren or a newline" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("*", sanitizePattern("", &buf));
+    try std.testing.expectEqualStrings("a_b", sanitizePattern("a)b", &buf));
+    try std.testing.expectEqualStrings("ab", sanitizePattern("a\nb\r", &buf));
+}

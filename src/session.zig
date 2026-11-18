@@ -1625,3 +1625,34 @@ test "consistency checkpoint fixture: persisted checkpoint line is detected on l
     try std.testing.expectEqual(@as(?usize, 2), sess.checkpoint_expected_messages);
     try std.testing.expect(!sess.consistency_mismatch);
 }
+
+test "load: a corrupt line is skipped and the rest of the session survives" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const p = try std.fmt.allocPrint(a, ".zode-corrupt-{d}.jsonl", .{std.testing.random_seed});
+    defer std.Io.Dir.cwd().deleteFile(io, p) catch {};
+    defer {
+        const caps = std.fmt.allocPrint(a, "{s}.caps.json", .{p}) catch null;
+        if (caps) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+        const compact = std.fmt.allocPrint(a, "{s}.compact.json", .{p}) catch null;
+        if (compact) |c| std.Io.Dir.cwd().deleteFile(io, c) catch {};
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = p,
+        .data =
+        \\{"role":"user","content":"first"}
+        \\{"role":"assistant","content":NOT_JSON
+        \\{"role":"assistant","content":"second"}
+        \\
+        ,
+    });
+
+    var sess = try load(alloc, io, p);
+    defer sess.deinit();
+    try std.testing.expectEqual(@as(usize, 2), sess.messages.items.len);
+    try std.testing.expectEqualStrings("first", sess.messages.items[0].content);
+    try std.testing.expectEqualStrings("second", sess.messages.items[1].content);
+}
