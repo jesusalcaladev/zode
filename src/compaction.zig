@@ -1422,3 +1422,53 @@ test "compaction: a background result survives the caller's arena being freed" {
     }
     try std.testing.expect(found);
 }
+
+// A deterministic failing allocator for the launch-error branch (43.6).
+const FailFirstAllocator = struct {
+    inner: std.mem.Allocator,
+    calls: usize = 0,
+
+    fn allocator(self: *FailFirstAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .free = free,
+            .remap = remap,
+            .resize = resize,
+        } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *FailFirstAllocator = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (self.calls == 1) return null;
+        return self.inner.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *FailFirstAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(buf, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *FailFirstAllocator = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(buf, alignment, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *FailFirstAllocator = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(buf, alignment, new_len, ret_addr);
+    }
+};
+
+test "compaction: a failed launch leaves state unlocked and reusable" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var msgs = std.ArrayList(chat.ChatMessage).empty;
+    try msgs.append(a, .{ .role = "user", .content = "x" });
+
+    var failing = FailFirstAllocator{ .inner = std.testing.allocator };
+    var state = CompactBgState{};
+    try std.testing.expect(!tryLaunchBg(&state, failing.allocator(), msgs.items, null, 128_000));
+    try std.testing.expect(!state.running);
+    // The mutex was released on the error path. If it were still held this
+    // tryLock would fail and the assertion would catch it — no threads needed.
+    try std.testing.expect(state.mtx.tryLock());
+    state.mtx.unlock();
+}
