@@ -154,6 +154,12 @@ pub const Session = struct {
     file: ?std.Io.File = null,
     write_buf: [4096]u8 = undefined,
     compress_buf: [1 << 16]u8 = undefined,
+    /// Reusable DEFLATE window + writer for persisted lines. Without these,
+    /// every compressible message page-allocates a 64 KB window and a fresh
+    /// allocating writer.
+    compress_window: [std.compress.flate.max_window_len]u8 = undefined,
+    compress_writer: std.Io.Writer.Allocating = undefined,
+    compress_writer_ready: bool = false,
     /// Session path (owned, to show in the TUI).
     path: ?[]const u8 = null,
     fw: ?std.Io.File.Writer = null,
@@ -287,6 +293,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        if (self.compress_writer_ready) self.compress_writer.deinit();
         self.saveCapsSidecar();
         self.saveCompactSidecar();
         if (self.fw != null) self.fw.?.interface.flush() catch {};
@@ -394,7 +401,7 @@ pub const Session = struct {
         const data = std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(1024 * 1024)) catch return;
         defer self.allocator.free(data);
         self.result_caps.deinit(self.allocator);
-        self.result_caps = resultcap.deserializeCaps(self.allocator, data) catch .{};
+        self.result_caps = resultcap.deserializeCaps(self.allocator, data) catch std.Io.Writer.Allocating.init(self.allocator);
     }
 
     fn scrubForPersist(self: *Session, content: []const u8) ![]u8 {
@@ -534,7 +541,11 @@ pub const Session = struct {
         w.writeAll("{\"role\":\"") catch {};
         w.writeAll(@tagName(m.role)) catch {};
         w.writeAll("\",\"content\":\"") catch {};
-        if (zjsonl.compressLine(&self.compress_buf, scrubbed)) |cline| {
+        if (!self.compress_writer_ready) {
+            self.compress_writer = std.Io.Writer.Allocating.initCapacity(self.allocator, 4096) catch std.Io.Writer.Allocating.init(self.allocator);
+            self.compress_writer_ready = true;
+        }
+        if (zjsonl.compressLineWith(&self.compress_buf, scrubbed, &self.compress_window, &self.compress_writer)) |cline| {
             writeEscaped(w, cline) catch {};
         } else {
             writeEscaped(w, scrubbed) catch {};

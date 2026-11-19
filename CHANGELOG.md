@@ -41,7 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - cache rendered tool_use blocks across requests (41.5) (chat) [`41fc4aef`](https://github.com/jesusalcaladev/zode/commit/41fc4aef)
 - cache the streaming paragraph render (41.8) (tui) [`bd606574`](https://github.com/jesusalcaladev/zode/commit/bd606574)
-- optimization pass — one style resolve per paint, zero-copy tool schema (46) [`cfcfd561`](https://github.com/jesusalcaladev/zode/commit/cfcfd561)
+- optimization pass — one style resolve per paint, zero-copy tool schema (46) [`61bc8bac`](https://github.com/jesusalcaladev/zode/commit/61bc8bac)
+- eliminate quadratic SSE tool-arg parsing and per-chunk allocations (46.6-46.11) [`789ca47c`](https://github.com/jesusalcaladev/zode/commit/789ca47c)
 
 ### Tests
 

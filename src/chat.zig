@@ -527,8 +527,13 @@ fn scrubErrBuf(out: *ErrBuf) void {
     const msg = out.buf[0..out.len];
     const scrubbed = redact_mod.redact(std.heap.page_allocator, msg, keys.items) catch return;
     defer if (scrubbed.ptr != msg.ptr) std.heap.page_allocator.free(scrubbed);
-    out.len = @min(scrubbed.len, out.buf.len);
-    @memcpy(out.buf[0..out.len], scrubbed[0..out.len]);
+    // redact returns the SAME slice when nothing was hidden. msg aliases
+    // out.buf, so memcpy'ing it back onto itself panics with "arguments
+    // alias" — leave the buffer as-is in that case.
+    if (scrubbed.ptr != msg.ptr) {
+        out.len = @min(scrubbed.len, out.buf.len);
+        @memcpy(out.buf[0..out.len], scrubbed[0..out.len]);
+    }
 }
 
 fn setServerMessageRaw(out: *ErrBuf, body: []const u8) void {
@@ -681,11 +686,7 @@ const Event = union(enum) {
 };
 
 /// Internal dispatch: turns stream JSON into Events and calls `dispatch`.
-fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyopaque, dispatch: *const fn (?*anyopaque, Event) void) !void {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
+fn dispatchEvents(arena: std.mem.Allocator, payload: []const u8, userdata: ?*anyopaque, dispatch: *const fn (?*anyopaque, Event) void) !void {
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, payload, .{});
     if (parsed != .object) return error.BadPayload;
 
@@ -761,9 +762,6 @@ fn dispatchEvents(gpa: std.mem.Allocator, payload: []const u8, userdata: ?*anyop
                                 }
                                 if (u.object.get("cache_read_input_tokens")) |v| {
                                     if (v == .integer) usage.cached = v.integer;
-                                }
-                                if (u.object.get("cache_creation_input_tokens")) |v| {
-                                    if (v == .integer) usage.cache_write = v.integer;
                                 }
                                 if (u.object.get("cache_creation_input_tokens")) |v| {
                                     if (v == .integer) usage.cache_write = v.integer;
@@ -948,6 +946,13 @@ pub const StreamCtx = struct {
     /// "Model access is disabled"). Without this the user only saw "HTTP 403".
     raw: [512]u8 = undefined,
     raw_len: usize = 0,
+    /// Reusable arena for ONE data line's parsed JSON. A long answer has
+    /// thousands of `data:` lines; a fresh ArenaAllocator per line meant a
+    /// page allocation and a page free per token. The arena is reset with
+    /// retain_capacity after each line, so it grows to the largest chunk once.
+    /// No slice escapes dispatch: every callback copies what it keeps.
+    event_arena: std.heap.ArenaAllocator = undefined,
+    event_arena_ready: bool = false,
 
     /// THIS request's usage, and this request's error text.
     ///
@@ -996,6 +1001,7 @@ pub const StreamCtx = struct {
         self.parts.deinit(self.gpa);
         self.line_buf.deinit(self.gpa);
         self.thinking.deinit(self.gpa);
+        if (self.event_arena_ready) self.event_arena.deinit();
         self.gpa.destroy(self);
     }
 
@@ -1043,7 +1049,12 @@ pub const StreamCtx = struct {
             self.saw_done = true;
             return;
         }
-        dispatchEvents(self.gpa, payload, self, StreamCtx.dispatch) catch |err| switch (err) {
+        if (!self.event_arena_ready) {
+            self.event_arena = std.heap.ArenaAllocator.init(self.gpa);
+            self.event_arena_ready = true;
+        }
+        _ = self.event_arena.reset(.retain_capacity);
+        dispatchEvents(self.event_arena.allocator(), payload, self, StreamCtx.dispatch) catch |err| switch (err) {
             error.ServerError => return error.ServerError,
             else => {}, // malformed chunk: skip it and keep going
         };
@@ -1141,6 +1152,17 @@ pub const StreamCtx = struct {
         if (p.emitted) return;
         if (p.id.items.len == 0 or p.name.items.len == 0) return;
         if (p.args.items.len == 0) return;
+        // Cheap guard BEFORE the parse. This runs on EVERY arguments delta, and
+        // parsing the whole accumulated buffer each time made large tool
+        // payloads quadratic: a 100 KB argument in 1000 chunks reparsed ~50 MB
+        // of JSON, all but the last parse certain to fail. A JSON object/array
+        // cannot be complete until its closer arrives. Non-object args (rare,
+        // tool schemas are objects) are still emitted by flushPendingTools at
+        // finish, so this moves no call out of the turn.
+        const trimmed = std.mem.trimEnd(u8, p.args.items, " \t\r\n");
+        if (trimmed.len == 0) return;
+        const last = trimmed[trimmed.len - 1];
+        if (last != '}' and last != ']') return;
 
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -3163,4 +3185,51 @@ test "tool-use cache: a repeated message renders byte-identical output" {
     try std.testing.expect(std.mem.indexOf(u8, second, "tool_use") != null);
     try std.testing.expect(std.mem.indexOf(u8, second, "src/main.zig") != null);
     _ = &tc;
+}
+
+test "tryEmitTool: many argument fragments still emit once with the full payload" {
+    // Regression for the quadratic path: every delta used to reparse the whole
+    // accumulated buffer. With hundreds of fragments inside a single JSON
+    // string, a premature closer byte in the middle must not emit a partial
+    // call, and the final one must contain every fragment.
+    const Collector = struct {
+        calls: usize = 0,
+        last_args: []const u8 = "",
+        fn onToolCall(ud: ?*anyopaque, _: []const u8, _: []const u8, args: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(ud.?));
+            self.calls += 1;
+            self.last_args = args;
+        }
+        fn onDelta(_: ?*anyopaque, _: []const u8) void {}
+    };
+    var col = Collector{};
+
+    const ctx = try std.testing.allocator.create(StreamCtx);
+    ctx.* = .{
+        .gpa = std.testing.allocator,
+        .user = .{ .userdata = &col, .onToolCall = Collector.onToolCall },
+    };
+    defer ctx.destroy();
+
+    var sse: std.ArrayList(u8) = .empty;
+    defer sse.deinit(std.testing.allocator);
+    try sse.appendSlice(std.testing.allocator,
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"text\\\":\\\"\"}}]}}]}\n");
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        // "a}" is a closer byte INSIDE a JSON string: it must not trigger an
+        // early emission even though the last byte is '}'.
+        try sse.appendSlice(std.testing.allocator,
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"a}\"}}]}}]}\n");
+    }
+    try sse.appendSlice(std.testing.allocator,
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"}\"}}]}}]}\n\n");
+
+    try scanSse(std.testing.allocator, sse.items, ctx);
+    try std.testing.expectEqual(@as(usize, 1), col.calls);
+    try std.testing.expect(std.mem.startsWith(u8, col.last_args, "{\"text\":\""));
+    try std.testing.expect(std.mem.endsWith(u8, col.last_args, "\"}"));
+    // Every one of the 300 fragments arrived: 300 * "a}" = 600 bytes plus the
+    // JSON wrapper. A single missing fragment would make this fail.
+    try std.testing.expectEqual(@as(usize, 600 + "{\"text\":\"\"}".len), col.last_args.len);
 }

@@ -566,9 +566,21 @@ pub const DiffStyles = struct {
     del_line_bg: vaxis.Style,
 };
 
+/// Only eight distinct Caps exist (three bools). Resolving the six diff
+/// styles does up to 12 RGB→ANSI256 conversions in a 256-color terminal, and
+/// the diff view asks for them per row/word. Compute once per capability set.
+/// Tests mutate `caps` between cases, so the cache is keyed on the argument,
+/// not on the global.
+var diff_cache: ?DiffStyles = null;
+var diff_cache_caps: Caps = .{};
+
 pub fn diffStyles(c: Caps) DiffStyles {
-    if (c.daltonized) {
-        return .{
+    if (diff_cache) |cached| {
+        const k = diff_cache_caps;
+        if (c.rgb == k.rgb and c.no_color == k.no_color and c.daltonized == k.daltonized) return cached;
+    }
+    const result: DiffStyles = if (c.daltonized) blk: {
+        break :blk .{
             .add = resolveStyle(rgb(0x4a, 0x9e, 0xff), c), // blue
             .del = resolveStyle(rgb(0xff, 0xa5, 0x00), c), // orange
             .add_bg = resolveStyle(.{ .bg = .{ .rgb = .{ 0x1c, 0x2c, 0x44 } } }, c),
@@ -576,15 +588,19 @@ pub fn diffStyles(c: Caps) DiffStyles {
             .add_line_bg = resolveStyle(diff_add_line_bg, c),
             .del_line_bg = resolveStyle(diff_del_line_bg, c),
         };
-    }
-    return .{
-        .add = resolveStyle(diff_add, c),
-        .del = resolveStyle(diff_del, c),
-        .add_bg = resolveStyle(diff_add_bg, c),
-        .del_bg = resolveStyle(diff_del_bg, c),
-        .add_line_bg = resolveStyle(diff_add_line_bg, c),
-        .del_line_bg = resolveStyle(diff_del_line_bg, c),
+    } else blk: {
+        break :blk .{
+            .add = resolveStyle(diff_add, c),
+            .del = resolveStyle(diff_del, c),
+            .add_bg = resolveStyle(diff_add_bg, c),
+            .del_bg = resolveStyle(diff_del_bg, c),
+            .add_line_bg = resolveStyle(diff_add_line_bg, c),
+            .del_line_bg = resolveStyle(diff_del_line_bg, c),
+        };
     };
+    diff_cache = result;
+    diff_cache_caps = c;
+    return result;
 }
 
 /// The `+` marker of an added row.

@@ -14,15 +14,28 @@ pub fn isCompressed(line: []const u8) bool {
 /// "z{...}" line slice (a view into `buf`), or null if compression
 /// didn't help (short or incompressible payload).
 pub fn compressLine(buf: []u8, payload: []const u8) ?[]const u8 {
-    if (payload.len < min_compress_len) return null;
-    if (buf.len < payload.len / 4) return null; // not enough room
-
     const window = std.compress.flate.max_window_len;
     const window_buf = std.heap.page_allocator.alloc(u8, window) catch return null;
     defer std.heap.page_allocator.free(window_buf);
 
     var out = std.Io.Writer.Allocating.initCapacity(std.heap.page_allocator, 4096) catch return null;
     defer out.deinit();
+
+    return compressLineWith(buf, payload, window_buf, &out);
+}
+
+/// Same as `compressLine`, but with caller-owned DEFLATE window and output
+/// writer. `Session` reuses both across messages: a fresh 64 KB window and a
+/// fresh allocating writer per large persisted line was measurable churn in
+/// sessions with many big tool results.
+pub fn compressLineWith(buf: []u8, payload: []const u8, window_buf: []u8, out: *std.Io.Writer.Allocating) ?[]const u8 {
+    if (payload.len < min_compress_len) return null;
+    if (buf.len < payload.len / 4) return null; // not enough room
+    if (window_buf.len < std.compress.flate.max_window_len) return null;
+    out.clearRetainingCapacity();
+    // Compress.init asserts the output buffer has room. A retained writer that
+    // started from init() (capacity 0) has none until it is grown once.
+    out.ensureUnusedCapacity(4096) catch return null;
 
     var comp = std.compress.flate.Compress.init(&out.writer, window_buf, .raw, .best) catch return null;
     comp.writer.writeAll(payload) catch return null;
@@ -84,4 +97,30 @@ test "round trip compresses and decompresses" {
 test "a short payload is not compressed" {
     var buf: [8192]u8 = undefined;
     try std.testing.expect(compressLine(&buf, "{\"short\":1}") == null);
+}
+
+test "compressLineWith: the same window and writer work across many payloads" {
+    // Session reuses one DEFLATE window and one allocating writer for every
+    // persisted line. A stale byte from the previous payload or a writer that
+    // did not reset would corrupt the next line silently (it is base64, so a
+    // bad decode only fails on resume).
+    const a = std.testing.allocator;
+    const window = try a.alloc(u8, std.compress.flate.max_window_len);
+    defer a.free(window);
+    var out = std.Io.Writer.Allocating.init(a);
+    defer out.deinit();
+
+    var buf: [1 << 16]u8 = undefined;
+    const payloads = [_][]const u8{
+        &repeat.rep("alpha", 400),
+        &repeat.rep("beta", 300),
+        &repeat.rep("gamma", 500),
+    };
+    for (payloads, 0..) |payload, i| {
+        const line = compressLineWith(&buf, payload, window, &out) orelse return error.TestExpectedNotNull;
+        const text = try decompressInto(a, line, 1 << 16);
+        defer a.free(text);
+        try std.testing.expectEqualStrings(payload, text);
+        _ = i;
+    }
 }

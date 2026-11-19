@@ -4,9 +4,17 @@ const std = @import("std");
 /// Pure, no I/O. If no known_keys are given, only shape redaction runs.
 
 pub fn redact(alloc: std.mem.Allocator, text: []const u8, known_keys: []const []const u8) ![]u8 {
-    // Fast path: nothing to hide and no shape.
+    // Fast path: almost every persisted message contains NO secret. Instead of
+    // building a full copy and letting the caller free it, write nothing until
+    // the FIRST redaction happens, then copy the pending raw span plus the
+    // replacement. Unchanged text is returned as the SAME slice — every caller
+    // already checks `scrubbed.ptr != content.ptr` before freeing, so this is
+    // compatible and saves one 1 MB alloc+copy per large tool result.
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
+    var pending: usize = 0;
+    var changed = false;
+
     // The env-marker search used to re-scan the ENTIRE remaining slice at
     // every byte: O(n^2) on any ordinary large message, reachable from
     // Session.append for every tool result. Track the NEXT marker position
@@ -24,21 +32,39 @@ pub fn redact(alloc: std.mem.Allocator, text: []const u8, known_keys: []const []
             }
         }
         if (hit) |len| {
+            if (!changed) {
+                try out.ensureTotalCapacity(alloc, text.len);
+                changed = true;
+            }
+            try out.appendSlice(alloc, text[pending..i]);
             try out.appendSlice(alloc, "[REDACTED]");
             i += len;
+            pending = i;
             continue;
         }
         // Bearer shape: "Bearer " + token
         if (i + 7 <= text.len and std.ascii.eqlIgnoreCase(text[i .. i + 7], "Bearer ")) {
+            if (!changed) {
+                try out.ensureTotalCapacity(alloc, text.len);
+                changed = true;
+            }
+            try out.appendSlice(alloc, text[pending..i]);
             try out.appendSlice(alloc, "Bearer [REDACTED]");
             i += 7;
             while (i < text.len and text[i] != ' ' and text[i] != '\n' and text[i] != '\t' and text[i] != '"') i += 1;
+            pending = i;
             continue;
         }
         // sk- / sk-ant- shapes
         if (i + 3 <= text.len and (std.mem.startsWith(u8, text[i..], "sk-ant-") or std.mem.startsWith(u8, text[i..], "sk-"))) {
+            if (!changed) {
+                try out.ensureTotalCapacity(alloc, text.len);
+                changed = true;
+            }
+            try out.appendSlice(alloc, text[pending..i]);
             try out.appendSlice(alloc, "[REDACTED]");
             while (i < text.len and text[i] != ' ' and text[i] != '\n' and text[i] != '\t' and text[i] != '"') i += 1;
+            pending = i;
             continue;
         }
         // ZODE_*_KEY= , *_TOKEN=
@@ -69,17 +95,24 @@ pub fn redact(alloc: std.mem.Allocator, text: []const u8, known_keys: []const []
                     }
                 }
                 if (ok) {
+                    if (!changed) {
+                        try out.ensureTotalCapacity(alloc, text.len);
+                        changed = true;
+                    }
+                    try out.appendSlice(alloc, text[pending..i]);
                     try out.appendSlice(alloc, prefix);
                     try out.appendSlice(alloc, "=[REDACTED]");
                     i += e + 1;
                     while (i < text.len and text[i] != ' ' and text[i] != '\n' and text[i] != '\t' and text[i] != '"') i += 1;
+                    pending = i;
                     continue;
                 }
             }
         }
-        try out.append(alloc, text[i]);
         i += 1;
     }
+    if (!changed) return @constCast(text);
+    try out.appendSlice(alloc, text[pending..]);
     return out.toOwnedSlice(alloc);
 }
 
@@ -100,7 +133,9 @@ test "redact: does not over-redact" {
     const a = std.testing.allocator;
     const text = "monkey-model is fine";
     const out = try redact(a, text, &.{});
-    defer a.free(out);
+    // Nothing to hide: redact hands back the ORIGINAL slice, so there is no
+    // allocation to free (and freeing a string literal would crash the gpa).
+    try std.testing.expect(out.ptr == text.ptr);
     try std.testing.expectEqualStrings(text, out);
 }
 
@@ -112,7 +147,7 @@ test "redact: a large message without env markers is handled in one pass" {
     defer big.deinit(a);
     for (0..100) |_| try big.appendSlice(a, "ordinary prose without any secret markers 0123456789\n");
     const result = try redact(a, big.items, &.{});
-    defer a.free(result);
+    try std.testing.expect(result.ptr == big.items.ptr);
     try std.testing.expectEqual(big.items.len, result.len);
     try std.testing.expectEqualStrings(big.items, result);
 }
