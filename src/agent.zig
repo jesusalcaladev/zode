@@ -568,7 +568,7 @@ pub fn cyclePermMode(m: *tui.Model) void {
     setPermMode(m, next);
     // The transcript says it, and the footer's RIGHT group shows the mode: the
     // mascot's legend belongs to the agent's work and nothing else.
-    pushInfoFmt(m, "permission mode: {s}", .{permModeName()});
+    m.pushInfoFmt("permission mode: {s}", .{permModeName()});
 }
 
 /// `/ask [on|off]`: Plan mode, retained as a command alias.
@@ -615,7 +615,7 @@ fn planApprovalNudge(m: *tui.Model) ?[]u8 {
             // newly approved implementation turn on its first response.
             m.goal.status = goal_mod.Status.none;
             setPermMode(m, .default);
-            pushInfo(m, "plan approved — plan mode off: implementing");
+            m.pushInfo("plan approved — plan mode off: implementing");
             return m.allocator.dupe(u8, plan_gate_approved_text) catch null;
         },
         .revise => {
@@ -634,11 +634,11 @@ fn planApprovalNudge(m: *tui.Model) ?[]u8 {
                 break :blk fb_buf[0..cut.len];
             } else revise_option;
             const nudge = std.fmt.allocPrint(m.allocator, plan_gate_revise_fmt, .{fb}) catch return null;
-            pushInfo(m, "plan not approved: revising");
+            m.pushInfo("plan not approved: revising");
             return nudge;
         },
         .skip => {
-            pushInfo(m, "plan approval skipped — shift+tab leaves plan mode whenever you want");
+            m.pushInfo("plan approval skipped — shift+tab leaves plan mode whenever you want");
             return null;
         },
     }
@@ -1030,11 +1030,11 @@ fn allowAlwaysFor(m: *tui.Model, name: []const u8, arg: []const u8) void {
     if (addBashPatternNoSave(cmd)) {
         saveAllowlist();
         const msg = std.fmt.allocPrint(m.allocator, "bash allowed: {s}", .{cmd}) catch return;
-        pushInfoOwned(m, msg);
+        m.pushInfoOwned(msg);
     } else {
         // Too long for the 160-byte budget, or the list is full. Saying
         // nothing here would look like the key had been ignored.
-        pushInfoFmt(m, "not saved: the command is longer than {d} bytes or the list of {d} is full", .{ bash_pattern_max, max_bash_patterns });
+        m.pushInfoFmt("not saved: the command is longer than {d} bytes or the list of {d} is full", .{ bash_pattern_max, max_bash_patterns });
     }
 }
 
@@ -1049,14 +1049,14 @@ fn warnDangerousAllowOnce(m: *tui.Model, what: []const u8) void {
         "warning: always allowing {s} lets the model run arbitrary commands through it — a broad permission, like /yolo for that tool.",
         .{what},
     ) catch return;
-    pushInfoOwned(m, msg);
+    m.pushInfoOwned(msg);
 }
 
 fn setAlwaysAllowed(m: *tui.Model, name: []const u8) void {
     if (setAlwaysAllowedNoSave(name)) {
         saveAllowlist();
         const msg = std.fmt.allocPrint(m.allocator, "always allowed: {s}", .{name}) catch return;
-        pushInfoOwned(m, msg);
+        m.pushInfoOwned(msg);
         // 34.4: warn once about dangerous broad allows
         if (permrules.isDangerousPattern(name, "*")) {
             warnDangerousAllowOnce(m, name);
@@ -1314,7 +1314,7 @@ pub fn initCheapRouterFromEnv(env: ?*const std.process.Environ.Map) void {
 /// notice is for.
 pub fn resetCheapRouter(m: *tui.Model) void {
     if (!router_cheap_on or !cheap_router.given_up) return;
-    pushInfo(m, "the cheap model is in play again after the model change");
+    m.pushInfo("the cheap model is in play again after the model change");
     cheap_router.given_up = false;
     cheap_router.attempts = 0;
     cheap_router.fallbacks = 0;
@@ -1340,22 +1340,19 @@ pub fn cheapRouterStats() CheapStats {
     };
 }
 
-/// [roster] `pub` so `free_auto.zig` can use it from its worker.
-pub fn pushInfo(m: *tui.Model, text: []const u8) void {
-    m.pushInfo(text);
-}
-
-/// [roster] `pub` so `free_auto.zig` can use it from its worker.
-pub fn pushError(m: *tui.Model, text: []const u8) void {
+// Thin local adapters: the loop-modules' ops tables need a plain function
+// pointer with this shape. No other module imports these (callers use the
+// Model methods directly).
+fn pushError(m: *tui.Model, text: []const u8) void {
     m.pushError(text);
 }
 
-/// Variant that already owns the caller's memory: the text does not have to be
-/// duplicated (nor freed). Used in the worker, which cannot leave garbage per
-/// frame.
-/// [roster] `pub` so `free_auto.zig` can use it.
-pub fn pushInfoOwned(m: *tui.Model, text: []const u8) void {
-    m.pushInfoOwned(text);
+fn pushErrorFmt(m: *tui.Model, comptime fmt: []const u8, args: anytype) void {
+    m.pushErrorFmt(fmt, args);
+}
+
+fn pushInfoFmt(m: *tui.Model, comptime fmt: []const u8, args: anytype) void {
+    m.pushInfoFmt(fmt, args);
 }
 
 pub fn replayPlanFromSessionMessages(plan: *plan_mod.Plan, msgs: []const session_mod.Message, arena: std.mem.Allocator) void {
@@ -1509,16 +1506,6 @@ pub fn setStatusWithZo(m: *tui.Model, mood: tui.StatusKind, text: []const u8) vo
 /// Composing and copying in one call makes that mistake unrepresentable.
 pub fn setStatusWithZoFmt(m: *tui.Model, mood: tui.StatusKind, comptime fmt: []const u8, args: anytype) void {
     m.setStatusFmt(mood, fmt, args);
-}
-
-/// `pushError` that composes the text. Same reason as `setStatusWithZoFmt`.
-pub fn pushErrorFmt(m: *tui.Model, comptime fmt: []const u8, args: anytype) void {
-    m.pushErrorFmt(fmt, args);
-}
-
-/// `pushInfo` that composes the text. Same reason as `setStatusWithZoFmt`.
-pub fn pushInfoFmt(m: *tui.Model, comptime fmt: []const u8, args: anytype) void {
-    m.pushInfoFmt(fmt, args);
 }
 
 // ── providers: config.json > built-in ────────────────────────
@@ -2086,7 +2073,7 @@ pub fn clearCurrentSessionLikeNew(m: *tui.Model) void {
 
     if (session) |s| {
         s.clearContents() catch |err| {
-            pushErrorFmt(m, "could not clear session: {t}", .{err});
+            m.pushErrorFmt("could not clear session: {t}", .{err});
         };
     }
     refreshContextUsage(m);
@@ -2139,7 +2126,7 @@ pub fn onSessionPick(m: *tui.Model, _: u32, index: usize) void {
 /// Renames the current session's custom title/tag and persists to the Meta sidecar.
 pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
     const path = m.picker_rename_target orelse {
-        pushInfo(m, "rename: could not find session path");
+        m.pushInfo("rename: could not find session path");
         return;
     };
 
@@ -2150,19 +2137,19 @@ pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
         label;
 
     const s = session orelse {
-        pushInfoFmt(m, "rename: no active session to rename {s}", .{display});
+        m.pushInfoFmt("rename: no active session to rename {s}", .{display});
         return;
     };
 
     // Only rename if this picker item is the current session.
     if (s.path == null or !std.mem.eql(u8, path, s.path.?)) {
-        pushInfoFmt(m, "rename: {s} is not the current session (use /rename <name>)", .{display});
+        m.pushInfoFmt("rename: {s} is not the current session (use /rename <name>)", .{display});
         return;
     }
 
     const trimmed = std.mem.trim(u8, display, " \t\r\n");
     if (trimmed.len == 0) {
-        pushInfo(m, "rename: empty name");
+        m.pushInfo("rename: empty name");
         return;
     }
 
@@ -2186,17 +2173,17 @@ pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
     }
     if (new_title) |t| {
         if (t.len == 0) {
-            pushInfo(m, "rename: empty title");
+            m.pushInfo("rename: empty title");
             return;
         }
         if (t.len > 64) {
-            pushInfo(m, "rename: title too long (max 64 chars)");
+            m.pushInfo("rename: title too long (max 64 chars)");
             return;
         }
     }
     if (new_tag) |t| {
         if (t.len > 32) {
-            pushInfo(m, "rename: tag too long (max 32 chars)");
+            m.pushInfo("rename: tag too long (max 32 chars)");
             return;
         }
     }
@@ -2204,14 +2191,14 @@ pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
     if (new_title) |t| {
         if (s.custom_title.len > 0) s.allocator.free(s.custom_title);
         s.custom_title = s.allocator.dupe(u8, t) catch {
-            pushInfo(m, "rename: out of memory");
+            m.pushInfo("rename: out of memory");
             return;
         };
     }
     if (new_tag) |t| {
         if (s.tag.len > 0) s.allocator.free(s.tag);
         s.tag = if (t.len == 0) "" else (s.allocator.dupe(u8, t) catch {
-            pushInfo(m, "rename: out of memory");
+            m.pushInfo("rename: out of memory");
             return;
         });
     }
@@ -2235,21 +2222,21 @@ pub fn onSessionRename(m: *tui.Model, _: u32, label: []const u8) void {
         .permissions_asked = meta.permissions_asked,
         .escs = meta.escs,
     }) catch |err| {
-        pushInfoFmt(m, "rename: could not save: {s}", .{@errorName(err)});
+        m.pushInfoFmt("rename: could not save: {s}", .{@errorName(err)});
         return;
     };
 
     if (new_title != null and new_tag != null) {
         if (s.tag.len > 0)
-            pushInfoFmt(m, "renamed to \"{s}\" #{s}", .{ s.custom_title, s.tag })
+            m.pushInfoFmt("renamed to \"{s}\" #{s}", .{ s.custom_title, s.tag })
         else
-            pushInfoFmt(m, "renamed to \"{s}\"", .{s.custom_title});
+            m.pushInfoFmt("renamed to \"{s}\"", .{s.custom_title});
     } else if (new_title != null) {
-        pushInfoFmt(m, "renamed to \"{s}\"", .{s.custom_title});
+        m.pushInfoFmt("renamed to \"{s}\"", .{s.custom_title});
     } else if (s.tag.len > 0) {
-        pushInfoFmt(m, "session tag set to #{s}", .{s.tag});
+        m.pushInfoFmt("session tag set to #{s}", .{s.tag});
     } else {
-        pushInfo(m, "session tag cleared");
+        m.pushInfo("session tag cleared");
     }
 }
 
@@ -2751,7 +2738,7 @@ pub fn bootstrapSession(m: *tui.Model) void {
                 cache_stats.session = s.usage_stats;
                 const msg = std.fmt.allocPrint(m.allocator, "session resumed: {s}", .{s.path orelse s.id[0..]}) catch
                     "session resumed";
-                pushInfoOwned(m, msg);
+                m.pushInfoOwned(msg);
                 return;
             } else |err| {
                 // It used to be `else |_| {}`, and the user saw "nothing to resume;
@@ -2759,11 +2746,11 @@ pub fn bootstrapSession(m: *tui.Model) void {
                 // The only way that happens is `error.FileTooBig` (the loader reads
                 // up to 64 MiB), and the honest answer names the file and says how
                 // to get to it, instead of quietly starting from zero.
-                pushInfoFmt(m, "could not resume {s}: {t} (it is bigger than the 64 MiB read limit; open it with /resume and a smaller session, or split it)", .{ path, err });
+                m.pushInfoFmt("could not resume {s}: {t} (it is bigger than the 64 MiB read limit; open it with /resume and a smaller session, or split it)", .{ path, err });
             }
         }
         const msg = allocPrint(m, "nothing to resume; starting a new session", .{}) catch return;
-        pushInfoOwned(m, msg);
+        m.pushInfoOwned(msg);
     }
     // CAREFUL: the session is NOT created here (ROADMAP 1.9). This line used to
     // open a `sessions/zode-*.jsonl` on EVERY startup, and since the file is
@@ -2988,7 +2975,7 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     } else if (std.mem.eql(u8, cmd, "ticks")) {
         m.tick_state.enabled = !m.tick_state.enabled;
         m.tick_state.reset();
-        pushInfoFmt(m, "· periodic check-ins {s}", .{if (m.tick_state.enabled) "on" else "off"});
+        m.pushInfoFmt("· periodic check-ins {s}", .{if (m.tick_state.enabled) "on" else "off"});
     } else if (std.mem.eql(u8, cmd, "context")) {
         commands_mod.cmdContext(m);
     } else if (std.mem.eql(u8, cmd, "inspect")) {
@@ -3546,7 +3533,7 @@ fn refuseForeignResume(m: *tui.Model, path: []const u8) void {
     const cmd = std.fmt.allocPrint(m.allocator, "zode --resume {s}", .{id}) catch return;
     defer m.allocator.free(cmd);
     m.setCopyPending(cmd);
-    pushInfoFmt(m, "that session belongs to a different project. Resume it from that project: {s} (copied to clipboard)", .{cmd});
+    m.pushInfoFmt("that session belongs to a different project. Resume it from that project: {s} (copied to clipboard)", .{cmd});
     appendHarnessPrompt(m, "The user asked to resume a session that belongs to a different project. Do not resume it here. Tell them to run the copied command from that session's project directory.");
 }
 
@@ -3611,11 +3598,11 @@ fn makeBranchTitle(gpa: std.mem.Allocator, arena: std.mem.Allocator, base: []con
 /// 30.4: fork/branch the current session into a new session file.
 pub fn branchSession(m: *tui.Model, arg: ?[]const u8) void {
     const s = session orelse {
-        pushInfo(m, "no active session to branch");
+        m.pushInfo("no active session to branch");
         return;
     };
     const src_path = s.path orelse {
-        pushInfo(m, "current session has no file path to branch");
+        m.pushInfo("current session has no file path to branch");
         return;
     };
 
@@ -3639,24 +3626,24 @@ pub fn branchSession(m: *tui.Model, arg: ?[]const u8) void {
         v >>= 5;
     }
     const new_path = std.fmt.allocPrint(a, "{s}{c}zode-{s}.jsonl", .{ session_mod.sessions_dir, std.fs.path.sep, &new_id }) catch {
-        pushError(m, "could not create branch session path");
+        m.pushError("could not create branch session path");
         return;
     };
 
     const src_data = std.Io.Dir.cwd().readFileAlloc(io_global, src_path, a, .limited(64 * 1024 * 1024)) catch |err| {
-        pushErrorFmt(m, "could not read session to branch: {t}", .{err});
+        m.pushErrorFmt("could not read session to branch: {t}", .{err});
         return;
     };
     std.Io.Dir.cwd().createDirPath(io_global, session_mod.sessions_dir) catch {};
     {
         var dst = std.Io.Dir.cwd().createFile(io_global, new_path, .{ .truncate = true, .permissions = session_mod.session_mode }) catch |err| {
-            pushErrorFmt(m, "could not create branch session: {t}", .{err});
+            m.pushErrorFmt("could not create branch session: {t}", .{err});
             return;
         };
         defer dst.close(io_global);
         dst.setPermissions(io_global, session_mod.session_mode) catch {};
         dst.writeStreamingAll(io_global, src_data) catch |err| {
-            pushErrorFmt(m, "could not write branch session: {t}", .{err});
+            m.pushErrorFmt("could not write branch session: {t}", .{err});
             return;
         };
     }
@@ -3702,7 +3689,7 @@ pub fn branchSession(m: *tui.Model, arg: ?[]const u8) void {
         .permissions_asked = src_meta.permissions_asked,
         .escs = src_meta.escs,
     }) catch |err| {
-        pushErrorFmt(m, "branched session created but could not write metadata: {t}", .{err});
+        m.pushErrorFmt("branched session created but could not write metadata: {t}", .{err});
     };
 
     const resume_cmd = std.fmt.allocPrint(m.allocator, "zode --resume {s}", .{src_id}) catch null;
@@ -3710,7 +3697,7 @@ pub fn branchSession(m: *tui.Model, arg: ?[]const u8) void {
         m.setCopyPending(cmd);
         m.allocator.free(cmd);
     }
-    pushInfoFmt(m, "Branched \"{s}\". To resume the original: zode --resume {s}", .{ branch_title, src_id });
+    m.pushInfoFmt("Branched \"{s}\". To resume the original: zode --resume {s}", .{ branch_title, src_id });
 }
 
 fn resumeSessionAtPath(m: *tui.Model, path: []const u8) void {
@@ -3731,7 +3718,7 @@ fn resumeSessionAtPath(m: *tui.Model, path: []const u8) void {
         // 29.6: "when the index says not found, read the file directly before
         // telling the user it does not exist" — resumePath already reads the file;
         // a missing/corrupt file is reported honestly.
-        pushInfoFmt(m, "could not resume {s}: {t}", .{ path, err });
+        m.pushInfoFmt("could not resume {s}: {t}", .{ path, err });
         return;
     };
     session = s;
@@ -3751,12 +3738,12 @@ fn resumeSessionAtPath(m: *tui.Model, path: []const u8) void {
     m.applyScrollState(s.getScrollState());
     if (s.consistency_mismatch) {
         if (s.checkpoint_expected_messages) |expected| {
-            pushInfoFmt(m, "session resumed with consistency mismatch: expected {d} messages, found {d}", .{ expected, s.checkpoint_actual_messages });
+            m.pushInfoFmt("session resumed with consistency mismatch: expected {d} messages, found {d}", .{ expected, s.checkpoint_actual_messages });
         } else {
-            pushInfo(m, "session resumed with consistency mismatch");
+            m.pushInfo("session resumed with consistency mismatch");
         }
     }
-    pushInfoFmt(m, "session resumed: {s} · {d} messages · prompts {d} · permissions {d} · ESCs {d}", .{
+    m.pushInfoFmt("session resumed: {s} · {d} messages · prompts {d} · permissions {d} · ESCs {d}", .{
         std.fs.path.basename(path),
         s.messages.items.len,
         s.prompts_asked,
@@ -3799,7 +3786,7 @@ fn resumeTerm(m: *tui.Model, term: []const u8) void {
         return;
     }
     if (matches.items.len > 1) {
-        pushInfoFmt(m, "Found {d} sessions matching {s}. Use /resume to pick.", .{ matches.items.len, term });
+        m.pushInfoFmt("Found {d} sessions matching {s}. Use /resume to pick.", .{ matches.items.len, term });
         return;
     }
     // 29.6: index said not found — try reading a direct `zode-<term>.jsonl` path
@@ -3811,7 +3798,7 @@ fn resumeTerm(m: *tui.Model, term: []const u8) void {
             return;
         } else |_| {}
     }
-    pushInfoFmt(m, "no session matching {s}. Use /resume to pick.", .{term});
+    m.pushInfoFmt("no session matching {s}. Use /resume to pick.", .{term});
 }
 
 
@@ -4353,7 +4340,7 @@ fn pipelineApplies(m: *tui.Model, user_text: []const u8) bool {
 }
 
 fn pushBgTaskInfo(m: *tui.Model, id: u32, status_word: []const u8) void {
-    pushInfoFmt(m, "bg task {d} {s}", .{ id, status_word });
+    m.pushInfoFmt("bg task {d} {s}", .{ id, status_word });
 }
 
 const BgSubagentCompletion = struct {
@@ -4426,7 +4413,7 @@ fn drainBackgroundTaskNotifications(m: *tui.Model) void {
         ) catch continue;
         defer m.allocator.free(msg);
         appendHarnessPrompt(m, msg);
-        pushInfoFmt(m, "bg subagent {d} finished", .{c.id});
+        m.pushInfoFmt("bg subagent {d} finished", .{c.id});
     }
 }
 
@@ -4492,7 +4479,7 @@ fn drainTeamNotifications(m: *tui.Model) void {
             .{ name, report },
         ) catch continue;
         appendHarnessPrompt(m, note);
-        pushInfoFmt(m, "teammate {s} reported", .{name});
+        m.pushInfoFmt("teammate {s} reported", .{name});
     }
 }
 
@@ -4506,7 +4493,7 @@ fn bashCommandAllowedForCmdSubst(command: []const u8) bool {
 
 fn reportCmdSubstFailure(m: *tui.Model, msg: []const u8) void {
     m.streamEnd();
-    pushError(m, msg);
+    m.pushError(msg);
     setStatusWithZo(m, .warn, "command substitution failed");
 }
 
@@ -4614,10 +4601,10 @@ const ExitGateAction = loop_guards.ExitGateAction;
 fn loopGuardsOps() loop_guards.UiOps {
     const S = struct {
         fn pushGateLimit(m: *tui.Model, limit: u8) void {
-            pushErrorFmt(m, "exit gate refused {d} times on a red build; ending this turn anyway. If this task cannot be completed here, call `goal` with status blocked and what_would_unblock.", .{limit});
+            m.pushErrorFmt("exit gate refused {d} times on a red build; ending this turn anyway. If this task cannot be completed here, call `goal` with status blocked and what_would_unblock.", .{limit});
         }
         fn pushRepeatStop(m: *tui.Model, which: []const u8) void {
-            pushInfoFmt(m, "stopped a repeated tool loop ({s})", .{which});
+            m.pushInfoFmt("stopped a repeated tool loop ({s})", .{which});
         }
     };
     return .{
@@ -4716,7 +4703,7 @@ fn handleLoopTurnSuccess(
 }
 
 fn pushStoppedForLoopError(m: *tui.Model) void {
-    pushInfo(m, "stopped (esc)");
+    m.pushInfo("stopped (esc)");
 }
 
 fn handleRunOneTurnLoopError(m: *tui.Model, err: anyerror, iterations: usize) TurnOutcome {
@@ -4791,7 +4778,7 @@ fn appendFinishedAutoCheckNote(m: *tui.Model, gpa: std.mem.Allocator, s: *sessio
             // re-attached verbatim until the project changes.
             const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
             _ = m.addFact(.blocker, text[0..line_end], "", 0);
-            pushInfoFmt(m, "· {s} checked the code you just wrote", .{
+            m.pushInfoFmt("· {s} checked the code you just wrote", .{
                 m.auto_check.label[0..m.auto_check.label_len],
             });
         }
@@ -4820,7 +4807,7 @@ fn ensureTurnModelReady(m: *tui.Model, http: *http_client.Http, pick: *Target) b
     }
     if (pick.model.len == 0) {
         m.streamEnd();
-        pushInfo(m, "no model to talk to: pick one with /model (ctrl+t). Nothing was sent.");
+        m.pushInfo("no model to talk to: pick one with /model (ctrl+t). Nothing was sent.");
         setStatusWithZo(m, .warn, "no model");
         return false;
     }
@@ -4964,7 +4951,7 @@ fn maybeProposeMemories(m: *tui.Model) void {
     }
 
     if (saved > 0) {
-        pushInfoFmt(m, "memory: {d} proposal(s) saved for your approval (use memory pending/approve)", .{saved});
+        m.pushInfoFmt("memory: {d} proposal(s) saved for your approval (use memory pending/approve)", .{saved});
     }
 }
 
@@ -5001,7 +4988,7 @@ pub fn finishAutoCheck(m: *tui.Model) void {
             const sess = ensureSession(m, gpa);
             sess.append(.user, owned) catch gpa.free(owned);
             sess.flush();
-            pushInfoFmt(m, "· {s} reported problems in the code you just wrote — see the history", .{
+            m.pushInfoFmt("· {s} reported problems in the code you just wrote — see the history", .{
                 m.auto_check.labelSlice(),
             });
             return;
@@ -5022,7 +5009,7 @@ pub fn finishAutoCheck(m: *tui.Model) void {
             // fact — `pollTouchedFiles` drops it on the next change, instead
             // of it answering for code it never saw.
             _ = m.addFact(.fact, line, "", 0);
-            pushInfo(m, line);
+            m.pushInfo(line);
         }
     }
 }
@@ -5301,7 +5288,7 @@ fn pushTurnSummary(m: *tui.Model) void {
     // `ensureParaHeights`) and the exit would be an "Invalid free".
     var line_buf: [256]u8 = undefined;
     const line = s.summaryLine(&line_buf, ms, ctx_used, cacheHitPct()) catch return;
-    pushInfo(m, line);
+    m.pushInfo(line);
 
     // A finished checklist has done its job: it goes off the row above the
     // input, and the history keeps the full list. Without this the block stayed
@@ -5313,7 +5300,7 @@ fn pushTurnSummary(m: *tui.Model) void {
     if (s.files.items.len == 0 and s.yolo_open.items.len == 0) return;
     var detail_buf: [512]u8 = undefined;
     const detail = s.detailLine(&detail_buf) catch return;
-    if (detail.len > 0) pushInfo(m, detail);
+    if (detail.len > 0) m.pushInfo(detail);
 
     // The questions nobody answered, in the summary.
     //
@@ -5324,7 +5311,7 @@ fn pushTurnSummary(m: *tui.Model) void {
     if (s.yolo_open.items.len > 0) {
         var ybuf: [256]u8 = undefined;
         const y = s.yoloOpenLine(&ybuf) catch return;
-        if (y.len > 0) pushInfo(m, y);
+        if (y.len > 0) m.pushInfo(y);
     }
 }
 
@@ -5652,7 +5639,7 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
     defer list.deinit(gpa);
 
     if (list.items.len == 0) {
-        pushInfoFmt(m, "{s} publishes no models. Open /model to check the base URL.", .{def.id});
+        m.pushInfoFmt("{s} publishes no models. Open /model to check the base URL.", .{def.id});
         return null;
     }
 
@@ -5666,7 +5653,7 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
     // WHICH and WHY, in the history and not only in the status bar: a silent
     // choice is indistinguishable from a hardcoded default, which is the thing
     // this exists to replace.
-    pushInfoFmt(m, "model → {s} ({s}; /model to change it)", .{ chosen.id, choice.why });
+    m.pushInfoFmt("model → {s} ({s}; /model to change it)", .{ chosen.id, choice.why });
     refreshContextUsage(m);
     // Remembered: the next start does not ask the catalogue again, it puts back
     // the model that actually worked here. (Free-auto ROTATIONS are not
@@ -5835,7 +5822,7 @@ fn notePoolState(m: *tui.Model) void {
     // one of the things that makes an information line unreadable).
     const msg = std.fmt.allocPrint(m.allocator, "{s} · /free-auto status for the detail", .{lbl}) catch
         "free-auto: pool changed";
-    pushInfoOwned(m, msg);
+    m.pushInfoOwned(msg);
 }
 
 /// [roster] Marks the pair that just brought the turn down and leaves it for the
@@ -6273,7 +6260,7 @@ fn pollTouchedFiles(m: *tui.Model) void {
     // the text into the session: no free here, and freeing an arena slice
     // with the gpa would abort on the length check.
     appendHarnessPrompt(m, text);
-    pushInfoFmt(m, "· files changed on disk: cached reads and facts invalidated", .{});
+    m.pushInfoFmt("· files changed on disk: cached reads and facts invalidated", .{});
 }
 
 /// A single-line excerpt of a compaction summary for the transcript.
@@ -6339,7 +6326,7 @@ fn applyTier2CompactionSummary(
     if (upto <= sum_from + 1) return;
 
     cache_stats.session.markCompacted();
-    pushInfo(m, "\u{b7} context full: summarizing the older turns with the model\u{2026}");
+    m.pushInfo("\u{b7} context full: summarizing the older turns with the model\u{2026}");
     var sum_http = http_client.Http.init(gpa, io_global);
     defer sum_http.deinit();
 
@@ -6366,12 +6353,12 @@ fn applyTier2CompactionSummary(
         summary_policy.noteSummarized(iteration);
         const excerpt = compactSummaryExcerpt(summary);
         if (excerpt.len > 0) {
-            pushInfoFmt(m, "\u{b7} compacted {d} older messages: {s}", .{
+            m.pushInfoFmt("\u{b7} compacted {d} older messages: {s}", .{
                 upto - sum_from,
                 excerpt,
             });
         } else {
-            pushInfoFmt(m, "\u{b7} compacted {d} older messages into a summary ({d} chars)", .{
+            m.pushInfoFmt("\u{b7} compacted {d} older messages into a summary ({d} chars)", .{
                 upto - sum_from,
                 summary.len,
             });
@@ -6391,7 +6378,7 @@ fn applyTier2CompactionSummary(
         } else |_| {}
     } else {
         summary_policy.noteSummarized(iteration);
-        pushInfo(m, "\u{b7} the summary failed; carrying on with the messages as they are");
+        m.pushInfo("\u{b7} the summary failed; carrying on with the messages as they are");
     }
 }
 
@@ -6488,7 +6475,7 @@ fn applyTier1Compaction(
         if (comp.elided > session_elided) {
             if (std.fmt.allocPrint(gpa, "· {d} tool results elided", .{comp.elided})) |msg| {
                 session_elided = comp.elided;
-                pushInfoOwned(m, msg);
+                m.pushInfoOwned(msg);
             } else |_| {}
         }
         for (comp.elided_at) |idx| m.reads.markDroppedAt(idx);
@@ -6533,7 +6520,7 @@ fn announceMentionsInlined(m: *tui.Model, mentions_in: MentionCount, iteration: 
         std.mem.print(&note_buf, "@file: {d} inlined with the prompt", .{
             mentions_in.files,
         }) catch "@file: inlined";
-    pushInfo(m, note);
+    m.pushInfo(note);
 }
 
 fn syncAndAttachTurnContext(m: *tui.Model, gpa: std.mem.Allocator, s: *session_mod.Session) void {
@@ -7935,7 +7922,7 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: s
     };
 
     if (m.asks_this_turn >= max_asks_per_turn) {
-        pushInfoFmt(m, "the model wanted to ask a 4th question this turn: not showing it (the cap is {d}). It will decide on its own.", .{max_asks_per_turn});
+        m.pushInfoFmt("the model wanted to ask a 4th question this turn: not showing it (the cap is {d}). It will decide on its own.", .{max_asks_per_turn});
         m.pushToolDone("ask", "refused (too many questions this turn)", 0, ask.declined_text);
         capStoreAppendToolResult(m, s, call.id, "ask", ask.declined_text, arena, budget);
         return 1;
@@ -8347,7 +8334,7 @@ pub fn shellOutputArrived(m: *tui.Model, so: tui.ShellOut) void {
 
     // Always VISIBLE, not a collapsed tool result: the user ran this to see it,
     // and Ctrl+R to expand what they just asked for would be perverse.
-    pushInfoFmt(m, "$ {s}\n{s}", .{ so.cmd, so.text });
+    m.pushInfoFmt("$ {s}\n{s}", .{ so.cmd, so.text });
     const s = ensureSession(m, m.allocator);
     s.append(.user, text) catch {};
     s.flush();
@@ -10058,7 +10045,7 @@ fn withPendingImages(m: *tui.Model, arena: std.mem.Allocator, msgs: []chat.ChatM
     if (!models_mod.isVision(curAnswering())) {
         const n = m.pending_images.len;
         m.pending_images.clear(m.allocator);
-        pushInfoFmt(m, "· {d} image(s) NOT sent: {s} cannot see images", .{ n, curAnswering() });
+        m.pushInfoFmt("· {d} image(s) NOT sent: {s} cannot see images", .{ n, curAnswering() });
         return msgs;
     }
 
@@ -10071,7 +10058,7 @@ fn withPendingImages(m: *tui.Model, arena: std.mem.Allocator, msgs: []chat.ChatM
     const out = arena.alloc(chat.ChatMessage, msgs.len + 1) catch return msgs;
     @memcpy(out[0..msgs.len], msgs);
     out[msgs.len] = .{ .role = "user", .content = note, .images = imgs };
-    pushInfoFmt(m, "· {d} image(s) sent to {s}", .{ m.pending_images.len, curAnswering() });
+    m.pushInfoFmt("· {d} image(s) sent to {s}", .{ m.pending_images.len, curAnswering() });
     return out;
 }
 
@@ -10863,7 +10850,7 @@ fn learnRuleForCall(m: *tui.Model, call_name: []const u8, args_json: []const u8,
     // Refuse to persist a dangerously broad rule (e.g. Bash(*), Bash(python *)).
     // The user should scope "always allow" to a specific command or prefix.
     if (permrules.isDangerousPattern(rule.tool, rule.pattern)) {
-        pushInfoFmt(m, "not saved as a broad rule (too dangerous): {s} — approve specific commands instead", .{text});
+        m.pushInfoFmt("not saved as a broad rule (too dangerous): {s} — approve specific commands instead", .{text});
         return .refused_dangerous;
     }
 
@@ -10881,7 +10868,7 @@ fn learnRuleForCall(m: *tui.Model, call_name: []const u8, args_json: []const u8,
     // And the file, so it is there tomorrow.
     if (savePermRule(rule)) {
         const msg = std.fmt.allocPrint(m.allocator, "always allowed: {s}", .{text}) catch return .saved;
-        pushInfoOwned(m, msg);
+        m.pushInfoOwned(msg);
     }
     return .saved;
 }
@@ -12133,7 +12120,7 @@ fn modelsWorker(job: *ModelsJob) void {
         const d = modelcache.diff(cached, list.items);
         catalog_changed = d.added > 0 or d.removed > 0 or d.changed > 0;
         const line = modelcache.describe(arena, d);
-        if (line.len > 0 and is_current(m, job)) pushInfoOwned(m, gpa.dupe(u8, line) catch line);
+        if (line.len > 0 and is_current(m, job)) m.pushInfoOwned(gpa.dupe(u8, line) catch line);
     }
 
     // Written AFTER the diff and not before: a cache that was just refreshed with the
@@ -12668,7 +12655,7 @@ fn byGroupThenName(_: void, a: palette.Item, b: palette.Item) bool {
 pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
     const def = config_mod.find(user_config, id) orelse providers.byId(id) orelse {
         const msg = std.fmt.allocPrint(m.allocator, "unknown provider: {s}", .{id}) catch return;
-        pushInfoOwned(m, msg);
+        m.pushInfoOwned(msg);
         return;
     };
     setProviderId(def.id);
@@ -12690,7 +12677,7 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
         // The model of the PREVIOUS provider is not valid here, and staying
         // silent about it means the next turn spends itself on a 400 that says
         // nothing about the cause.
-        pushInfo(m, "that model was from another provider; /model picks one from this provider's catalog");
+        m.pushInfo("that model was from another provider; /model picks one from this provider's catalog");
     }
     refreshContextUsage(m);
     persistLastModel();
@@ -18786,7 +18773,7 @@ fn pipelineCancelled() bool {
 fn pipelineStop(m: *tui.Model, cancelled: bool) void {
     m.setPipelineStage(null);
     if (cancelled) {
-        pushInfo(m, "· pipeline: cancelled — the tree may be partially changed; review the diff and artifacts before continuing");
+        m.pushInfo("· pipeline: cancelled — the tree may be partially changed; review the diff and artifacts before continuing");
         setStatusWithZo(m, .warn, "pipeline cancelled");
     }
     m.streamEnd();
@@ -18819,14 +18806,14 @@ fn runPipelineExplorerStage(
     setStatusWithZo(m, .thinking, "pipeline · explorer");
     var rep: subagent_mod.Report = undefined;
     const prompt = std.fmt.allocPrint(arena, explorer_prompt, .{task_text}) catch {
-        pushError(m, "pipeline: could not compose the explorer prompt");
+        m.pushError("pipeline: could not compose the explorer prompt");
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
         return null;
     };
     const out = runPipelineSubagent(m, &rep, "explorer", prompt, run_dir, "evidence.md");
     const evidence = arena.dupe(u8, out) catch out;
-    pushInfo(m, "· pipeline: explorer — evidence in .zode/pipeline/");
+    m.pushInfo("· pipeline: explorer — evidence in .zode/pipeline/");
     // Consolidated implementation brief artifact for traceability/handoff.
     writePipelinePlanArtifact(arena, run_dir, task_text, evidence, "No investigation was needed for this task.");
     return evidence;
@@ -18840,7 +18827,7 @@ fn runPipelineInvestigatorStage(
     evidence: []const u8,
 ) ?[]const u8 {
     if (!pipeline_support.needsInvestigation(task_text, evidence)) {
-        pushInfo(m, "· pipeline: investigator — skipped (nothing outside the repo to verify)");
+        m.pushInfo("· pipeline: investigator — skipped (nothing outside the repo to verify)");
         return null;
     }
     m.setPipelineStage("investigator");
@@ -18849,7 +18836,7 @@ fn runPipelineInvestigatorStage(
     const prompt = std.fmt.allocPrint(arena, investigator_prompt, .{ task_text, evidence }) catch return null;
     const out = runPipelineSubagent(m, &rep, "investigator", prompt, run_dir, "notes.md");
     const notes = arena.dupe(u8, out) catch out;
-    pushInfo(m, "· pipeline: investigator — notes in .zode/pipeline/");
+    m.pushInfo("· pipeline: investigator — notes in .zode/pipeline/");
     writePipelinePlanArtifact(arena, run_dir, task_text, evidence, notes);
     return notes;
 }
@@ -18868,7 +18855,7 @@ fn runPipelineImplementerStage(
         evidence,
         if (notes) |n| n else "No investigation was needed for this task.",
     }) catch {
-        pushError(m, "pipeline: could not compose the implementer seed");
+        m.pushError("pipeline: could not compose the implementer seed");
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
         return false;
@@ -18892,7 +18879,7 @@ fn enforceImplementerTestGuard(
     if (violations.len == 0) return true;
 
     const detail = pipeline_support.formatViolations(arena, violations) catch "existing tests were modified";
-    pushErrorFmt(m, "pipeline: existing tests were modified — this is not allowed:\n{s}\nRestoring them is required.", .{detail});
+    m.pushErrorFmt("pipeline: existing tests were modified — this is not allowed:\n{s}\nRestoring them is required.", .{detail});
     const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The existing tests changed during your work:\n{s}\nRestore them exactly as they were. Do not re-add your version of them by hand in any other file — the point is the ORIGINAL tests, byte for byte.", .{detail}) catch {
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
@@ -18905,12 +18892,12 @@ fn enforceImplementerTestGuard(
     }
     const left = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
     if (left.len > 0) {
-        pushError(m, "pipeline: existing tests are still modified — stopping. The tree is left as it is; review the diff before deciding.");
+        m.pushError("pipeline: existing tests are still modified — stopping. The tree is left as it is; review the diff before deciding.");
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
         return false;
     }
-    pushInfo(m, "· pipeline: existing tests restored");
+    m.pushInfo("· pipeline: existing tests restored");
     return true;
 }
 
@@ -18925,7 +18912,7 @@ fn runPipelineTesterStage(
     omit_tests: bool,
 ) bool {
     if (omit_tests) {
-        pushInfo(m, "· pipeline: tests omitted at the task's request");
+        m.pushInfo("· pipeline: tests omitted at the task's request");
         return true;
     }
 
@@ -18938,7 +18925,7 @@ fn runPipelineTesterStage(
         return false;
     };
     _ = runPipelineSubagent(m, &rep, "tester", prompt, run_dir, "tester-report.md");
-    pushInfo(m, "· pipeline: tester — report in .zode/pipeline/");
+    m.pushInfo("· pipeline: tester — report in .zode/pipeline/");
     if (pipelineCancelled()) {
         pipelineStop(m, true);
         return false;
@@ -18946,7 +18933,7 @@ fn runPipelineTesterStage(
     const violations2 = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
     if (violations2.len > 0) {
         const detail = pipeline_support.formatViolations(arena, violations2) catch "existing tests were modified";
-        pushErrorFmt(m, "pipeline: the tester modified existing tests — refusing to trust its report:\n{s}", .{detail});
+        m.pushErrorFmt("pipeline: the tester modified existing tests — refusing to trust its report:\n{s}", .{detail});
     }
     return true;
 }
@@ -18978,15 +18965,15 @@ fn runPipelineVerifyStage(
                 const suite = pipeline_support.runTestSuite(arena, io, plan);
                 if (suite.passed) {
                     tests_passed = true;
-                    pushInfoFmt(m, "· pipeline: {s} — all tests pass", .{plan.label});
+                    m.pushInfoFmt("· pipeline: {s} — all tests pass", .{plan.label});
                     break;
                 }
                 cycle += 1;
                 if (cycle > pipeline_mod.max_repair_cycles) {
-                    pushErrorFmt(m, "· pipeline: {s} is still failing after {d} repair passes — see the output", .{ plan.label, pipeline_mod.max_repair_cycles });
+                    m.pushErrorFmt("· pipeline: {s} is still failing after {d} repair passes — see the output", .{ plan.label, pipeline_mod.max_repair_cycles });
                     break;
                 }
-                pushInfoFmt(m, "· pipeline: {s} failed — repair pass {d}/{d}", .{ plan.label, cycle, pipeline_mod.max_repair_cycles });
+                m.pushInfoFmt("· pipeline: {s} failed — repair pass {d}/{d}", .{ plan.label, cycle, pipeline_mod.max_repair_cycles });
                 const repair = std.fmt.allocPrint(arena, verify_repair_prompt, .{ plan.label, suite.tail }) catch break;
                 appendPipelineHarnessPrompt(m, repair);
                 m.setPipelineStage("implementer");
@@ -19000,7 +18987,7 @@ fn runPipelineVerifyStage(
                 const touch = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
                 if (touch.len > 0) {
                     const detail = pipeline_support.formatViolations(arena, touch) catch "existing tests were modified";
-                    pushErrorFmt(m, "pipeline: a repair modified existing tests:\n{s}\nRestoring them is required.", .{detail});
+                    m.pushErrorFmt("pipeline: a repair modified existing tests:\n{s}\nRestoring them is required.", .{detail});
                     const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The repair pass changed existing tests:\n{s}\nRestore them exactly as they were.", .{detail}) catch break;
                     appendPipelineHarnessPrompt(m, reprimand);
                     m.setPipelineStage("implementer");
@@ -19011,7 +18998,7 @@ fn runPipelineVerifyStage(
                     m.setPipelineStage("verify");
                     const left = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
                     if (left.len > 0) {
-                        pushError(m, "pipeline: existing tests are still modified after repair — stopping. Review the diff before deciding.");
+                        m.pushError("pipeline: existing tests are still modified after repair — stopping. Review the diff before deciding.");
                         m.streamEnd();
                         endTurn(m, turn_stats.iterations, false);
                         return .{ .stopped = true, .tests_passed = tests_passed };
@@ -19019,7 +19006,7 @@ fn runPipelineVerifyStage(
                 }
             }
         } else {
-            pushInfo(m, "· pipeline: no test command known for this project — tests not run");
+            m.pushInfo("· pipeline: no test command known for this project — tests not run");
             tests_passed = true;
         }
         if (!tests_passed) setStatusWithZo(m, .warn, "pipeline · tests failing");
@@ -19040,7 +19027,7 @@ fn runPipelineReviewStage(
 ) PipelineVerifyResult {
     var tests_passed = tests_passed_in;
     if (omit_review) {
-        pushInfo(m, "· pipeline: review omitted at the task's request");
+        m.pushInfo("· pipeline: review omitted at the task's request");
         return .{ .stopped = false, .tests_passed = tests_passed };
     }
 
@@ -19057,7 +19044,7 @@ fn runPipelineReviewStage(
         return .{ .stopped = true, .tests_passed = tests_passed };
     }
     if (counts.high > 0) {
-        pushInfoFmt(m, "· pipeline: review found {d} high-severity problem(s) — running one repair pass", .{counts.high});
+        m.pushInfoFmt("· pipeline: review found {d} high-severity problem(s) — running one repair pass", .{counts.high});
         const repair = std.fmt.allocPrint(arena, review_repair_prompt, .{report}) catch "";
         if (repair.len > 0) appendPipelineHarnessPrompt(m, repair);
         m.setPipelineStage("implementer");
@@ -19071,12 +19058,12 @@ fn runPipelineReviewStage(
                 m.setPipelineStage("verify");
                 setStatusWithZo(m, .tooling, "pipeline · running the test suite");
                 const suite = pipeline_support.runTestSuite(arena, io, plan);
-                pushInfo(m, if (suite.passed) "· pipeline: tests still pass after the repair" else "· pipeline: tests are RED after the repair");
+                m.pushInfo(if (suite.passed) "· pipeline: tests still pass after the repair" else "· pipeline: tests are RED after the repair");
                 if (!suite.passed) tests_passed = false;
             }
         }
     }
-    pushInfoFmt(m, "· pipeline: review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
+    m.pushInfoFmt("· pipeline: review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
     return .{ .stopped = false, .tests_passed = tests_passed };
 }
 /// Phase 32.3: four CHEAP local checks before any expensive pipeline stage
@@ -19111,7 +19098,7 @@ fn pipelineSpendGate(m: *tui.Model, arena: std.mem.Allocator, io: std.Io) bool {
     }
 
     const v = spendgate_mod.decide(arena, inputs) catch return true;
-    for (v.notes) |note| pushInfo(m, note);
+    for (v.notes) |note| m.pushInfo(note);
     return v.kind == .proceed;
 }
 
@@ -19127,7 +19114,7 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
     }
 
     // Announce, then do the same session bookkeeping every turn does.
-    pushInfo(m, "· pipeline started: evidence/plan → implement → tester → verify → review (artifacts in .zode/pipeline/)");
+    m.pushInfo("· pipeline started: evidence/plan → implement → tester → verify → review (artifacts in .zode/pipeline/)");
     appendUserLine(m, task_text);
     resetTurnBudget(m);
     turn_stats.reset(gpa, std.Io.Timestamp.now(io, .real).nanoseconds);
@@ -19140,7 +19127,7 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
     // Phase 32.3: gate BEFORE anything expensive starts. An empty diff stops
     // here instead of launching a container that would echo "no changes".
     if (!pipelineSpendGate(m, arena, io)) {
-        pushInfo(m, "· pipeline stopped by the spend gate: nothing expensive was started");
+        m.pushInfo("· pipeline stopped by the spend gate: nothing expensive was started");
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
         return;
@@ -19148,7 +19135,7 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
 
     var dir_buf: [512]u8 = undefined;
     const run_dir = pipeline_support.pipelineRunDir(&dir_buf, io) orelse {
-        pushError(m, "pipeline: could not create the artifacts directory");
+        m.pushError("pipeline: could not create the artifacts directory");
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
         return;
@@ -19217,7 +19204,7 @@ fn finishPipelineRun(
         pipeline_mod.verifyWord(.failed)
     else
         pipeline_mod.verifyWord(.not_detectable);
-    pushInfoFmt(m, "· pipeline: done — {s} — artifacts in {s}", .{ verify_label, run_dir });
+    m.pushInfoFmt("· pipeline: done — {s} — artifacts in {s}", .{ verify_label, run_dir });
     m.streamEnd();
     setStatusWithZo(m, if (tests_passed or verdict.omit_tests) .done else .warn, "pipeline done");
     endTurn(m, turn_stats.iterations, false);
@@ -19236,14 +19223,14 @@ fn resolveCodeReviewPrompt(m: *tui.Model, arena: std.mem.Allocator, io: std.Io, 
         switch (pipeline_support.buildDiffReviewPrompt(arena, io)) {
             .prompt => |p| return p,
             .nothing_to_review => {
-                pushInfo(m, "· code-review: nothing to review — the working tree is clean");
+                m.pushInfo("· code-review: nothing to review — the working tree is clean");
                 m.streamEnd();
                 setStatusWithZo(m, .done, "code-review done");
                 endTurn(m, turn_stats.iterations, false);
                 return null;
             },
             .compose_failed => {
-                pushError(m, "code-review: could not compose the review prompt");
+                m.pushError("code-review: could not compose the review prompt");
                 m.streamEnd();
                 endTurn(m, turn_stats.iterations, false);
                 return null;
@@ -19254,7 +19241,7 @@ fn resolveCodeReviewPrompt(m: *tui.Model, arena: std.mem.Allocator, io: std.Io, 
         .prompt => |p| return p,
         .nothing_to_review => unreachable,
         .compose_failed => {
-            pushError(m, "code-review: could not compose the review prompt");
+            m.pushError("code-review: could not compose the review prompt");
             m.streamEnd();
             endTurn(m, turn_stats.iterations, false);
             return null;
@@ -19267,7 +19254,7 @@ fn runCodeReview(m: *tui.Model, arg: []const u8) void {
 
     m.setPipelineStage("reviewer");
     defer m.setPipelineStage(null);
-    pushInfo(m, "· code-review: analyzing the changes…");
+    m.pushInfo("· code-review: analyzing the changes…");
     // The command's raw argument line goes into the session like any other
     // prompt, so `zode` knows this turn asked for a review and not a fix.
     const session_line = if (arg.len > 0) arg else "/code-review";
@@ -19296,10 +19283,10 @@ fn finishCodeReviewRun(m: *tui.Model, prompt: []const u8, run_dir: []const u8) v
     const counts = pipeline_mod.parseReviewReport(report);
     m.streamEnd();
     setStatusWithZo(m, .done, "code-review done");
-    pushInfoFmt(m, "· code-review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
-    pushInfoFmt(m, "· the report is in {s}/review.md", .{run_dir});
+    m.pushInfoFmt("· code-review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
+    m.pushInfoFmt("· the report is in {s}/review.md", .{run_dir});
     if (counts.high > 0) {
-        pushInfo(m, "· to fix the high-severity findings, say so — the harness will not touch tests to make them pass");
+        m.pushInfo("· to fix the high-severity findings, say so — the harness will not touch tests to make them pass");
     }
     endTurn(m, turn_stats.iterations, false);
 }

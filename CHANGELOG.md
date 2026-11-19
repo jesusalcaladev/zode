@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 41 - terse output style and lossless prompt trims (tokens) [`f1a20944`](https://github.com/jesusalcaladev/zode/commit/f1a20944)
 - TUI key safety, docs and CI correctness (phases44-45) [`55368ae1`](https://github.com/jesusalcaladev/zode/commit/55368ae1)
 - close four more backlog items (45.2, 43.5, 43.8, 42.7) [`5e6ca604`](https://github.com/jesusalcaladev/zode/commit/5e6ca604)
-- bound every network operation (40.10) (http) [`29acece2`](https://github.com/jesusalcaladev/zode/commit/29acece2)
+- bound every network operation (40.10) (http) [`069dd1dc`](https://github.com/jesusalcaladev/zode/commit/069dd1dc)
 
 ### Bug Fixes
 
@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - finish 42.10, split headless runner, unify aliases (phase42) [`c38b5e3a`](https://github.com/jesusalcaladev/zode/commit/c38b5e3a)
 - split tui tests out of tui.zig (42.9 part 2) (phase42) [`df94f80a`](https://github.com/jesusalcaladev/zode/commit/df94f80a)
 - split event and draw dispatch into modules (42.9) (tui) [`c52b7a38`](https://github.com/jesusalcaladev/zode/commit/c52b7a38)
+- drop 337 one-line agent forwarders (42.8) [`062f4e79`](https://github.com/jesusalcaladev/zode/commit/062f4e79)
 
 ### Performance
 

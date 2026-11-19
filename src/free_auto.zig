@@ -194,7 +194,7 @@ fn rosterWorker(job: *RosterJob) void {
         roster_state.empty_reason = "could not reach any provider";
         rosterUnlock();
         const msg = "free-auto: could not build the model pool (no provider answered)";
-        agent.pushInfo(m, msg);
+        m.pushInfo(msg);
         return;
     };
 
@@ -233,7 +233,7 @@ pub fn startRosterBuild(m: *tui.Model) void {
         m.endWorker();
         m.allocator.destroy(job);
         const msg = "free-auto: could not start the model listing thread";
-        agent.pushInfo(m, msg);
+        m.pushInfo(msg);
         return;
     };
     t.detach();
@@ -251,10 +251,10 @@ pub fn startRosterBuild(m: *tui.Model) void {
 /// quiet, not push a literal into a function that is supposed to take ownership.
 fn own(m: *tui.Model, comptime fmt: []const u8, args: anytype) void {
     const msg = std.fmt.allocPrint(m.allocator, fmt, args) catch {
-        agent.pushInfo(m, "free-auto: out of memory");
+        m.pushInfo("free-auto: out of memory");
         return;
     };
-    agent.pushInfoOwned(m, msg);
+    m.pushInfoOwned(msg);
 }
 
 /// Changes the state of the mode. Returns `true` if the pool worker has to be
@@ -299,7 +299,7 @@ pub fn setFreeAuto(m: *tui.Model, want_on: bool) bool {
     rosterUnlock();
 
     if (!want_on) {
-        agent.pushInfo(m, "free-auto: off (back to the active model)");
+        m.pushInfo("free-auto: off (back to the active model)");
         agent.setStatusWithZo(m, .idle, "free-auto off");
         return false;
     }
@@ -310,7 +310,7 @@ pub fn setFreeAuto(m: *tui.Model, want_on: bool) bool {
         return false;
     }
 
-    agent.pushInfo(m, "free-auto: on · listing free models of every provider with a key…");
+    m.pushInfo("free-auto: on · listing free models of every provider with a key…");
     agent.setStatusWithZo(m, .thinking, "building the free pool");
     return true;
 }
@@ -325,12 +325,12 @@ pub fn cmdFreeAuto(m: *tui.Model, arg: ?[]const u8) void {
         // in `Model.deinit`, and that is an "Invalid free" on exit. Worth stressing:
         // `/free-auto status` with the pool unbuilt is exactly the literal branch.
         if (!freeAutoOn()) {
-            agent.pushInfo(m, "free-auto: off");
+            m.pushInfo("free-auto: off");
             return;
         }
         const lbl = freeAutoLabel(m.allocator);
         if (lbl.len == 0) {
-            agent.pushInfo(m, "free-auto: on · still listing models");
+            m.pushInfo("free-auto: on · still listing models");
             return;
         }
         own(m, "free-auto: on · {s}", .{lbl});
@@ -340,7 +340,7 @@ pub fn cmdFreeAuto(m: *tui.Model, arg: ?[]const u8) void {
     const want_on = if (std.mem.eql(u8, a, "off"))
         false
     else if (a.len > 0 and !std.mem.eql(u8, a, "on")) {
-        agent.pushInfo(m, "usage: /free-auto [on|off|status]");
+        m.pushInfo("usage: /free-auto [on|off|status]");
         return;
     } else !freeAutoOn();
 

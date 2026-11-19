@@ -52,11 +52,11 @@ const taskstore = @import("lib/taskstore.zig");
 /// what the TUI calls. Everything below it is local work that has no reason to
 /// live next to the agent loop.
 ///
-/// The edge only goes one way: this file imports `agent.zig` for the shared
-/// helpers (`agent.pushInfo*`, `agent.applyModel`, the cache numbers) and `agent.zig` calls
-/// into here. A file that both imported the other would be a cycle, and the way
-/// out of that is not a `usingnamespace`, it is deciding which side owns the
-/// entry point.
+/// This file imports `agent.zig` for shared runtime STATE (session, model,
+/// context numbers) and `agent.zig` calls into here for command dispatch. The
+/// old one-line forwarders (`agent.pushInfo*`) are gone: every call site now
+/// uses the `Model` method directly, which removed 337 indirections from this
+/// file alone. What remains is genuine shared state, not forwarding.
 /// `/help`: commands (with their shortcut) and then the bare shortcuts.
 ///
 /// Two blocks because they answer two different questions: "what can I type"
@@ -71,15 +71,15 @@ fn pushCommandList(m: *tui.Model, palette_visible: bool) void {
             std.fmt.allocPrint(gpa, "{s: <14} {s}  ({s})", .{ c.key, c.desc, h }) catch continue
         else
             std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
-        agent.pushInfoOwned(m, line);
+        m.pushInfoOwned(line);
     }
 }
 
 pub fn cmdHelp(m: *tui.Model) void {
     const gpa = m.allocator;
-    agent.pushInfoOwned(m, gpa.dupe(u8, "commands") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "commands") catch return);
     pushCommandList(m, true);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "advanced · type these commands directly") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "advanced · type these commands directly") catch return);
     pushCommandList(m, false);
 
     // The user's own commands, refreshed so a file written a minute ago shows
@@ -88,25 +88,25 @@ pub fn cmdHelp(m: *tui.Model) void {
     agent.refreshUserCommandsModel(m);
     const uc = agent.userCommands();
     if (uc.len > 0) {
-        agent.pushInfoOwned(m, gpa.dupe(u8, "your commands (.zode/commands · ~/.config/zode/commands)") catch return);
+        m.pushInfoOwned(gpa.dupe(u8, "your commands (.zode/commands · ~/.config/zode/commands)") catch return);
         var i: usize = 0;
         while (i < uc.len) : (i += 1) {
             if (agent.userCommandInfo(i)) |info| {
                 const origin = if (info.root == 0) "proj" else "user";
                 const line = std.fmt.allocPrint(gpa, "{s: <14} {s: <10} {s}", .{ info.key, origin, info.desc }) catch continue;
-                agent.pushInfoOwned(m, line);
+                m.pushInfoOwned(line);
             } else {
                 const c = uc[i];
                 const line = std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
-                agent.pushInfoOwned(m, line);
+                m.pushInfoOwned(line);
             }
         }
     }
 
-    agent.pushInfoOwned(m, gpa.dupe(u8, "shortcuts") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "shortcuts") catch return);
     for (shortcuts) |s| {
         const line = std.fmt.allocPrint(gpa, "{s: <18} {s}", .{ s.key, s.desc }) catch continue;
-        agent.pushInfoOwned(m, line);
+        m.pushInfoOwned(line);
     }
 }
 
@@ -145,7 +145,7 @@ pub fn cmdAllowlist(m: *tui.Model) void {
         "{s}",
         .{w.buffered()},
     ) catch return;
-    agent.pushInfoOwned(m, msg);
+    m.pushInfoOwned(msg);
 }
 
 /// `/permissions`: permission mode, rules, and allowlist (35.11 panel).
@@ -160,7 +160,7 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
         if (std.ascii.eqlIgnoreCase(sub, "reload")) {
             agent.loadPermRules();
             agent.loadAllowlist();
-            agent.pushInfoOwned(m, gpa.dupe(u8, "permissions: reloaded rules and allowlist from disk") catch return);
+            m.pushInfoOwned(gpa.dupe(u8, "permissions: reloaded rules and allowlist from disk") catch return);
             // fall through to show current state
         } else if (sub.len > 7 and std.ascii.eqlIgnoreCase(sub[0..4], "add ")) {
             const rule_text = std.mem.trim(u8, sub[4..], " \t\r\n");
@@ -168,37 +168,37 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
             defer arena_state.deinit();
             const aa = arena_state.allocator();
             const rule = permrules.parseRule(rule_text, .user, aa) orelse {
-                agent.pushInfoFmt(m, "permissions add: invalid rule `{s}` (expected: Tool(pattern) allow|deny|ask|dontAsk)", .{rule_text});
+                m.pushInfoFmt("permissions add: invalid rule `{s}` (expected: Tool(pattern) allow|deny|ask|dontAsk)", .{rule_text});
                 return;
             };
             if ((rule.action == .allow or rule.action == .dontAsk) and permrules.isDangerousPattern(rule.tool, rule.pattern)) {
-                agent.pushInfoFmt(m, "permissions add: refused dangerous broad allow `{s}` — use a narrower pattern (e.g. Bash(git *)) or deny/ask", .{rule.text});
+                m.pushInfoFmt("permissions add: refused dangerous broad allow `{s}` — use a narrower pattern (e.g. Bash(git *)) or deny/ask", .{rule.text});
                 return;
             }
             // Add to in-memory rules (local-strength view isn't needed; save as user
             // and reload so precedence/ordering is consistent) and persist.
             if (agent.savePermRule(rule)) {
                 agent.loadPermRules();
-                agent.pushInfoFmt(m, "permissions add: saved user rule `{s}`", .{rule.text});
+                m.pushInfoFmt("permissions add: saved user rule `{s}`", .{rule.text});
             } else {
-                agent.pushInfoFmt(m, "permissions add: could not save rule `{s}` (check user permissions file path)", .{rule.text});
+                m.pushInfoFmt("permissions add: could not save rule `{s}` (check user permissions file path)", .{rule.text});
             }
             // fall through to show current state
         } else if (sub.len > 0) {
-            agent.pushInfoFmt(m, "permissions: unknown subcommand `{s}` (use: /permissions | /permissions reload | /permissions add <Tool(pattern) action>)", .{sub});
+            m.pushInfoFmt("permissions: unknown subcommand `{s}` (use: /permissions | /permissions reload | /permissions add <Tool(pattern) action>)", .{sub});
             return;
         }
     }
     const set = agent.permRuleSet();
 
-    agent.pushInfoFmt(m, "permissions  ·  mode: {s}", .{agent.permModeName()});
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  engine: Phase 6 Tool(pattern) rules + pathsafe dangerous-path protection (34.1)") catch return);
+    m.pushInfoFmt("permissions  ·  mode: {s}", .{agent.permModeName()});
+    m.pushInfoOwned(gpa.dupe(u8, "  engine: Phase 6 Tool(pattern) rules + pathsafe dangerous-path protection (34.1)") catch return);
 
-    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "rules  ·  Tool(pattern) action  ·  allow | deny | ask | dontAsk") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  sources: local > project > user > policy  ·  deny beats any allow  ·  last rule in a file wins") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "rules  ·  Tool(pattern) action  ·  allow | deny | ask | dontAsk") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "  sources: local > project > user > policy  ·  deny beats any allow  ·  last rule in a file wins") catch return);
     if (set.rules.len == 0) {
-        agent.pushInfoOwned(m, gpa.dupe(u8, "  (no loaded rules; built-in pathsafe/policy checks and legacy allowlist still apply)") catch return);
+        m.pushInfoOwned(gpa.dupe(u8, "  (no loaded rules; built-in pathsafe/policy checks and legacy allowlist still apply)") catch return);
     } else {
         for (set.rules, 0..) |r, i| {
             var tag_buf: [64]u8 = undefined;
@@ -210,12 +210,12 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
                 "  {s: <8} {s}{s}",
                 .{ r.source.name(), r.text, tag_w.buffered() },
             ) catch continue;
-            agent.pushInfoOwned(m, line);
+            m.pushInfoOwned(line);
         }
     }
 
-    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "legacy allowlist  ·  persisted standing approvals (user permissions file)") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "legacy allowlist  ·  persisted standing approvals (user permissions file)") catch return);
     var abuf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&abuf);
     aw.writeAll("  tools: ") catch {};
@@ -236,8 +236,8 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
         bn += 1;
     }
     if (bn == 0) aw.writeAll("(none)") catch {};
-    agent.pushInfoOwned(m, gpa.dupe(u8, aw.buffered()) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, aw.buffered()) catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "") catch return);
     var prbuf: [640]u8 = undefined;
     const project_path = agent.resolvedProjectRulesPath(&prbuf);
     const project_exists = if (m.io_ready) blk: {
@@ -250,7 +250,7 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
         _ = std.Io.Dir.cwd().statFile(agent.io_global, p, .{}) catch break :blk false;
         break :blk true;
     } else false else false;
-    agent.pushInfoOwned(m, gpa.dupe(u8, "loaded from (effective paths, resolved like the loader):") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "loaded from (effective paths, resolved like the loader):") catch return);
     const files = std.fmt.allocPrint(
         gpa,
         "  project: {s} ({s})  ·  user: {s} ({s})",
@@ -261,9 +261,9 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
             if (user_path == null) "unknown path" else if (!m.io_ready) "unknown" else if (user_exists) "exists" else "missing",
         },
     ) catch return;
-    agent.pushInfoOwned(m, files);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  edit: add Tool(pattern) allow|deny|ask lines/objects under \"rules\"; legacy \"tools\"/\"bash\" arrays still work") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  commands: /permissions reload  ·  /permissions add <Tool(pattern) allow|deny|ask>  ·  edit JSON files directly for full control") catch return);
+    m.pushInfoOwned(files);
+    m.pushInfoOwned(gpa.dupe(u8, "  edit: add Tool(pattern) allow|deny|ask lines/objects under \"rules\"; legacy \"tools\"/\"bash\" arrays still work") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "  commands: /permissions reload  ·  /permissions add <Tool(pattern) allow|deny|ask>  ·  edit JSON files directly for full control") catch return);
 }
 
 /// `/hooks`: loaded hooks and the hooks file (35.11 panel).
@@ -276,15 +276,15 @@ pub fn cmdHooks(m: *tui.Model, arg: ?[]const u8) void {
         const sub = std.mem.trim(u8, a, " \t\r\n");
         if (std.ascii.eqlIgnoreCase(sub, "reload")) {
             agent.loadHooks();
-            agent.pushInfoOwned(m, gpa.dupe(u8, "hooks: reloaded from disk") catch return);
+            m.pushInfoOwned(gpa.dupe(u8, "hooks: reloaded from disk") catch return);
             // fall through to show current state
         } else if (sub.len > 0) {
-            agent.pushInfoFmt(m, "hooks: unknown subcommand `{s}` (use: /hooks | /hooks reload)", .{sub});
+            m.pushInfoFmt("hooks: unknown subcommand `{s}` (use: /hooks | /hooks reload)", .{sub});
             return;
         }
     }
     const set = agent.hooks_set;
-    agent.pushInfoOwned(m, gpa.dupe(u8, "hooks  ·  Phase 5 command hooks (PreToolUse, PostToolUse, UserPromptSubmit, Stop, PermissionRequest)") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "hooks  ·  Phase 5 command hooks (PreToolUse, PostToolUse, UserPromptSubmit, Stop, PermissionRequest)") catch return);
     var hpbuf: [640]u8 = undefined;
     const hooks_path = agent.resolvedProjectHooksPath(&hpbuf);
     const file_exists = if (m.io_ready) blk: {
@@ -292,12 +292,12 @@ pub fn cmdHooks(m: *tui.Model, arg: ?[]const u8) void {
         break :blk true;
     } else false;
     const file_line = std.fmt.allocPrint(gpa, "  loaded from (effective project path): {s} ({s}; loaded on startup/reload)", .{ hooks_path, if (!m.io_ready) "unknown" else if (file_exists) "exists" else "missing" }) catch return;
-    agent.pushInfoOwned(m, file_line);
+    m.pushInfoOwned(file_line);
     if (set.hooks.len == 0) {
-        agent.pushInfoOwned(m, gpa.dupe(u8, "  (no hooks loaded)") catch return);
+        m.pushInfoOwned(gpa.dupe(u8, "  (no hooks loaded)") catch return);
     } else {
         const count = std.fmt.allocPrint(gpa, "  loaded: {d}", .{set.hooks.len}) catch return;
-        agent.pushInfoOwned(m, count);
+        m.pushInfoOwned(count);
         for (set.hooks) |h| {
             const matcher = if (h.matcher.len > 0) h.matcher else "*";
             const cond = if (h.@"if".len > 0) h.@"if" else "-";
@@ -307,52 +307,52 @@ pub fn cmdHooks(m: *tui.Model, arg: ?[]const u8) void {
                 "  {s}  matcher={s}  if={s}  timeout={d}ms{s}  cmd={s}",
                 .{ h.event.name(), matcher, cond, h.timeout_ms, once, h.command },
             ) catch continue;
-            agent.pushInfoOwned(m, line);
+            m.pushInfoOwned(line);
         }
     }
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  contract: PreToolUse can block/update input; PostToolUse/UserPromptSubmit add context; PermissionRequest can allow/deny/ask (JSON stdout contract supported)") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  commands: /hooks reload  ·  edit .zode/hooks.json directly for full control") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "  contract: PreToolUse can block/update input; PostToolUse/UserPromptSubmit add context; PermissionRequest can allow/deny/ask (JSON stdout contract supported)") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "  commands: /hooks reload  ·  edit .zode/hooks.json directly for full control") catch return);
 }
 
 /// `/agents`: subagent definitions/status (35.11 panel).
 pub fn cmdAgents(m: *tui.Model) void {
     const gpa = m.allocator;
-    agent.pushInfoOwned(m, gpa.dupe(u8, "agents  ·  subagent/task configuration") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  current: task subagent (general-purpose), depth 1, effort low, 24k budget, restricted/read-oriented tool set, no conversation history") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  parallel cap: ZODE_TASK_PARALLEL (default 3; see env/config)") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "agents  ·  subagent/task configuration") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "  current: task subagent (general-purpose), depth 1, effort low, 24k budget, restricted/read-oriented tool set, no conversation history") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "  parallel cap: ZODE_TASK_PARALLEL (default 3; see env/config)") catch return);
     var defs: []const agentdefs.Entry = &.{};
     if (m.io_ready) defs = agent.ensureAgentDefs(gpa, m.io, m.environ);
     if (defs.len == 0) {
-        agent.pushInfoOwned(m, gpa.dupe(u8, "  definitions on disk (Phase 9): none (open /config → Agent definitions to create one)") catch return);
+        m.pushInfoOwned(gpa.dupe(u8, "  definitions on disk (Phase 9): none (open /config → Agent definitions to create one)") catch return);
     } else {
         for (defs) |d| {
-            agent.pushInfoOwned(m, std.fmt.allocPrint(gpa,
+            m.pushInfoOwned(std.fmt.allocPrint(gpa,
                 "  · {s} [{s}] — {s}",
                 .{ d.name, d.source, if (d.description.len > 0) d.description else "no description" },
             ) catch return);
         }
     }
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  layouts: .zode/agents/<name>.md or <name>/AGENT.md (project overrides user)") catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  built-in roles (Phase 26): explore / plan / verify via task(role=…)") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "  layouts: .zode/agents/<name>.md or <name>/AGENT.md (project overrides user)") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "  built-in roles (Phase 26): explore / plan / verify via task(role=…)") catch return);
     const team_summary = m.team.summary(gpa) catch "";
     defer gpa.free(team_summary);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  team mode (Phase 20): {s}", .{team_summary}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  team mode (Phase 20): {s}", .{team_summary}) catch return);
 }
 
 /// `/mcp`: MCP server configuration and status (35.13 panel, partial).
 /// Shows configured servers without forcing connections; tools are discovered on demand.
 pub fn cmdMcp(m: *tui.Model) void {
     const gpa = m.allocator;
-    agent.pushInfoOwned(m, gpa.dupe(u8, "mcp  ·  MCP server configuration and status") catch return);
-    agent.pushInfoFmt(m, "  manager: {s}", .{if (mcp_manager.isReady()) "ready" else "not initialized"});
+    m.pushInfoOwned(gpa.dupe(u8, "mcp  ·  MCP server configuration and status") catch return);
+    m.pushInfoFmt("  manager: {s}", .{if (mcp_manager.isReady()) "ready" else "not initialized"});
     const servers = mcp_manager.configuredServers();
     if (servers.len == 0) {
-        agent.pushInfo(m, "  servers: none configured (add `mcp_servers` in ~/.config/zode/config.json)");
+        m.pushInfo("  servers: none configured (add `mcp_servers` in ~/.config/zode/config.json)");
     } else {
-        agent.pushInfoFmt(m, "  servers: {d} configured", .{servers.len});
+        m.pushInfoFmt("  servers: {d} configured", .{servers.len});
         for (servers) |s| {
             const cmd = if (s.command.len > 0) s.command[0] else "(no command)";
-            agent.pushInfoFmt(m, "    - {s}  ({s}, {d} arg{s}, {d} env)", .{
+            m.pushInfoFmt("    - {s}  ({s}, {d} arg{s}, {d} env)", .{
                 s.name,
                 cmd,
                 if (s.command.len > 1) s.command.len - 1 else 0,
@@ -360,7 +360,7 @@ pub fn cmdMcp(m: *tui.Model) void {
                 s.env.len,
             });
         }
-        agent.pushInfo(m, "  note: tool catalogs are discovered lazily on use (use the `mcp` tool to search/list/call)");
+        m.pushInfo("  note: tool catalogs are discovered lazily on use (use the `mcp` tool to search/list/call)");
     }
 }
 
@@ -368,17 +368,17 @@ pub fn cmdMcp(m: *tui.Model) void {
 pub fn cmdSandbox(m: *tui.Model) void {
     const path = agent.envGet(m.environ, "PATH");
     const kind = sandbox_mod.detect(agent.io_global, std.Io.Dir.cwd(), path);
-    agent.pushInfoOwned(m, m.allocator.dupe(u8, "sandbox  ·  availability for flagged bash commands") catch return);
+    m.pushInfoOwned(m.allocator.dupe(u8, "sandbox  ·  availability for flagged bash commands") catch return);
     switch (kind) {
         .none => {
-            agent.pushInfo(m, "  detected: none (install bubblewrap `bwrap` or `firejail` to enable sandboxed runs)");
+            m.pushInfo("  detected: none (install bubblewrap `bwrap` or `firejail` to enable sandboxed runs)");
         },
         else => {
-            agent.pushInfoFmt(m, "  detected: {s} ({s})", .{ kind.name(), sandbox_mod.binary(kind) });
-            agent.pushInfo(m, "  behavior: optional sandboxed execution offered for flagged bash commands (project writable, rest read-only; no network isolation)");
+            m.pushInfoFmt("  detected: {s} ({s})", .{ kind.name(), sandbox_mod.binary(kind) });
+            m.pushInfo("  behavior: optional sandboxed execution offered for flagged bash commands (project writable, rest read-only; no network isolation)");
         },
     }
-    agent.pushInfo(m, "  note: sandbox is opt-in per command when offered by the permission dialog (not applied to every command)");
+    m.pushInfo("  note: sandbox is opt-in per command when offered by the permission dialog (not applied to every command)");
 }
 
 /// `/vim`: toggle vim keybindings for the input editor (35.13 / Phase 13).
@@ -389,7 +389,7 @@ pub fn cmdRemote(m: *tui.Model, arg: ?[]const u8) void {
     const a = m.allocator;
     const cfg = remote_mod.Config.fromEnv(m.environ);
     if (!cfg.enabled or !cfg.valid()) {
-        agent.pushInfo(m, "remote: set ZODE_REMOTE_URL (http(s), no credentials) to enable. Optional: ZODE_REMOTE_TOKEN.");
+        m.pushInfo("remote: set ZODE_REMOTE_URL (http(s), no credentials) to enable. Optional: ZODE_REMOTE_TOKEN.");
         return;
     }
     var it = std.mem.tokenizeScalar(u8, arg orelse "", ' ');
@@ -409,61 +409,61 @@ pub fn cmdRemote(m: *tui.Model, arg: ?[]const u8) void {
                 shown = std.fmt.allocPrint(a, "{s}{s}", .{ shown[0..authority], shown[authority + at + 1 ..] }) catch cfg.url;
             }
         }
-        agent.pushInfoFmt(m, "remote: {s} (token {s})", .{ shown, if (cfg.token != null) "set" else "not set" });
+        m.pushInfoFmt("remote: {s} (token {s})", .{ shown, if (cfg.token != null) "set" else "not set" });
         return;
     }
     if (std.mem.eql(u8, op, "list")) {
         const refs = remotesync.fetchIndex(a, m.io, cfg) catch {
-            agent.pushInfo(m, "remote: could not fetch the session index");
+            m.pushInfo("remote: could not fetch the session index");
             return;
         };
         defer a.free(refs);
         if (refs.len == 0) {
-            agent.pushInfo(m, "remote: no sessions");
+            m.pushInfo("remote: no sessions");
             return;
         }
         for (refs) |r| {
-            agent.pushInfoFmt(m, "  {s}  {d} bytes  {s}", .{ r.id, r.size, r.updated });
+            m.pushInfoFmt("  {s}  {d} bytes  {s}", .{ r.id, r.size, r.updated });
         }
         return;
     }
     if (std.mem.eql(u8, op, "pull")) {
         if (id == null) {
-            agent.pushInfo(m, "usage: /remote pull <session-id>");
+            m.pushInfo("usage: /remote pull <session-id>");
             return;
         }
         const data = remotesync.fetchSession(a, m.io, cfg, id.?) catch {
-            agent.pushInfoFmt(m, "remote: pull '{s}' failed", .{id.?});
+            m.pushInfoFmt("remote: pull '{s}' failed", .{id.?});
             return;
         };
         defer a.free(data);
         remotesync.writeSession(a, m.io, dir, id.?, data) catch {
-            agent.pushInfo(m, "remote: could not write the local session");
+            m.pushInfo("remote: could not write the local session");
             return;
         };
-        agent.pushInfoFmt(m, "remote: pulled {s} ({d} bytes)", .{ id.?, data.len });
+        m.pushInfoFmt("remote: pulled {s} ({d} bytes)", .{ id.?, data.len });
         return;
     }
     if (std.mem.eql(u8, op, "push")) {
         if (id == null) {
-            agent.pushInfo(m, "usage: /remote push <session-id>");
+            m.pushInfo("usage: /remote push <session-id>");
             return;
         }
         const data = remotesync.readSession(a, m.io, dir, id.?) catch {
-            agent.pushInfoFmt(m, "remote: local session '{s}' not found", .{id.?});
+            m.pushInfoFmt("remote: local session '{s}' not found", .{id.?});
             return;
         };
         defer a.free(data);
         const status = remotesync.uploadSession(a, m.io, cfg, id.?, data) catch {
-            agent.pushInfo(m, "remote: upload failed");
+            m.pushInfo("remote: upload failed");
             return;
         };
-        agent.pushInfoFmt(m, "remote: pushed {s} (HTTP {d})", .{ id.?, status });
+        m.pushInfoFmt("remote: pushed {s} (HTTP {d})", .{ id.?, status });
         return;
     }
     if (std.mem.eql(u8, op, "sync")) {
         const refs = remotesync.fetchIndex(a, m.io, cfg) catch {
-            agent.pushInfo(m, "remote: could not fetch the session index");
+            m.pushInfo("remote: could not fetch the session index");
             return;
         };
         defer a.free(refs);
@@ -476,18 +476,18 @@ pub fn cmdRemote(m: *tui.Model, arg: ?[]const u8) void {
         else
             .skip;
         const plan = remote_mod.plan(a, local, refs, policy) catch {
-            agent.pushInfo(m, "remote: out of memory");
+            m.pushInfo("remote: out of memory");
             return;
         };
         defer a.free(plan);
         const result = remotesync.applyPlan(a, m.io, cfg, dir, plan) catch {
-            agent.pushInfo(m, "remote: sync failed");
+            m.pushInfo("remote: sync failed");
             return;
         };
-        agent.pushInfoFmt(m, "remote sync: {d} pulled, {d} pushed, {d} skipped", .{ result.pulled, result.pushed, result.skipped });
+        m.pushInfoFmt("remote sync: {d} pulled, {d} pushed, {d} skipped", .{ result.pulled, result.pushed, result.skipped });
         return;
     }
-    agent.pushInfo(m, "usage: /remote [status | list | pull <id> | push <id> | sync [local|remote]]");
+    m.pushInfo("usage: /remote [status | list | pull <id> | push <id> | sync [local|remote]]");
 }
 
 /// `/plugin`: the declarative plugin marketplace. No code is ever executed —
@@ -502,64 +502,64 @@ pub fn cmdPlugin(m: *tui.Model, arg: ?[]const u8) void {
     if (std.mem.eql(u8, op, "search")) {
         const q = name orelse "";
         const hits = plugins_mod.search(a, q) catch {
-            agent.pushInfo(m, "plugin: out of memory");
+            m.pushInfo("plugin: out of memory");
             return;
         };
         defer a.free(hits);
         if (hits.len == 0) {
-            agent.pushInfoFmt(m, "plugin: no catalog entry matches '{s}'", .{q});
+            m.pushInfoFmt("plugin: no catalog entry matches '{s}'", .{q});
             return;
         }
         for (hits) |i| {
             const e = plugins_mod.catalog[i];
-            agent.pushInfoFmt(m, "  {s} {s} - {s}", .{ e.name, e.version, e.description });
+            m.pushInfoFmt("  {s} {s} - {s}", .{ e.name, e.version, e.description });
         }
         return;
     }
     if (std.mem.eql(u8, op, "list")) {
         const installed = pluginstore.discover(a, m.io, m.environ, root) catch &.{};
         defer if (installed.len > 0) pluginstore.freeInstalled(a, installed);
-        agent.pushInfo(m, "plugin catalog (bundled):");
+        m.pushInfo("plugin catalog (bundled):");
         for (plugins_mod.catalog) |e| {
-            agent.pushInfoFmt(m, "  {s} {s} - {s}", .{ e.name, e.version, e.description });
+            m.pushInfoFmt("  {s} {s} - {s}", .{ e.name, e.version, e.description });
         }
-        agent.pushInfo(m, "installed:");
+        m.pushInfo("installed:");
         if (installed.len == 0) {
-            agent.pushInfo(m, "  (none) - use /plugin install <name>");
+            m.pushInfo("  (none) - use /plugin install <name>");
         }
         for (installed) |it2| {
-            agent.pushInfoFmt(m, "  {s} {s} [{s}] {s}", .{ it2.name, it2.manifest.version, it2.source, if (it2.manifest.enabled) "enabled" else "disabled" });
+            m.pushInfoFmt("  {s} {s} [{s}] {s}", .{ it2.name, it2.manifest.version, it2.source, if (it2.manifest.enabled) "enabled" else "disabled" });
         }
         return;
     }
     const pname = name orelse {
-        agent.pushInfo(m, "usage: /plugin [list | search <q> | install <name> | remove <name> | info <name> | enable <name> | disable <name>]");
+        m.pushInfo("usage: /plugin [list | search <q> | install <name> | remove <name> | info <name> | enable <name> | disable <name>]");
         return;
     };
     if (std.mem.eql(u8, op, "install")) {
         const path = pluginstore.install(a, m.io, root, pname) catch |err| {
-            agent.pushInfoFmt(m, "plugin: install {s} failed ({s})", .{ pname, @errorName(err) });
+            m.pushInfoFmt("plugin: install {s} failed ({s})", .{ pname, @errorName(err) });
             return;
         };
         a.free(path);
-        agent.pushInfoFmt(m, "plugin: installed {s} in {s}/.zode/plugins (instructions now on the prompt)", .{ pname, root });
+        m.pushInfoFmt("plugin: installed {s} in {s}/.zode/plugins (instructions now on the prompt)", .{ pname, root });
         return;
     }
     if (std.mem.eql(u8, op, "remove")) {
         pluginstore.remove(a, m.io, root, pname) catch |err| {
-            agent.pushInfoFmt(m, "plugin: remove {s} failed ({s})", .{ pname, @errorName(err) });
+            m.pushInfoFmt("plugin: remove {s} failed ({s})", .{ pname, @errorName(err) });
             return;
         };
-        agent.pushInfoFmt(m, "plugin: removed {s}", .{pname});
+        m.pushInfoFmt("plugin: removed {s}", .{pname});
         return;
     }
     if (std.mem.eql(u8, op, "info")) {
         const e = plugins_mod.findInCatalog(pname) orelse {
-            agent.pushInfoFmt(m, "plugin: '{s}' is not in the catalog", .{pname});
+            m.pushInfoFmt("plugin: '{s}' is not in the catalog", .{pname});
             return;
         };
-        agent.pushInfoFmt(m, "plugin {s} {s}: {s}", .{ e.name, e.version, e.description });
-        agent.pushInfoFmt(m, "  instructions: {s}", .{e.instructions});
+        m.pushInfoFmt("plugin {s} {s}: {s}", .{ e.name, e.version, e.description });
+        m.pushInfoFmt("  instructions: {s}", .{e.instructions});
         return;
     }
     if (std.mem.eql(u8, op, "enable") or std.mem.eql(u8, op, "disable")) {
@@ -569,17 +569,17 @@ pub fn cmdPlugin(m: *tui.Model, arg: ?[]const u8) void {
         for (installed) |it2| {
             if (std.mem.eql(u8, it2.name, pname)) {
                 pluginstore.setEnabled(a, m.io, it2.path, enabled) catch {
-                    agent.pushInfoFmt(m, "plugin: could not update {s}", .{pname});
+                    m.pushInfoFmt("plugin: could not update {s}", .{pname});
                     return;
                 };
-                agent.pushInfoFmt(m, "plugin: {s} {s}", .{ pname, if (enabled) "enabled" else "disabled" });
+                m.pushInfoFmt("plugin: {s} {s}", .{ pname, if (enabled) "enabled" else "disabled" });
                 return;
             }
         }
-        agent.pushInfoFmt(m, "plugin: '{s}' is not installed", .{pname});
+        m.pushInfoFmt("plugin: '{s}' is not installed", .{pname});
         return;
     }
-    agent.pushInfoFmt(m, "plugin: unknown operation '{s}'", .{op});
+    m.pushInfoFmt("plugin: unknown operation '{s}'", .{op});
 }
 
 /// `/keybinds`: list, set or reset the user's custom key -> command map.
@@ -595,40 +595,40 @@ pub fn cmdKeybinds(m: *tui.Model, arg: ?[]const u8) void {
 
     if (op.len == 0 or std.mem.eql(u8, op, "list")) {
         if (current.len == 0) {
-            agent.pushInfo(m, "keybindings: none (defaults only). Use /keybinds set <key> <command>.");
+            m.pushInfo("keybindings: none (defaults only). Use /keybinds set <key> <command>.");
             return;
         }
         for (current) |b| {
-            agent.pushInfoFmt(m, "{s} -> {s}", .{ b.key, b.command });
+            m.pushInfoFmt("{s} -> {s}", .{ b.key, b.command });
         }
         return;
     }
     if (std.mem.eql(u8, op, "reset")) {
         const obj = std.json.ObjectMap.init(a, &.{}, &.{}) catch return;
         config_mod.patchKeybindings(m.io, m.environ, obj) catch {
-            agent.pushInfo(m, "keybindings: could not write config.json");
+            m.pushInfo("keybindings: could not write config.json");
             return;
         };
         if (current.len > 0) keybinds.freeBindings(a, current);
         m.keybindings = &.{};
-        agent.pushInfo(m, "keybindings: reset to defaults");
+        m.pushInfo("keybindings: reset to defaults");
         return;
     }
     if (std.mem.eql(u8, op, "set")) {
         const key_raw = it.next() orelse {
-            agent.pushInfo(m, "usage: /keybinds set <key> <command>   (e.g. /keybinds set alt+r /review)");
+            m.pushInfo("usage: /keybinds set <key> <command>   (e.g. /keybinds set alt+r /review)");
             return;
         };
         const command = it.rest();
         if (command.len == 0 or command[0] != '/') {
-            agent.pushInfo(m, "keybindings: the command must be a slash command, e.g. /review");
+            m.pushInfo("keybindings: the command must be a slash command, e.g. /review");
             return;
         }
         const key = keybinds.canonicalize(a, key_raw) catch {
-            agent.pushInfo(m, "keybindings: out of memory");
+            m.pushInfo("keybindings: out of memory");
             return;
         } orelse {
-            agent.pushInfoFmt(m, "keybindings: unsupported key '{s}'", .{key_raw});
+            m.pushInfoFmt("keybindings: unsupported key '{s}'", .{key_raw});
             return;
         };
         defer a.free(key);
@@ -652,15 +652,15 @@ pub fn cmdKeybinds(m: *tui.Model, arg: ?[]const u8) void {
             obj.put(a, b.key, .{ .string = b.command }) catch return;
         }
         config_mod.patchKeybindings(m.io, m.environ, obj) catch {
-            agent.pushInfo(m, "keybindings: could not write config.json");
+            m.pushInfo("keybindings: could not write config.json");
             return;
         };
         if (current.len > 0) keybinds.freeBindings(a, current);
         m.keybindings = updated.toOwnedSlice(a) catch &.{};
-        agent.pushInfoFmt(m, "keybindings: {s} -> {s}", .{ key, command });
+        m.pushInfoFmt("keybindings: {s} -> {s}", .{ key, command });
         return;
     }
-    agent.pushInfo(m, "usage: /keybinds [list | set <key> <command> | reset]");
+    m.pushInfo("usage: /keybinds [list | set <key> <command> | reset]");
 }
 
 pub fn cmdVim(m: *tui.Model) void {
@@ -669,9 +669,9 @@ pub fn cmdVim(m: *tui.Model) void {
     m.vim_pending = 0;
     if (m.vim_mode) {
         // Start in insert mode to avoid surprising users mid-typing.
-        agent.pushInfo(m, "vim mode: on (insert). Esc -> normal, i/a/... -> insert. /vim to disable.");
+        m.pushInfo("vim mode: on (insert). Esc -> normal, i/a/... -> insert. /vim to disable.");
     } else {
-        agent.pushInfo(m, "vim mode: off");
+        m.pushInfo("vim mode: off");
     }
 }
 
@@ -682,40 +682,39 @@ pub fn cmdAddDir(m: *tui.Model, arg: ?[]const u8) void {
     const trimmed = if (arg) |a| std.mem.trim(u8, a, " \t\r\n") else "";
     if (trimmed.len == 0) {
         if (m.extra_dirs.items.len == 0) {
-            agent.pushInfo(m, "no additional directories added. usage: /add-dir <path>");
+            m.pushInfo("no additional directories added. usage: /add-dir <path>");
             return;
         }
-        agent.pushInfoOwned(m, gpa.dupe(u8, "additional directories:") catch return);
+        m.pushInfoOwned(gpa.dupe(u8, "additional directories:") catch return);
         for (m.extra_dirs.items) |d| {
-            agent.pushInfoFmt(m, "  - {s}", .{d});
+            m.pushInfoFmt("  - {s}", .{d});
         }
         return;
     }
     // Avoid duplicates.
     for (m.extra_dirs.items) |d| {
         if (std.mem.eql(u8, d, trimmed)) {
-            agent.pushInfoFmt(m, "already added: {s}", .{trimmed});
+            m.pushInfoFmt("already added: {s}", .{trimmed});
             return;
         }
     }
     const copy = gpa.dupe(u8, trimmed) catch {
-        agent.pushError(m, "could not add directory");
+        m.pushError("could not add directory");
         return;
     };
     m.extra_dirs.append(gpa, copy) catch {
         gpa.free(copy);
-        agent.pushError(m, "could not add directory");
+        m.pushError("could not add directory");
         return;
     };
-    agent.pushInfoFmt(m, "added directory: {s}", .{trimmed});
+    m.pushInfoFmt("added directory: {s}", .{trimmed});
 }
 
 /// `/cache`: prompt cache hit-rate of the session.
 pub fn cmdCache(m: *tui.Model) void {
     const gpa = m.allocator;
     const st = &cache_stats.session;
-    agent.pushInfoFmt(
-        m,
+    m.pushInfoFmt(
         // WRITES are in the line because they are the expensive half: a high
         // hit-rate with a write on EVERY request means the prefix is being
         // rebuilt each turn, and no hit-rate alone can reveal that.
@@ -755,7 +754,7 @@ pub fn cmdCache(m: *tui.Model) void {
     // — the one thing the harness can fix (the provider/router it cannot).
     const breaks = agent.cacheBreakCount();
     if (breaks == 0) {
-        agent.pushInfo(m, "prefix: 0 breaks detected — the stable blocks are unchanged between requests");
+        m.pushInfo("prefix: 0 breaks detected — the stable blocks are unchanged between requests");
     } else {
         var line_buf: [512]u8 = undefined;
         var line: std.Io.Writer = .fixed(&line_buf);
@@ -765,9 +764,9 @@ pub fn cmdCache(m: *tui.Model) void {
             if (i > 0) line.writeAll(", ") catch {};
             line.print("{s} @ byte {d}", .{ b.block, b.pos }) catch {};
         }
-        agent.pushInfoOwned(m, gpa.dupe(u8, line.buffered()) catch return);
+        m.pushInfoOwned(gpa.dupe(u8, line.buffered()) catch return);
         if (agent.cacheBreakUnstable()) {
-            agent.pushInfo(m, "prefix writes are frequent (>0.5 per request): a moving block is rebuilt on every turn");
+            m.pushInfo("prefix writes are frequent (>0.5 per request): a moving block is rebuilt on every turn");
         }
     }
 }
@@ -797,8 +796,7 @@ fn formatTokenCount(buf: []u8, value: i64) []const u8 {
 pub fn cmdCost(m: *tui.Model) void {
     const st = agent.cacheSessionStats();
     if (st.requests == 0) {
-        agent.pushInfo(
-            m,
+        m.pushInfo(
             "cost \u{b7} no provider-reported usage yet: a turn has to finish before there are tokens to price.",
         );
         return;
@@ -835,7 +833,7 @@ pub fn cmdCost(m: *tui.Model) void {
         m.pushError("could not build the cost report");
         return;
     };
-    agent.pushInfoOwned(m, text);
+    m.pushInfoOwned(text);
 }
 
 /// The published price of ONE model, from the cached catalogue of a provider that
@@ -1001,7 +999,7 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
             "compaction: {s} · threshold {d}% ({s}) · limit {d} → budget {d} tokens",
             .{ @tagName(eff), pct, from_env, compaction.contextLimitFor(m.environ, agent.curModelContext()), compaction.budgetFor(m.environ, agent.curModelContext()) },
         ) catch "compaction";
-        agent.pushInfoOwned(m, line);
+        m.pushInfoOwned(line);
         const detail = std.fmt.allocPrint(
             m.allocator,
             // The RANGE, not the value: this printed `ZODE_COMPACT_PCT=10%` next to
@@ -1010,13 +1008,13 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
             "  {s} · ZODE_COMPACT_PCT accepts {d}..{d} · ZODE_COMPACT=off|elide|full",
             .{ compaction.describe(eff), compaction.min_target_pct, compaction.max_target_pct },
         ) catch "compaction";
-        agent.pushInfoOwned(m, detail);
+        m.pushInfoOwned(detail);
         return;
     }
 
     if (std.ascii.eqlIgnoreCase(arg, "now")) {
         const s = agent.session orelse {
-            agent.pushInfoOwned(m, "no active session: nothing to compact. Start a chat first.");
+            m.pushInfoOwned("no active session: nothing to compact. Start a chat first.");
             return;
         };
         var astate = std.heap.ArenaAllocator.init(m.allocator);
@@ -1024,14 +1022,14 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
         const arena = astate.allocator();
         const msgs = agent.snapshotMsgs(arena);
         if (msgs.len == 0) {
-            agent.pushInfoOwned(m, "session is empty: nothing to compact.");
+            m.pushInfoOwned("session is empty: nothing to compact.");
             return;
         }
         const budget = compaction.budgetFor(m.environ, agent.curModelContext());
         const chosen_mode = if (m.compact_mode == null) compaction.mode(m.environ) else m.compact_mode.?;
         const comp: compaction.Compacted = compaction.elideTier(arena, msgs, budget, m.environ, agent.curModelContext(), chosen_mode) catch compaction.nothingElided(msgs);
         if (comp.elided == 0 and !comp.needs_summary) {
-            agent.pushInfoOwned(m, std.fmt.allocPrint(m.allocator, "already under budget (est. {d} tokens vs budget {d}). Nothing to compact.", .{ compaction.estimateTokens(msgs), budget }) catch "compaction");
+            m.pushInfoOwned(std.fmt.allocPrint(m.allocator, "already under budget (est. {d} tokens vs budget {d}). Nothing to compact.", .{ compaction.estimateTokens(msgs), budget }) catch "compaction");
             return;
         }
         var applied: usize = 0;
@@ -1047,9 +1045,9 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
             applied += 1;
         }
         agent.session_elided = comp.elided;
-        agent.pushInfoOwned(m, std.fmt.allocPrint(m.allocator, "compacted now: {d} result(s) elided (applied {d}), est. {d} tokens -> budget {d}.", .{ comp.elided, applied, compaction.estimateTokens(comp.msgs), budget }) catch "compaction");
+        m.pushInfoOwned(std.fmt.allocPrint(m.allocator, "compacted now: {d} result(s) elided (applied {d}), est. {d} tokens -> budget {d}.", .{ comp.elided, applied, compaction.estimateTokens(comp.msgs), budget }) catch "compaction");
         if (comp.needs_summary) {
-            agent.pushInfoOwned(m, "after tier-1 elision still over budget: tier-2 (LLM summary) will run on the next turn.");
+            m.pushInfoOwned("after tier-1 elision still over budget: tier-2 (LLM summary) will run on the next turn.");
         }
         return;
     }
@@ -1058,7 +1056,7 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
         m.compact_mode = null;
         const eff = compaction.effectiveMode(m.environ, null);
         const line = std.fmt.allocPrint(m.allocator, "compaction: following ZODE_COMPACT again ({s})", .{@tagName(eff)}) catch "compaction";
-        agent.pushInfoOwned(m, line);
+        m.pushInfoOwned(line);
         return;
     }
 
@@ -1073,7 +1071,7 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
             "unknown compaction mode '{s}': use off | elide | full | now | default (off = never compact, elide = free tier only, full = also summarize)",
             .{arg},
         ) catch "unknown compaction mode";
-        agent.pushInfoOwned(m, line);
+        m.pushInfoOwned(line);
         return;
     };
     m.compact_mode = chosen;
@@ -1082,7 +1080,7 @@ pub fn cmdCompact(m: *tui.Model, arg: []const u8) void {
         "compaction: {s} ({s})",
         .{ @tagName(chosen), compaction.describe(chosen) },
     ) catch "compaction";
-    agent.pushInfoOwned(m, line);
+    m.pushInfoOwned(line);
 }
 
 /// `/goal [text|clear]`: the objective of this turn, which the turn may not stop
@@ -1132,13 +1130,13 @@ pub fn cmdStatus(m: *tui.Model) void {
     var gauge_buf: [64]u8 = undefined;
     const bar = renderProgressBar(@intFromFloat(@min(@as(f64, 100.0), @max(@as(f64, 0.0), pct_used))), &gauge_buf);
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "status  ·  zode {s}", .{build_options.version}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  model:    {s}  (ctx {d})", .{ cur_model, ctx }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  effort:   {s}  ·  style: {s}  ·  view: {s}", .{ effort_label, style, m.view_mode.name() }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  perms:    {s}  ·  api key: {s}", .{ perm, key_state }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  compact:  {s}  ·  limit {d}  ·  budget {d} ({d}%)", .{ @tagName(eff), limit, budget, pct }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  context:  [{s}] ~{d}/{d} ({d:.1}% of limit)", .{ bar, used, limit, pct_used }) catch return);
-    agent.pushInfoOwned(m, "");
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "status  ·  zode {s}", .{build_options.version}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  model:    {s}  (ctx {d})", .{ cur_model, ctx }) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  effort:   {s}  ·  style: {s}  ·  view: {s}", .{ effort_label, style, m.view_mode.name() }) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  perms:    {s}  ·  api key: {s}", .{ perm, key_state }) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  compact:  {s}  ·  limit {d}  ·  budget {d} ({d}%)", .{ @tagName(eff), limit, budget, pct }) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  context:  [{s}] ~{d}/{d} ({d:.1}% of limit)", .{ bar, used, limit, pct_used }) catch return);
+    m.pushInfoOwned("");
 }
 
 /// `/config`: configuration that is actually in effect — env vars, compaction
@@ -1167,24 +1165,24 @@ fn configReport(m: *tui.Model) void {
     const hot_pct = compaction.hotPct(m.environ, ctx);
     const src = compaction.limitSource(m.environ, ctx);
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "config  ·  zode {s}", .{build_options.version}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  limit source:  {s}", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "config  ·  zode {s}", .{build_options.version}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  limit source:  {s}", .{
         switch (src) {
             .model => "the model's own context window",
             .env => "ZODE_CONTEXT_LIMIT",
             .default_ => "the 128k default",
         },
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  limit:         {d} tokens", .{limit}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  budget:        {d} tokens ({d}% of limit)", .{ budget, pct }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  compact:       {s}  ({s})", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  limit:         {d} tokens", .{limit}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  budget:        {d} tokens ({d}% of limit)", .{ budget, pct }) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  compact:       {s}  ({s})", .{
         @tagName(eff),
         if (m.compact_mode == null) "from ZODE_COMPACT" else "overridden with /compact",
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  warm (bg):     {d}%  (ZODE_COMPACT_BG_PCT)", .{bg_pct}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  hot (sync):    {d}%  (ZODE_COMPACT_HOT_PCT)", .{hot_pct}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  recent window: {d} messages  (ZODE_RECENT_WINDOW)", .{compaction.recentWindow(m.environ)}) catch return);
-    agent.pushInfoOwned(m, "");
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  warm (bg):     {d}%  (ZODE_COMPACT_BG_PCT)", .{bg_pct}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  hot (sync):    {d}%  (ZODE_COMPACT_HOT_PCT)", .{hot_pct}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  recent window: {d} messages  (ZODE_RECENT_WINDOW)", .{compaction.recentWindow(m.environ)}) catch return);
+    m.pushInfoOwned("");
 }
 
 // ── interactive Settings screen (Claude-Code-style internal config) ────
@@ -1426,27 +1424,27 @@ pub fn cmdUsage(m: *tui.Model) void {
     var output_buf: [32]u8 = undefined;
     var cached_buf: [32]u8 = undefined;
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "usage  ·  zode {s}", .{build_options.version}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  requests:  {d}", .{requests}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  tokens:    {s} total  (input {s}, output {s})", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "usage  ·  zode {s}", .{build_options.version}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  requests:  {d}", .{requests}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  tokens:    {s} total  (input {s}, output {s})", .{
         formatTokenCount(&total_buf, total),
         formatTokenCount(&input_buf, input),
         formatTokenCount(&output_buf, output),
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  cache:     {s}  {s}  {d:.1}%", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  cache:     {s}  {s}  {d:.1}%", .{
         formatTokenCount(&cached_buf, cached),
         bar,
         hit,
     }) catch return);
     if (m.reads.stats.hits > 0 or m.reads.stats.misses > 0) {
-        agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  read:      {d} re-reads avoided  ·  ~{d} KB", .{
+        m.pushInfoOwned(std.fmt.allocPrint(gpa, "  read:      {d} re-reads avoided  ·  ~{d} KB", .{
             m.reads.stats.hits,
             m.reads.stats.saved / 1024,
         }) catch return);
     }
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  elided:    {d} tool results", .{agent.session_elided}) catch return);
-    agent.pushInfoOwned(m, gpa.dupe(u8, "  next:      /cost per-model  ·  /cache verdict") catch return);
-    agent.pushInfoOwned(m, "");
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  elided:    {d} tool results", .{agent.session_elided}) catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "  next:      /cost per-model  ·  /cache verdict") catch return);
+    m.pushInfoOwned("");
 }
 
 fn usageBar(pct: f64) []const u8 {
@@ -1473,30 +1471,30 @@ pub fn cmdDoctor(m: *tui.Model) void {
     const budget = compaction.budgetFor(m.environ, agent.curModelContext());
     const pct = compaction.targetPct(m.environ);
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "doctor  ·  zode {s}", .{build_options.version}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  mode:      {s}", .{agent.permModeName()}) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  compact:   {s} at {d}% (budget {d} tokens)", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "doctor  ·  zode {s}", .{build_options.version}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  mode:      {s}", .{agent.permModeName()}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  compact:   {s} at {d}% (budget {d} tokens)", .{
         @tagName(eff), pct, budget,
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  flags:     yolo={s}  ·  read-only={s}  ·  accept-edits={s}", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  flags:     yolo={s}  ·  read-only={s}  ·  accept-edits={s}", .{
         if (agent.yolo) "on" else "off",
         if (agent.read_only) "on" else "off",
         if (agent.accept_edits) "on" else "off",
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  api key:   {s} (value never printed)", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  api key:   {s} (value never printed)", .{
         if (agent.api_key_global) |_| "set" else "not set",
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  motion:    {s}  ·  view: {s}  ·  ticks={d}  ·  mascot repaints={d}", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  motion:    {s}  ·  view: {s}  ·  ticks={d}  ·  mascot repaints={d}", .{
         if (m.no_animation) "none" else if (m.reduced_motion) "reduced" else "full",
         m.view_mode.name(),
         m.motion_tick_count,
         m.mascot_motion_repaints,
     }) catch return);
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "  sessions:  dir={s}/  ·  elided this session={d}", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  sessions:  dir={s}/  ·  elided this session={d}", .{
         session_mod.sessions_dir,
         agent.session_elided,
     }) catch return);
-    agent.pushInfoOwned(m, "");
+    m.pushInfoOwned("");
 }
 
 /// Phase 37: `/diag` — internal, millimetre-level runtime control. Reports
@@ -1518,23 +1516,23 @@ pub fn cmdDiag(m: *tui.Model) void {
     const line = diag_mod.formatLine(gpa, cur, growth) catch return;
     defer gpa.free(line);
 
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "diag  ·  zode {s}  ·  pid {d}", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "diag  ·  zode {s}  ·  pid {d}", .{
         build_options.version,
         if (m.io_ready) std.os.linux.getpid() else 0,
     }) catch return);
-    agent.pushInfoFmt(m, "  memory: {s}", .{line});
-    agent.pushInfoFmt(m, "  samples: {d}/{d}  ·  sustained growth (5): {s}", .{
+    m.pushInfoFmt("  memory: {s}", .{line});
+    m.pushInfoFmt("  samples: {d}/{d}  ·  sustained growth (5): {s}", .{
         m.diag_monitor.len,
         diag_mod.max_samples,
         if (m.diag_monitor.growingFor(5)) "YES (possible leak)" else "no",
     });
-    agent.pushInfoFmt(m, "  workers in flight: {d}  ·  subagents {d}/{d}  ·  bg jobs {d}", .{
+    m.pushInfoFmt("  workers in flight: {d}  ·  subagents {d}/{d}  ·  bg jobs {d}", .{
         m.workers.load(.seq_cst),
         m.task_batch_completed,
         m.task_batch_total,
         m.bg.liveCount(),
     });
-    agent.pushInfoFmt(m, "  uptime: {d:.1}s  ·  turns {d}  ·  tool calls {d}", .{
+    m.pushInfoFmt("  uptime: {d:.1}s  ·  turns {d}  ·  tool calls {d}", .{
         @as(f64, @floatFromInt(m.motion_tick_count)) * 0.12,
         m.bench.turns,
         m.bench.tool_calls,
@@ -1547,10 +1545,10 @@ pub fn cmdDiag(m: *tui.Model) void {
         while (it.next()) |ln| {
             if (ln.len > 0) last = ln;
         }
-        agent.pushInfoFmt(m, "  last crash: {s}", .{if (last.len > 0) last else "(empty log)"});
+        m.pushInfoFmt("  last crash: {s}", .{if (last.len > 0) last else "(empty log)"});
     } else |_| {}
-    agent.pushInfo(m, "  tip: ZODE_DBG_BOOT=1 for startup timings · ZODE_EXIT_TRACE=1 for exit state · zig build debug for symbolized crash traces");
-    agent.pushInfo(m, "");
+    m.pushInfo("  tip: ZODE_DBG_BOOT=1 for startup timings · ZODE_EXIT_TRACE=1 for exit state · zig build debug for symbolized crash traces");
+    m.pushInfo("");
 }
 
 pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
@@ -1558,7 +1556,7 @@ pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
 
     if (trimmed.len == 0) {
         if (!m.goal.isSet()) {
-            agent.pushInfoOwned(m, "no goal set. /goal <objective> gives the next turn something it may not stop short of.");
+            m.pushInfoOwned("no goal set. /goal <objective> gives the next turn something it may not stop short of.");
             return;
         }
         const state = switch (m.goal.status) {
@@ -1567,21 +1565,21 @@ pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
             .blocked => "BLOCKED",
         };
         const l1 = std.fmt.allocPrint(m.allocator, "goal ({s}): {s}", .{ state, m.goal.objective() }) catch "goal";
-        agent.pushInfoOwned(m, l1);
+        m.pushInfoOwned(l1);
         if (m.goal.summary_len > 0) {
             const l2 = std.fmt.allocPrint(m.allocator, "  {s}", .{m.goal.say()}) catch "goal";
-            agent.pushInfoOwned(m, l2);
+            m.pushInfoOwned(l2);
         }
         if (m.goal.unblock_len > 0) {
             const l3 = std.fmt.allocPrint(m.allocator, "  would unblock it: {s}", .{m.goal.whatUnblocks()}) catch "goal";
-            agent.pushInfoOwned(m, l3);
+            m.pushInfoOwned(l3);
         }
         const l4 = std.fmt.allocPrint(
             m.allocator,
             "  budget: {d} soft, {d} hard ({d} checkpoints asked) · /goal clear to drop it",
             .{ agent.iterationLimit(), agent.goalHardLimit(), m.goal.checkpoints },
         ) catch "goal";
-        agent.pushInfoOwned(m, l4);
+        m.pushInfoOwned(l4);
         return;
     }
 
@@ -1595,9 +1593,9 @@ pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
         if (agent.session) |ss| ss.setGoalNote(null) catch {};
         if (was.len > 0) {
             const line = std.fmt.allocPrint(m.allocator, "goal cleared ({d} checkpoints, {d} iterations)", .{ m.goal.checkpoints, m.goal.iterations }) catch "goal cleared";
-            agent.pushInfoOwned(m, line);
+            m.pushInfoOwned(line);
         } else {
-            agent.pushInfoOwned(m, "no goal was set");
+            m.pushInfoOwned("no goal was set");
         }
         return;
     }
@@ -1613,7 +1611,7 @@ pub fn cmdGoal(m: *tui.Model, arg: []const u8) void {
         "goal set: {s}\n  the turn may use {d} iterations instead of {d}, and will be asked at {d} whether it is met or blocked. Now type the task.",
         .{ trimmed, agent.goalHardLimit(), agent.iterationLimit(), agent.iterationLimit() },
     ) catch "goal";
-    agent.pushInfoOwned(m, line);
+    m.pushInfoOwned(line);
 }
 
 /// `/init`: analyse the codebase and write AGENTS.md.
@@ -1715,13 +1713,13 @@ pub fn cmdContext(m: *tui.Model) void {
         "context [{s}] ~{d} / {d} tokens ({d:.1}% of limit)",
         .{ gauge_buf[0..gi], used, limit, pct_limit },
     ) catch "context";
-    agent.pushInfoOwned(m, l1);
+    m.pushInfoOwned(l1);
     const l2 = std.fmt.allocPrint(
         m.allocator,
         "  system ~{d} · history ~{d} · {d} turns · budget {d} ({d:.0}% used)",
         .{ sys, hist, turns, budget, pct_budget },
     ) catch "details";
-    agent.pushInfoOwned(m, l2);
+    m.pushInfoOwned(l2);
 
     // 33.10: proportional context breakdown by category.
     var cat_system: i64 = 0;
@@ -1788,7 +1786,7 @@ pub fn cmdContext(m: *tui.Model) void {
         "  breakdown [{s}] sys ~{d} · tools ~{d} · msgs ~{d} · skills ~{d} · reserve ~{d}",
         .{ chart_buf[0..ci], cat_system, cat_tools, cat_messages, cat_skills, cat_reserve },
     ) catch "breakdown";
-    agent.pushInfoOwned(m, l3chart);
+    m.pushInfoOwned(l3chart);
     // WHERE the limit came from, because the number is now an automatic: with a
     // fixed 128k you could not tell "the model has 128k" from "zode is budgeting
     // 128k for a 1M model" from "the catalogue was never downloaded", and all
@@ -1811,7 +1809,7 @@ pub fn cmdContext(m: *tui.Model) void {
             .default_ => "the 128k default (this provider does not publish a window; /model from a catalogue that has one)",
         }, agent.session_elided, agent.tps_last },
     ) catch "details";
-    agent.pushInfoOwned(m, l3);
+    m.pushInfoOwned(l3);
     // The facts block is context too, and it is the part compaction cannot
     // elide: it is re-attached verbatim. Showing the count (and the blockers
     // separately) is how a user knows why the model believes something.
@@ -1822,7 +1820,7 @@ pub fn cmdContext(m: *tui.Model) void {
             "  facts: {d} verified ({d} blocker{s}) · attached after the cached prefix, dropped when a source changes",
             .{ facts_now.len, facts_now.countKind(.blocker), if (facts_now.countKind(.blocker) == 1) "" else "s" },
         ) catch "facts";
-        agent.pushInfoOwned(m, lf);
+        m.pushInfoOwned(lf);
     }
     if (provider_count > 0) {
         const l3c = std.fmt.allocPrint(
@@ -1830,7 +1828,7 @@ pub fn cmdContext(m: *tui.Model) void {
             "  last request: {d} tokens counted by the provider (our estimate: {d})",
             .{ provider_count, used },
         ) catch "details";
-        agent.pushInfoOwned(m, l3c);
+        m.pushInfoOwned(l3c);
     }
     // WHAT WILL HAPPEN at the threshold, which is a different question from how much
     // is used: "80% of the limit" does not say whether crossing it costs a request.
@@ -1843,7 +1841,7 @@ pub fn cmdContext(m: *tui.Model) void {
             if (m.compact_mode == null) "ZODE_COMPACT" else "overridden with /compact",
         },
     ) catch "compaction";
-    agent.pushInfoOwned(m, l3b);
+    m.pushInfoOwned(l3b);
 
     // WHERE THE MEMORY IS, in bytes.
     //
@@ -1871,7 +1869,7 @@ pub fn cmdContext(m: *tui.Model) void {
             ram.read_cache_entries,
         },
     ) catch "details";
-    agent.pushInfoOwned(m, lram);
+    m.pushInfoOwned(lram);
 
     // The read cache, in tokens saved rather than in hits: "it worked" is a number
     // the user can compare against the size of the files they are working with.
@@ -1881,7 +1879,7 @@ pub fn cmdContext(m: *tui.Model) void {
             "  read cache: {d} re-reads avoided · ~{d} KB not re-sent ({d} files still in context)",
             .{ m.reads.stats.hits, m.reads.stats.saved / 1024, m.reads.liveEntries() },
         ) catch "details";
-        agent.pushInfoOwned(m, l4);
+        m.pushInfoOwned(l4);
     }
 
     // Where the tools are actually reading and writing. It is here and not only in
@@ -1889,7 +1887,7 @@ pub fn cmdContext(m: *tui.Model) void {
     // answered by the cwd, and without it the answer is a guess.
     var loc_buf: [std.fs.max_path_bytes]u8 = undefined;
     const loc = agent.project_info.oneLine(&loc_buf);
-    if (loc.len > 0) agent.pushInfoFmt(m, "  {s}", .{loc});
+    if (loc.len > 0) m.pushInfoFmt("  {s}", .{loc});
 
     // Price/usage: what this session has spent, per model, shown next to the
     // token gauge. `/cost` owns the detailed per-model table; this is the
@@ -1910,7 +1908,7 @@ pub fn cmdContext(m: *tui.Model) void {
         }
         const st = agent.cacheSessionStats();
         if (cost_mod.costSummaryText(m.allocator, rows.items, st.requests, st.prompt_tokens)) |text| {
-            agent.pushInfoOwned(m, text);
+            m.pushInfoOwned(text);
         } else |err| {
             m.pushErrorFmt("could not build the cost summary: {s}", .{@errorName(err)});
         }
@@ -1925,7 +1923,7 @@ pub fn cmdContext(m: *tui.Model) void {
 /// from other projects never leak into this project's list.
 pub fn cmdSession(m: *tui.Model) void {
     if (!m.io_ready) {
-        agent.pushInfo(m, "session: I/O not ready");
+        m.pushInfo("session: I/O not ready");
         return;
     }
     const gpa = m.allocator;
@@ -1946,7 +1944,7 @@ pub fn cmdSession(m: *tui.Model) void {
     }
 
     if (owned_count == 0) {
-        agent.pushInfo(m, "no sessions in this project yet");
+        m.pushInfo("no sessions in this project yet");
         return;
     }
 
@@ -1973,7 +1971,7 @@ pub fn cmdSession(m: *tui.Model) void {
     m.session_picker_paths = .empty;
 
     const owned = gpa.alloc(sessionindex.Entry, owned_count) catch {
-        agent.pushInfo(m, "cannot open session picker");
+        m.pushInfo("cannot open session picker");
         return;
     };
     defer gpa.free(owned);
@@ -2017,7 +2015,7 @@ pub fn cmdSession(m: *tui.Model) void {
     const owned_len = idx;
 
     const items = gpa.alloc(tui.PickerItem, owned_len) catch {
-        agent.pushInfo(m, "cannot open session picker");
+        m.pushInfo("cannot open session picker");
         return;
     };
 
@@ -2074,12 +2072,12 @@ pub fn cmdSession(m: *tui.Model) void {
 /// shown as `#tag` in the session picker. Persisted to the Meta sidecar.
 pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
     const name = arg orelse {
-        agent.pushInfo(m, "usage: /rename <title> | /rename #tag | /rename <title> #tag");
+        m.pushInfo("usage: /rename <title> | /rename #tag | /rename <title> #tag");
         return;
     };
     const trimmed = std.mem.trim(u8, name, " \t\r\n");
     if (trimmed.len == 0) {
-        agent.pushInfo(m, "rename: empty name");
+        m.pushInfo("rename: empty name");
         return;
     }
 
@@ -2105,43 +2103,43 @@ pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
 
     if (new_title) |t| {
         if (t.len == 0) {
-            agent.pushInfo(m, "rename: empty title");
+            m.pushInfo("rename: empty title");
             return;
         }
         if (t.len > 64) {
-            agent.pushInfo(m, "rename: title too long (max 64 chars)");
+            m.pushInfo("rename: title too long (max 64 chars)");
             return;
         }
     }
     if (new_tag) |t| {
         if (t.len > 32) {
-            agent.pushInfo(m, "rename: tag too long (max 32 chars)");
+            m.pushInfo("rename: tag too long (max 32 chars)");
             return;
         }
     }
 
     const s = agent.session orelse {
-        agent.pushInfo(m, "no session to rename");
+        m.pushInfo("no session to rename");
         return;
     };
 
     if (new_title) |t| {
         if (s.custom_title.len > 0) s.allocator.free(s.custom_title);
         s.custom_title = s.allocator.dupe(u8, t) catch {
-            agent.pushInfo(m, "rename: out of memory");
+            m.pushInfo("rename: out of memory");
             return;
         };
     }
     if (new_tag) |t| {
         if (s.tag.len > 0) s.allocator.free(s.tag);
         s.tag = if (t.len == 0) "" else (s.allocator.dupe(u8, t) catch {
-            agent.pushInfo(m, "rename: out of memory");
+            m.pushInfo("rename: out of memory");
             return;
         });
     }
 
     if (!m.io_ready) {
-        agent.pushInfo(m, "renamed (I/O not ready to save)");
+        m.pushInfo("renamed (I/O not ready to save)");
         return;
     }
 
@@ -2150,7 +2148,7 @@ pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
     const arena = arena_state.allocator();
 
     const path = s.path orelse {
-        agent.pushInfo(m, "rename: session has no path");
+        m.pushInfo("rename: session has no path");
         return;
     };
     const meta = sessionindex.readMeta(arena, agent.io_global, path);
@@ -2168,21 +2166,21 @@ pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
         .permissions_asked = meta.permissions_asked,
         .escs = meta.escs,
     }) catch |err| {
-        agent.pushInfoFmt(m, "rename: could not save: {s}", .{@errorName(err)});
+        m.pushInfoFmt("rename: could not save: {s}", .{@errorName(err)});
         return;
     };
 
     if (new_title != null and new_tag != null) {
         if (s.tag.len > 0)
-            agent.pushInfoFmt(m, "renamed to \"{s}\" #{s}", .{ s.custom_title, s.tag })
+            m.pushInfoFmt("renamed to \"{s}\" #{s}", .{ s.custom_title, s.tag })
         else
-            agent.pushInfoFmt(m, "renamed to \"{s}\"", .{s.custom_title});
+            m.pushInfoFmt("renamed to \"{s}\"", .{s.custom_title});
     } else if (new_title != null) {
-        agent.pushInfoFmt(m, "renamed to \"{s}\"", .{s.custom_title});
+        m.pushInfoFmt("renamed to \"{s}\"", .{s.custom_title});
     } else if (s.tag.len > 0) {
-        agent.pushInfoFmt(m, "session tag set to #{s}", .{s.tag});
+        m.pushInfoFmt("session tag set to #{s}", .{s.tag});
     } else {
-        agent.pushInfo(m, "session tag cleared");
+        m.pushInfo("session tag cleared");
     }
 }
 
@@ -2248,7 +2246,7 @@ pub fn cmdFiles(m: *tui.Model) void {
     const stats = filesview.Stats{ .hits = rc.hits, .misses = rc.misses, .saved = rc.saved };
     report.bash_may_write = m.bash_may_write;
     const text = report.finish(stats, m.changed.dropped) catch return;
-    agent.pushInfoOwned(m, text);
+    m.pushInfoOwned(text);
     // Turn-scoped honest net diff summary (real baseline->after stats).
     m.pushTurnFileSummary();
 }
@@ -2281,9 +2279,9 @@ pub fn cmdTasks(m: *tui.Model) void {
     const st = &m.tasks;
     if (st.count() == 0) {
         if (st.fresh_after_corrupt) {
-            agent.pushInfo(m, "tasks · no tasks (saved task list could not be read and was started fresh)");
+            m.pushInfo("tasks · no tasks (saved task list could not be read and was started fresh)");
         } else {
-            agent.pushInfo(m, "tasks · no tasks yet. Use task_create to add the first one.");
+            m.pushInfo("tasks · no tasks yet. Use task_create to add the first one.");
         }
         return;
     }
@@ -2395,7 +2393,7 @@ pub fn cmdTasks(m: *tui.Model) void {
 
     const text = out.written();
     const owned = m.allocator.dupe(u8, text) catch return;
-    agent.pushInfoOwned(m, owned);
+    m.pushInfoOwned(owned);
 }
 
 /// `/inspect [context|git|session]`: read-only workbench inspector (Phase 5).
@@ -2414,24 +2412,24 @@ pub fn cmdInspect(m: *tui.Model, arg: ?[]const u8) void {
     if (std.ascii.eqlIgnoreCase(a, "session")) {
         if (agent.session) |s| {
             const id = if (s.path) |p| std.fs.path.basename(p) else "(no path)";
-            agent.pushInfoFmt(m, "Inspect  ·  Session  {s}", .{id});
-            if (s.custom_title.len > 0) agent.pushInfoFmt(m, "  Title  {s}", .{s.custom_title});
-            agent.pushInfoFmt(m, "  Messages  {d}", .{s.messages.items.len});
-            agent.pushInfo(m, "  Details  /session, /resume, /rename");
+            m.pushInfoFmt("Inspect  ·  Session  {s}", .{id});
+            if (s.custom_title.len > 0) m.pushInfoFmt("  Title  {s}", .{s.custom_title});
+            m.pushInfoFmt("  Messages  {d}", .{s.messages.items.len});
+            m.pushInfo("  Details  /session, /resume, /rename");
         } else {
-            agent.pushInfo(m, "Inspect  ·  Session  none active (/session, /resume)");
+            m.pushInfo("Inspect  ·  Session  none active (/session, /resume)");
         }
         return;
     }
     if (a.len > 0) {
-        agent.pushInfo(m, "usage: /inspect | /inspect context|git|session");
+        m.pushInfo("usage: /inspect | /inspect context|git|session");
         return;
     }
 
     // Unified workbench overview (runtime-truth only).
-    agent.pushInfoOwned(m, std.fmt.allocPrint(gpa, "Inspect  ·  Workbench overview  (zode {s})", .{build_options.version}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "Inspect  ·  Workbench overview  (zode {s})", .{build_options.version}) catch return);
     const motion: []const u8 = if (m.no_animation) "none" else if (m.reduced_motion) "reduced" else "full";
-    agent.pushInfoFmt(m, "  Model  {s}  ·  Perms  {s}  ·  Motion  {s}  ·  View  {s}", .{ agent.curModel(), agent.permModeName(), motion, m.view_mode.name() });
+    m.pushInfoFmt("  Model  {s}  ·  Perms  {s}  ·  Motion  {s}  ·  View  {s}", .{ agent.curModel(), agent.permModeName(), motion, m.view_mode.name() });
 
     // Context (honest estimate, same basis as /context).
     _ = agent.ensureSession(m, gpa);
@@ -2442,7 +2440,7 @@ pub fn cmdInspect(m: *tui.Model, arg: ?[]const u8) void {
     const limit = compaction.contextLimitFor(m.environ, agent.curModelContext());
     const budget = compaction.budgetFor(m.environ, agent.curModelContext());
     const pct = if (limit > 0) @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(limit)) * 100.0 else 0.0;
-    agent.pushInfoFmt(m, "  Context  ~{d}/{d} tokens ({d:.1}%)  ·  budget {d}  ·  {d} turn(s)", .{
+    m.pushInfoFmt("  Context  ~{d}/{d} tokens ({d:.1}%)  ·  budget {d}  ·  {d} turn(s)", .{
         used, limit, pct, budget, if (msgs.len > 0) msgs.len - 1 else 0,
     });
 
@@ -2464,28 +2462,28 @@ pub fn cmdInspect(m: *tui.Model, arg: ?[]const u8) void {
                 }
             }
             if (changes == 0)
-                agent.pushInfoFmt(m, "  Git  {s}  ·  clean", .{bt})
+                m.pushInfoFmt("  Git  {s}  ·  clean", .{bt})
             else
-                agent.pushInfoFmt(m, "  Git  {s}  ·  {d} changed path(s)", .{ bt, changes });
+                m.pushInfoFmt("  Git  {s}  ·  {d} changed path(s)", .{ bt, changes });
         } else {
-            agent.pushInfo(m, "  Git  not a repository (or git unavailable)");
+            m.pushInfo("  Git  not a repository (or git unavailable)");
         }
     } else {
-        agent.pushInfo(m, "  Git  (I/O not ready)");
+        m.pushInfo("  Git  (I/O not ready)");
     }
 
     // Session/file focus (honest).
     if (agent.session) |s| {
         const id = if (s.path) |p| std.fs.path.basename(p) else "(active)";
-        agent.pushInfoFmt(m, "  Session  {s}", .{id});
+        m.pushInfoFmt("  Session  {s}", .{id});
     }
-    if (m.lastChangedFile()) |p| agent.pushInfoFmt(m, "  File  last changed  {s}", .{p});
+    if (m.lastChangedFile()) |p| m.pushInfoFmt("  File  last changed  {s}", .{p});
 
     switch (m.view_mode) {
-        .review => agent.pushInfo(m, "  Details  /diff /hunk /files /file /code-review /git  ·  /context /status /session"),
-        .flow => agent.pushInfo(m, "  Details  /context /status /session  ·  /git /diff /files"),
-        .focus => agent.pushInfo(m, "  Details  /status /context /session (focus view; runtime state unchanged)"),
-        .normal => agent.pushInfo(m, "  Details  /context /status /config /usage /cache /doctor /git /diff /files /session"),
+        .review => m.pushInfo("  Details  /diff /hunk /files /file /code-review /git  ·  /context /status /session"),
+        .flow => m.pushInfo("  Details  /context /status /session  ·  /git /diff /files"),
+        .focus => m.pushInfo("  Details  /status /context /session (focus view; runtime state unchanged)"),
+        .normal => m.pushInfo("  Details  /context /status /config /usage /cache /doctor /git /diff /files /session"),
     }
 }
 
@@ -2494,8 +2492,8 @@ pub fn cmdInspect(m: *tui.Model, arg: ?[]const u8) void {
 pub fn cmdView(m: *tui.Model, arg: ?[]const u8) void {
     const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
     if (a.len == 0) {
-        agent.pushInfoFmt(m, "View mode: {s}  ·  {s}", .{ m.view_mode.name(), m.view_mode.desc() });
-        agent.pushInfo(m, "  usage: /view normal|focus|flow|review");
+        m.pushInfoFmt("View mode: {s}  ·  {s}", .{ m.view_mode.name(), m.view_mode.desc() });
+        m.pushInfo("  usage: /view normal|focus|flow|review");
         return;
     }
     const mode: tui.ViewMode = if (std.ascii.eqlIgnoreCase(a, "normal") or std.ascii.eqlIgnoreCase(a, "off"))
@@ -2507,12 +2505,12 @@ pub fn cmdView(m: *tui.Model, arg: ?[]const u8) void {
     else if (std.ascii.eqlIgnoreCase(a, "review"))
         .review
     else {
-        agent.pushInfo(m, "usage: /view normal|focus|flow|review");
+        m.pushInfo("usage: /view normal|focus|flow|review");
         return;
     };
     m.view_mode = mode;
     m.redraw_requested.store(true, .seq_cst);
-    agent.pushInfoFmt(m, "View mode: {s}  ·  {s}", .{ mode.name(), mode.desc() });
+    m.pushInfoFmt("View mode: {s}  ·  {s}", .{ mode.name(), mode.desc() });
 }
 
 /// `/github`: GitHub integration status and context (local, read-only).
@@ -2521,7 +2519,7 @@ pub fn cmdView(m: *tui.Model, arg: ?[]const u8) void {
 pub fn cmdGithub(m: *tui.Model, arg: ?[]const u8) void {
     const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
     if (a.len > 0 and !std.ascii.eqlIgnoreCase(a, "status") and !std.ascii.eqlIgnoreCase(a, "help")) {
-        agent.pushInfo(m, "usage: /github [status|help]");
+        m.pushInfo("usage: /github [status|help]");
         return;
     }
 
@@ -2564,14 +2562,14 @@ pub fn cmdGithub(m: *tui.Model, arg: ?[]const u8) void {
     }
 
     const owned = m.allocator.dupe(u8, std.mem.trimEnd(u8, out.items, "\n")) catch return;
-    agent.pushInfoOwned(m, owned);
+    m.pushInfoOwned(owned);
 }
 
 /// `/git`: read-only Git overview (Phase 5 foundation). No destructive actions.
 pub fn cmdGit(m: *tui.Model, arg: ?[]const u8) void {
     const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
     if (a.len > 0) {
-        agent.pushInfo(m, "usage: /git (read-only overview: branch, status, recent commits)");
+        m.pushInfo("usage: /git (read-only overview: branch, status, recent commits)");
         return;
     }
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -2583,7 +2581,7 @@ pub fn cmdGit(m: *tui.Model, arg: ?[]const u8) void {
     const log = runGitCapture(arena, &.{ "git", "--no-optional-locks", "log", "--oneline", "-n", "5", "--decorate" }, 16 * 1024);
 
     if (branch == null and status == null and log == null) {
-        agent.pushInfo(m, "Git: not a repository (or git is not available)");
+        m.pushInfo("Git: not a repository (or git is not available)");
         return;
     }
 
@@ -2624,7 +2622,7 @@ pub fn cmdGit(m: *tui.Model, arg: ?[]const u8) void {
     }
     out.appendSlice(m.allocator, "  Actions  /diff (changes), /code-review (read-only analysis). No destructive git actions.") catch {};
     const owned = m.allocator.dupe(u8, std.mem.trimEnd(u8, out.items, "\n")) catch return;
-    agent.pushInfoOwned(m, owned);
+    m.pushInfoOwned(owned);
 }
 
 pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
@@ -2638,11 +2636,11 @@ pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
         return;
     }
     if (std.mem.eql(u8, a, "view") or std.mem.eql(u8, a, "viewer") or std.mem.eql(u8, a, "modal")) {
-        if (!m.openDiffViewer()) agent.pushInfo(m, "diff: no changed-file diffs to view in this session");
+        if (!m.openDiffViewer()) m.pushInfo("diff: no changed-file diffs to view in this session");
         return;
     }
     if (a.len > 0) {
-        agent.pushInfo(m, "usage: /diff | /diff next|prev|view");
+        m.pushInfo("usage: /diff | /diff next|prev|view");
         return;
     }
     var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -2650,7 +2648,7 @@ pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
     const arena = arena_state.allocator();
 
     const status = runGitCapture(arena, &.{ "git", "--no-optional-locks", "-c", "core.quotepath=false", "status", "--short", "--branch" }, 64 * 1024) orelse {
-        agent.pushInfo(m, "diff: not a git repository (or git is not available)");
+        m.pushInfo("diff: not a git repository (or git is not available)");
         return;
     };
 
@@ -2665,12 +2663,12 @@ pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
         header.appendSlice(m.allocator, "\nworking tree clean (nothing staged or modified).") catch return;
     }
     const header_owned = m.allocator.dupe(u8, header.items) catch return;
-    agent.pushInfoOwned(m, header_owned);
+    m.pushInfoOwned(header_owned);
 
     if (runGitCapture(arena, &.{ "git", "--no-optional-locks", "-c", "core.quotepath=false", "diff", "--no-color", "-U3", "HEAD" }, 512 * 1024)) |diff| {
         const trimmed = std.mem.trim(u8, diff, " \t\r\n");
         if (trimmed.len > 0) {
-            agent.pushInfo(m, "uncommitted (vs HEAD):");
+            m.pushInfo("uncommitted (vs HEAD):");
             m.pushKind(md.Kind.diff, trimmed);
         }
     }
@@ -2684,10 +2682,10 @@ pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
         if (runGitCapture(arena, argv.items, 512 * 1024)) |tdiff| {
             const ttrim = std.mem.trim(u8, tdiff, " \t\r\n");
             if (ttrim.len > 0) {
-                agent.pushInfoFmt(m, "files  ·  this turn vs HEAD  ·  {d} file(s)", .{turn_files.len});
+                m.pushInfoFmt("files  ·  this turn vs HEAD  ·  {d} file(s)", .{turn_files.len});
                 m.pushKind(md.Kind.diff, ttrim);
             } else {
-                agent.pushInfoFmt(m, "files  ·  this turn  ·  {d} file(s) touched, diff vs HEAD is empty", .{turn_files.len});
+                m.pushInfoFmt("files  ·  this turn  ·  {d} file(s) touched, diff vs HEAD is empty", .{turn_files.len});
             }
         }
     }
@@ -2706,7 +2704,7 @@ pub fn cmdProviders(m: *tui.Model) void {
             "{s:<11} {s} ({s}){s}  {s}",
             .{ d.id, d.name, key_state, active, d.note },
         ) catch "provider";
-        agent.pushInfoOwned(m, line);
+        m.pushInfoOwned(line);
     }
 }
 
@@ -3023,7 +3021,7 @@ pub fn cmdHunk(m: *tui.Model, arg: ?[]const u8) void {
         _ = m.navigateLastDiffHunk(-1);
         return;
     }
-    agent.pushInfo(m, "usage: /hunk next|prev (also alt+] / alt+[ on the last diff)");
+    m.pushInfo("usage: /hunk next|prev (also alt+] / alt+[ on the last diff)");
 }
 
 /// `/file [copy|path|next|prev|open]`: last changed file (Phase 2/3, honest structured state).
@@ -3044,10 +3042,10 @@ pub fn cmdFile(m: *tui.Model, arg: ?[]const u8) void {
     if (std.mem.eql(u8, a, "show") or std.mem.eql(u8, a, "go") or std.mem.eql(u8, a, "current")) {
         if (m.showFocusedFileIntel()) return;
         const path = m.focusedFilePath() orelse m.lastChangedFile() orelse {
-            agent.pushInfo(m, "file: no changed files in this session");
+            m.pushInfo("file: no changed files in this session");
             return;
         };
-        agent.pushInfoFmt(m, "file: {s}", .{path});
+        m.pushInfoFmt("file: {s}", .{path});
         return;
     }
     if (std.mem.eql(u8, a, "list") or std.mem.eql(u8, a, "ls")) {
@@ -3055,28 +3053,28 @@ pub fn cmdFile(m: *tui.Model, arg: ?[]const u8) void {
         return;
     }
     const path = m.focusedFilePath() orelse m.lastChangedFile() orelse {
-        agent.pushInfo(m, "file: no changed files in this session");
+        m.pushInfo("file: no changed files in this session");
         return;
     };
     if (std.mem.eql(u8, a, "copy") or std.mem.eql(u8, a, "path")) {
         m.setCopyPending(path);
-        agent.pushInfoFmt(m, "file: copied path  {s}", .{path});
+        m.pushInfoFmt("file: copied path  {s}", .{path});
         return;
     }
     if (std.mem.eql(u8, a, "open") or std.mem.eql(u8, a, "edit")) {
         m.setCopyPending(path);
-        agent.pushInfoFmt(m, "file: {s}", .{path});
-        agent.pushInfo(m, "open: path copied to clipboard. Run $VISUAL/$EDITOR outside the TUI (in-TUI spawn is deferred).");
+        m.pushInfoFmt("file: {s}", .{path});
+        m.pushInfo("open: path copied to clipboard. Run $VISUAL/$EDITOR outside the TUI (in-TUI spawn is deferred).");
         return;
     }
     if (a.len > 0) {
-        agent.pushInfo(m, "usage: /file [list|show|next|prev|copy|path|open]");
+        m.pushInfo("usage: /file [list|show|next|prev|copy|path|open]");
         return;
     }
     // Show/jump to focused file intelligence entry when available.
     if (m.showFocusedFileIntel()) return;
-    agent.pushInfoFmt(m, "file: {s}", .{path});
-    agent.pushInfo(m, "actions: /file list|next|prev · /file copy|open · /diff · /hunk next|prev");
+    m.pushInfoFmt("file: {s}", .{path});
+    m.pushInfo("actions: /file list|next|prev · /file copy|open · /diff · /hunk next|prev");
 }
 
 test "/diff command is dispatched" {
@@ -3195,20 +3193,20 @@ pub fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
         const off = std.ascii.eqlIgnoreCase(a, "off") or std.ascii.eqlIgnoreCase(a, "0");
         if (on) {
             agent.setPermMode(m, .read_only);
-            agent.pushInfo(m, "Plan mode ON: investigate first; writes are blocked pending approval.");
+            m.pushInfo("Plan mode ON: investigate first; writes are blocked pending approval.");
             return;
         }
         if (off) {
             agent.setPermMode(m, .default);
-            agent.pushInfo(m, "Build mode ON");
+            m.pushInfo("Build mode ON");
             return;
         }
-        agent.pushInfoFmt(m, "/ask: on|off (it is {s})", .{if (agent.read_only) "on" else "off"});
+        m.pushInfoFmt("/ask: on|off (it is {s})", .{if (agent.read_only) "on" else "off"});
         return;
     }
     const next: agent.PermMode = if (agent.read_only) .default else .read_only;
     agent.setPermMode(m, next);
-    agent.pushInfoFmt(m, "permission mode: {s}", .{agent.permModeName()});
+    m.pushInfoFmt("permission mode: {s}", .{agent.permModeName()});
 }
 
 pub fn cmdDots(m: *tui.Model, arg: ?[]const u8) void {
@@ -3218,7 +3216,7 @@ pub fn cmdDots(m: *tui.Model, arg: ?[]const u8) void {
         if (on) {
             m.show_prompt_dots = true;
             m.requestRedraw();
-            agent.pushInfo(m, "prompt dots: on — click a dot on the right rail to jump to that prompt");
+            m.pushInfo("prompt dots: on — click a dot on the right rail to jump to that prompt");
             return;
         }
         if (off) {
@@ -3226,10 +3224,10 @@ pub fn cmdDots(m: *tui.Model, arg: ?[]const u8) void {
             m.prompt_dot_hover = null;
             m.prompt_dot_len = 0;
             m.requestRedraw();
-            agent.pushInfo(m, "prompt dots: off");
+            m.pushInfo("prompt dots: off");
             return;
         }
-        agent.pushInfo(m, "/dots: on|off");
+        m.pushInfo("/dots: on|off");
         return;
     }
     m.show_prompt_dots = !m.show_prompt_dots;
@@ -3238,7 +3236,7 @@ pub fn cmdDots(m: *tui.Model, arg: ?[]const u8) void {
         m.prompt_dot_len = 0;
     }
     m.requestRedraw();
-    agent.pushInfoFmt(m, "prompt dots: {s}", .{if (m.show_prompt_dots) "on" else "off"});
+    m.pushInfoFmt("prompt dots: {s}", .{if (m.show_prompt_dots) "on" else "off"});
 }
 
 pub fn cmdYolo(m: *tui.Model) void {
@@ -3247,21 +3245,20 @@ pub fn cmdYolo(m: *tui.Model) void {
         "yolo ON: no confirmations, and no questions (your questions are answered for you and said in the summary)"
     else
         "yolo OFF: asks for permission";
-    agent.pushInfo(m, msg);
+    m.pushInfo(msg);
 }
 
 pub fn cmdBench(m: *tui.Model) void {
     var buf: [1024]u8 = undefined;
     const text = m.bench.report(&buf, agent.iterationLimit(), agent.cacheHitPct()) catch {
-        agent.pushInfo(m, "/bench: could not compose the report");
+        m.pushInfo("/bench: could not compose the report");
         return;
     };
-    agent.pushInfo(m, text);
+    m.pushInfo(text);
 
     const cs = agent.cheapRouterStats();
     if (cs.on) {
-        agent.pushInfoFmt(
-            m,
+        m.pushInfoFmt(
             "cheap router: {s} · {d} turn(s) sent to it · {d} fell back{s}",
             .{
                 cs.model,
@@ -3284,23 +3281,23 @@ pub fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
         const mode = agent.parsePermMode(a);
         if (mode) |mm| {
             agent.setPermMode(m, mm);
-            agent.pushInfoFmt(m, "permission mode: {s}", .{agent.permModeName()});
+            m.pushInfoFmt("permission mode: {s}", .{agent.permModeName()});
             return;
         }
-        agent.pushInfo(m, "/mode: build|accept-edits|plan|bypass");
+        m.pushInfo("/mode: build|accept-edits|plan|bypass");
         return;
     }
-    agent.pushInfoFmt(m, "permission mode: {s} (shift+tab cycles)", .{agent.permModeName()});
+    m.pushInfoFmt("permission mode: {s} (shift+tab cycles)", .{agent.permModeName()});
 }
 
 /// `/skills`: what is loadable, and from where.
 pub fn cmdSkills(m: *tui.Model) void {
     const entries = agent.discoverSkills(m.allocator, m.environ);
     if (entries.len == 0) {
-        agent.pushInfo(m, "no skills found. Put them in .zode/skills/<name>/SKILL.md (this project) or ~/.config/zode/skills/<name>/SKILL.md (yours)");
+        m.pushInfo("no skills found. Put them in .zode/skills/<name>/SKILL.md (this project) or ~/.config/zode/skills/<name>/SKILL.md (yours)");
         return;
     }
-    agent.pushInfoFmt(m, "{d} skill{s} (only the name and description are in the prompt; the body loads on demand)", .{
+    m.pushInfoFmt("{d} skill{s} (only the name and description are in the prompt; the body loads on demand)", .{
         entries.len,
         if (entries.len == 1) @as([]const u8, "") else @as([]const u8, "s"),
     });
@@ -3320,7 +3317,7 @@ pub fn cmdSkills(m: *tui.Model) void {
             else
                 "",
         }) catch continue;
-        agent.pushInfoOwned(m, line);
+        m.pushInfoOwned(line);
     }
 }
 
@@ -3352,7 +3349,7 @@ pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
                 m.pushInfoFmt("output style: {s} (not found — was it removed?)", .{name});
             }
         } else {
-            agent.pushInfo(m, "no output style selected. /style <name> picks one; /style off clears it.");
+            m.pushInfo("no output style selected. /style <name> picks one; /style off clears it.");
         }
         return;
     }
@@ -3362,7 +3359,7 @@ pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
         agent.current_style_len = 0;
         agent.terse_tools = false;
         persistSettings(m); // /style is a persisted setting, not a per-session whim
-        agent.pushInfo(m, "output style cleared. The base prompt (with coding rules) is used.");
+        m.pushInfo("output style cleared. The base prompt (with coding rules) is used.");
         return;
     }
 
@@ -3379,7 +3376,7 @@ pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
         }
     }
     if (found == null) {
-        agent.pushInfoFmt(m, "unknown output style '{s}'. Available: {s}", .{
+        m.pushInfoFmt("unknown output style '{s}'. Available: {s}", .{
             trimmed,
             if (entries.len > 0) agent.styleNames(entries) else "none",
         });
@@ -3395,7 +3392,7 @@ pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
 
     const keep_note = if (found_keep) "" else " — this style replaces the coding rules";
     const terse_note = if (found_terse) " — terse tool schemas (rules restated in this style)" else "";
-    agent.pushInfoFmt(m, "output style: {s}{s}{s}", .{ trimmed, keep_note, terse_note });
+    m.pushInfoFmt("output style: {s}{s}{s}", .{ trimmed, keep_note, terse_note });
 }
 
 pub fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
@@ -3491,7 +3488,7 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
         .roots = .{ .sessions = "sessions", .instances = inst, .config = cfg, .worktrees = wt_root },
         .now_secs = now_secs,
     }) catch {
-        agent.pushInfo(m, "/clean: could not read the directories");
+        m.pushInfo("/clean: could not read the directories");
         return;
     };
     defer rep.deinit();
@@ -3500,10 +3497,10 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
         "/clean: applied"
     else
         "/clean: dry run (nothing deleted)";
-    agent.pushInfo(m, header);
+    m.pushInfo(header);
 
     if (rep.missing_sessions) {
-        agent.pushInfo(m, "  no sessions/ directory here (nothing to clean in it)");
+        m.pushInfo("  no sessions/ directory here (nothing to clean in it)");
     }
 
     const order = [_]clean_mod.Bucket{ .empty_session, .own_temp, .stale_instance, .old_session, .worktree };
@@ -3515,18 +3512,18 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
             b.label(),
             if (b == .old_session) "kept, delete with find sessions/ -mtime +30d" else b.rootHint(),
         }) catch continue;
-        agent.pushInfoOwned(m, line);
+        m.pushInfoOwned(line);
     }
 
     if (rep.items.len == 0 and !rep.missing_sessions) {
-        agent.pushInfo(m, "  nothing to clean");
+        m.pushInfo("  nothing to clean");
         return;
     }
 
     if (!aplicar) {
         const total = rep.deletable();
         if (total == 0) {
-            agent.pushInfo(m, "  nothing to delete without a yes");
+            m.pushInfo("  nothing to delete without a yes");
             return;
         }
         const line = std.fmt.allocPrint(
@@ -3534,7 +3531,7 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
             "  -> {d} files, {d} bytes. run `/clean yes` to delete them",
             .{ total, rep.bytes() },
         ) catch return;
-        agent.pushInfoOwned(m, line);
+        m.pushInfoOwned(line);
         return;
     }
 
@@ -3565,7 +3562,7 @@ pub fn cmdUndo(m: *tui.Model, arg: ?[]const u8) void {
     if (!confirmed and !agent.yolo) {
         const cp = m.checkpoints.last();
         if (cp == null) {
-            agent.pushInfo(m, "nothing to undo: no turn has changed any file yet");
+            m.pushInfo("nothing to undo: no turn has changed any file yet");
             return;
         }
         var buf: [1024]u8 = undefined;
@@ -3575,11 +3572,11 @@ pub fn cmdUndo(m: *tui.Model, arg: ?[]const u8) void {
             w.print("  {s}{s}\n", .{ if (f.existed) "" else "new: ", f.pathOf() }) catch {};
         }
         w.writeAll("use /undo yes to apply") catch {};
-        agent.pushInfo(m, w.buffered());
+        m.pushInfo(w.buffered());
         return;
     }
     var cp = m.takeCheckpointOwned() orelse {
-        agent.pushInfo(m, "nothing to undo: no turn has changed any file yet");
+        m.pushInfo("nothing to undo: no turn has changed any file yet");
         return;
     };
     // The snapshots are the caller's memory now (see `takeCheckpointOwned`):
@@ -3695,13 +3692,13 @@ fn collectAssistantTexts(s: *session_mod.Session, out: *[copytext.max_lookback][
 pub fn cmdBtw(m: *tui.Model, arg: ?[]const u8) void {
     const question = std.mem.trim(u8, arg orelse "", " \t\r\n");
     if (question.len == 0) {
-        agent.pushInfo(m, "usage: /btw <question>");
+        m.pushInfo("usage: /btw <question>");
         return;
     }
 
     const gpa = m.allocator;
     const owned = gpa.dupe(u8, question) catch {
-        agent.pushInfo(m, "btw: could not allocate the question");
+        m.pushInfo("btw: could not allocate the question");
         return;
     };
 
@@ -3745,7 +3742,7 @@ pub fn cmdBtw(m: *tui.Model, arg: ?[]const u8) void {
 
     const job = gpa.create(Job) catch {
         gpa.free(owned);
-        agent.pushInfo(m, "btw: could not start the side question");
+        m.pushInfo("btw: could not start the side question");
         return;
     };
     job.* = .{ .m = m, .question = owned };
@@ -3754,23 +3751,23 @@ pub fn cmdBtw(m: *tui.Model, arg: ?[]const u8) void {
         m.endWorker();
         gpa.destroy(job);
         gpa.free(owned);
-        agent.pushInfo(m, "btw: could not start the side question");
+        m.pushInfo("btw: could not start the side question");
         return;
     };
     thread.detach();
-    agent.pushInfo(m, "btw: asking a side question (running in background)...");
+    m.pushInfo("btw: asking a side question (running in background)...");
 }
 
 /// `/copy [N]`: the answer, on the clipboard and in a file.
 pub fn cmdCopy(m: *tui.Model, arg: ?[]const u8) void {
     const s = agent.session orelse {
-        agent.pushInfo(m, copytext.no_messages_msg);
+        m.pushInfo(copytext.no_messages_msg);
         return;
     };
     var texts: [copytext.max_lookback][]const u8 = undefined;
     const n = collectAssistantTexts(s, &texts);
     if (n == 0) {
-        agent.pushInfo(m, copytext.no_messages_msg);
+        m.pushInfo(copytext.no_messages_msg);
         return;
     }
 
@@ -3778,18 +3775,18 @@ pub fn cmdCopy(m: *tui.Model, arg: ?[]const u8) void {
     const index: usize = switch (sel) {
         .found => |i| i,
         .no_messages => {
-            agent.pushInfo(m, copytext.no_messages_msg);
+            m.pushInfo(copytext.no_messages_msg);
             return;
         },
         .usage, .too_few => {
             var buf: [256]u8 = undefined;
-            agent.pushInfo(m, copytext.formatRefusal(&buf, sel, arg));
+            m.pushInfo(copytext.formatRefusal(&buf, sel, arg));
             return;
         },
     };
 
     var ctx = copytext.buildCtx(m.allocator, texts[index]) catch {
-        agent.pushInfo(m, "the answer could not be prepared for copying");
+        m.pushInfo("the answer could not be prepared for copying");
         return;
     };
 
@@ -3804,7 +3801,7 @@ pub fn cmdCopy(m: *tui.Model, arg: ?[]const u8) void {
     const items = buildCopyItems(m, &ctx);
     if (items.len == 0) {
         ctx.deinit();
-        agent.pushInfo(m, copytext.no_messages_msg);
+        m.pushInfo(copytext.no_messages_msg);
         return;
     }
     m.setCopyCtx(ctx);
@@ -3899,7 +3896,7 @@ fn copyPickerCancelled(m: *tui.Model, tag: u32) void {
         var c = ctx;
         c.deinit();
     }
-    agent.pushInfo(m, copytext.cancelled_msg);
+    m.pushInfo(copytext.cancelled_msg);
 }
 
 /// The copy itself: the clipboard first, then the file, then the message.
@@ -3928,11 +3925,11 @@ fn performCopy(m: *tui.Model, ctx: *const copytext.Ctx, index: usize) void {
     var msg_buf: [512]u8 = undefined;
     if (path) |p| {
         defer m.allocator.free(p);
-        agent.pushInfo(m, copytext.formatCopiedVia(&msg_buf, chars, lines, decision.method.phrase(), p));
+        m.pushInfo(copytext.formatCopiedVia(&msg_buf, chars, lines, decision.method.phrase(), p));
     } else {
         // The file could not be written: said out loud, not swallowed. The
         // clipboard half may still have worked.
-        agent.pushInfo(m, copytext.formatCopiedNoFile(&msg_buf, chars, lines, decision.method.phrase()));
+        m.pushInfo(copytext.formatCopiedNoFile(&msg_buf, chars, lines, decision.method.phrase()));
     }
 }
 
@@ -4012,12 +4009,12 @@ const copy_file_mode: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600))
 /// Copy arbitrary message text (used by per-message targeting / 33.12).
 pub fn copyTargetedText(m: *tui.Model, text: []const u8) void {
     if (text.len == 0) {
-        agent.pushInfo(m, "nothing to copy");
+        m.pushInfo("nothing to copy");
         return;
     }
     // Build a minimal context as full-response copy.
     var ctx = copytext.buildCtx(m.allocator, text) catch {
-        agent.pushInfo(m, "the message could not be prepared for copying");
+        m.pushInfo("the message could not be prepared for copying");
         return;
     };
     defer ctx.deinit();
@@ -4029,7 +4026,7 @@ pub fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
     const arg = arg_in orelse "";
     if (std.ascii.eqlIgnoreCase(arg, "killall")) {
         const n = if (m.io_ready) m.bg.killNow(agent.io_global) else m.bg.requestKillAll();
-        agent.pushInfoFmt(m, "killed {d} background command{s}", .{
+        m.pushInfoFmt("killed {d} background command{s}", .{
             n,
             if (n == 1) @as([]const u8, "") else @as([]const u8, "s"),
         });
@@ -4039,17 +4036,17 @@ pub fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
         var it = std.mem.tokenizeAny(u8, arg, " \t");
         _ = it.next(); // "kill"
         const id_str = it.next() orelse {
-            agent.pushInfo(m, "/bg kill <id> · /bg killall");
+            m.pushInfo("/bg kill <id> · /bg killall");
             return;
         };
         const id = std.fmt.parseInt(u32, id_str, 10) catch {
-            agent.pushInfo(m, "/bg kill <id> · /bg killall");
+            m.pushInfo("/bg kill <id> · /bg killall");
             return;
         };
         if (m.bg.kill(agent.io_global, id)) {
-            agent.pushInfoFmt(m, "killed job {d}", .{id});
+            m.pushInfoFmt("killed job {d}", .{id});
         } else {
-            agent.pushInfoFmt(m, "job {d} was not running ({s})", .{ id, m.bg.stateWord(id) });
+            m.pushInfoFmt("job {d} was not running ({s})", .{ id, m.bg.stateWord(id) });
         }
         return;
     }
@@ -4064,10 +4061,10 @@ pub fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
         w.print("  job {d} [{s}] {s}\n", .{ slot.id, slot.stateWord(), slot.commandSlice() }) catch {};
     }
     if (!any) {
-        agent.pushInfo(m, "no background commands");
+        m.pushInfo("no background commands");
         return;
     }
-    agent.pushInfo(m, std.mem.trimEnd(u8, w.buffered(), "\n"));
+    m.pushInfo(std.mem.trimEnd(u8, w.buffered(), "\n"));
 }
 
 // ── self-update ─────────────────────────────────────────────
@@ -4081,7 +4078,7 @@ pub fn startUpdateCheck(m: *tui.Model) void {
 
 /// `/update`: installs the newest release.
 pub fn cmdUpdate(m: *tui.Model) void {
-    spawnUpdateJob(m, .install) catch agent.pushError(m, "could not start the update");
+    spawnUpdateJob(m, .install) catch m.pushError("could not start the update");
 }
 
 const UpdateMode = enum { check, install };
@@ -4220,7 +4217,7 @@ pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
     if (n_turns == 0) {
         const count = m.checkpoints.len;
         if (count == 0) {
-            agent.pushInfo(m, "nothing to rewind: no turn has changed any file yet");
+            m.pushInfo("nothing to rewind: no turn has changed any file yet");
             return;
         }
         var buf: [2048]u8 = undefined;
@@ -4241,17 +4238,17 @@ pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
             }) catch {};
         }
         w.print("use /rewind N to undo the last N turns", .{}) catch {};
-        agent.pushInfo(m, w.buffered());
+        m.pushInfo(w.buffered());
         return;
     }
 
     const count = m.checkpoints.len;
     if (count == 0) {
-        agent.pushInfo(m, "nothing to rewind: no turn has changed any file yet");
+        m.pushInfo("nothing to rewind: no turn has changed any file yet");
         return;
     }
     if (n_turns > count) {
-        agent.pushInfoFmt(m, "rewind: only {d} checkpoint{s} available", .{ count, if (count == 1) "" else "s" });
+        m.pushInfoFmt("rewind: only {d} checkpoint{s} available", .{ count, if (count == 1) "" else "s" });
         return;
     }
 
@@ -4270,7 +4267,7 @@ pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
             kk += 1;
         }
         w.print("use /rewind {d} yes to apply", .{n_turns}) catch {};
-        agent.pushInfo(m, w.buffered());
+        m.pushInfo(w.buffered());
         return;
     }
 
@@ -4303,9 +4300,9 @@ pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
     }
 
     if (total_undone == 0) {
-        agent.pushInfo(m, "rewind: nothing could be restored");
+        m.pushInfo("rewind: nothing could be restored");
     } else {
-        agent.pushInfoFmt(m, "rewind: restored {d} file change{s} across {d} turn{s}", .{
+        m.pushInfoFmt("rewind: restored {d} file change{s} across {d} turn{s}", .{
             total_undone,
             if (total_undone == 1) "" else "s",
             n_turns,
@@ -4313,7 +4310,7 @@ pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
         });
     }
     if (total_skipped > 0 or total_failed > 0) {
-        agent.pushInfoFmt(m, "{d} skipped, {d} failed", .{ total_skipped, total_failed });
+        m.pushInfoFmt("{d} skipped, {d} failed", .{ total_skipped, total_failed });
     }
     if (total_undone > 0) agent.setStatusWithZo(m, .done, "rewound");
 }
@@ -4322,27 +4319,27 @@ pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
 pub fn cmdIter(m: *tui.Model, arg: ?[]const u8) void {
     if (arg) |raw| {
         const n = std.fmt.parseInt(usize, raw, 10) catch {
-            agent.pushInfo(m, "/iter: expected a number (minimum 8)");
+            m.pushInfo("/iter: expected a number (minimum 8)");
             return;
         };
         if (n < 8) {
-            agent.pushInfoFmt(m, "/iter: minimum is 8, you asked for {d}", .{n});
+            m.pushInfoFmt("/iter: minimum is 8, you asked for {d}", .{n});
             return;
         }
         if (n > 200) {
-            agent.pushInfoFmt(m, "/iter: maximum is 200, you asked for {d}", .{n});
+            m.pushInfoFmt("/iter: maximum is 200, you asked for {d}", .{n});
             return;
         }
         if (n < 32) {
-            agent.pushInfoFmt(m, "/iter: budget set to {d} iterations — low for a long task, fine for a short one", .{n});
+            m.pushInfoFmt("/iter: budget set to {d} iterations — low for a long task, fine for a short one", .{n});
         } else {
-            agent.pushInfoFmt(m, "/iter: budget set to {d} iterations for this session", .{n});
+            m.pushInfoFmt("/iter: budget set to {d} iterations for this session", .{n});
         }
         agent.iter_limit_override = n;
     } else {
         const cur = agent.iterationLimit();
         const src = runtime_state.iterationSource(agent.iter_limit_override > 0, agent.model_requested_iter > 0);
-        agent.pushInfoFmt(m, "/iter: current budget is {d} iterations ({s})", .{ cur, src });
+        m.pushInfoFmt("/iter: current budget is {d} iterations ({s})", .{ cur, src });
     }
 }
 
