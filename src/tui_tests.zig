@@ -1,6 +1,7 @@
-//! TUI tests, split out of tui.zig (Phase 42.9). The implementation file stays
-//! focused on rendering and input; every test here drives the real Model and
-//! real draw functions through their public surface.
+//! TUI tests, split out of tui.zig (Phase 42.9). The implementation now lives
+//! across tui.zig (Model + rendering helpers), tui_events.zig (event dispatch)
+//! and tui_draw.zig (draw dispatch); every test here drives the real Model
+//! through the public surface those modules share.
 
 const std = @import("std");
 const tui = @import("tui.zig");

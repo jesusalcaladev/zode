@@ -2,7 +2,7 @@
 
 **Purpose:** concise invariants for TUI/runtime/UX changes in Zode. This is not a feature roadmap. If a change conflicts with an invariant, the change is wrong or needs an explicit, tested design decision.
 
-**Scope:** `src/tui.zig`, `src/palette.zig`, `src/commands.zig`, TUI-facing agent integration, and `src/lib/*` modules that render or supply UI state (`theme`, `markdown`, `highlight`, `ask`, `lang_icons`, `filechange`, `filesview`, `diffhunks`, etc.).
+**Scope:** `src/tui.zig`, `src/tui_events.zig`, `src/tui_draw.zig`, `src/tui_tests.zig`, `src/palette.zig`, `src/commands.zig`, TUI-facing agent integration, and `src/lib/*` modules that render or supply UI state (`theme`, `markdown`, `highlight`, `ask`, `lang_icons`, `filechange`, `filesview`, `diffhunks`, etc.).
 
 ## Hard invariants
 

@@ -62,17 +62,6 @@ pub const StatusKind = enum {
     done,
     warn,
     err,
-
-    pub fn color(self: StatusKind) u8 {
-        return switch (self) {
-            .idle => 6, // cyan
-            .thinking => 5, // magenta
-            .tooling => 4, // blue
-            .done => 2, // green
-            .warn => 3, // yellow
-            .err => 1, // red
-        };
-    }
 };
 
 /// 33.9: transient notifications channel (absolutely positioned, no layout shift).
@@ -127,9 +116,9 @@ pub const face_width: u16 = 7;
 
 /// The colour of a mood, from the THEME and not from the 16-colour palette.
 ///
-/// `mood.color()` returns an ANSI index (cyan, magenta, blue…), and an index
-/// on a truecolor terminal is the terminal's own palette, not this app's: the
-/// mascot came out in a colour that belonged to nothing around it.
+/// A 16-colour index (idle -> cyan, thinking -> magenta…) is the terminal's
+/// own palette on a truecolor terminal, not this app's: the mascot came out in
+/// a colour that belonged to nothing around it.
 fn moodStyle(kind: StatusKind) vaxis.Style {
     return switch (kind) {
         .idle => theme.ink2,
@@ -293,11 +282,10 @@ const PickerSnapshot = struct {
 //
 // TRAP (vaxis 0.6): `vxfw.Surface.writeCell` stores the `vaxis.Cell` BY
 // VALUE, and vaxis reads the BYTES of `char.grapheme` in `Vaxis.render()`,
-// that is, AFTER this drawFn has returned. A pointer to a stack temporary
+// that is, after the draw callback returns. A pointer to a stack temporary
 // (`&[_]u8{c}`) reaches the renderer as garbage (NULs) → blank screen.
 // Rule: the grapheme must live at least until the end of the frame, that is,
 // be a static literal, owned by the Model, or owned by the frame's arena
-// (`ctx.arena`, which is reset at the start of the NEXT frame).
 // (`ctx.arena`, which is reset at the start of the NEXT frame).
 
 /// True when a grapheme is a raw control byte (C0, DEL, or a C1 byte in
@@ -1766,8 +1754,6 @@ pub const Model = struct {
     /// is SLEEPING with a growing `nanosleep`. `std.Io.Condition` is not used
     /// because it needs an `Io` and the tests build the Model without an app.
     perm_mutex: std.atomic.Mutex = .unlocked,
-    /// Epoch to wake up the waiters (see `waitPermAnswer`).
-    perm_epoch: std.atomic.Value(u32) = .init(0),
 
     // ── `ask`: the model asks the user ───────────────
     //
@@ -1781,7 +1767,6 @@ pub const Model = struct {
     // because the tests build a Model without an app and there is no Io to
     // condition on (the same reason `perm_mutex` is there).
     ask_mutex: std.atomic.Mutex = .unlocked,
-    ask_epoch: std.atomic.Value(u32) = .init(0),
     ask_active: bool = false,
     /// The question, its header and its options: OWN COPIES (gpa).
     ///
@@ -1910,7 +1895,6 @@ pub const Model = struct {
     diag_seq: usize = 0,
 
     /// Spinner (counters, no alloc).
-    spinner_frame: usize = 0,
     busy: bool = false,
 
     /// Tool in progress. It is what keeps a 30s `bash` from looking like a
@@ -2037,12 +2021,6 @@ pub const Model = struct {
     layout_overflow: bool = false,
     /// Monotonically increasing frame counter for LRU cache eviction.
     frame_counter: u64 = 0,
-    /// Differential render tracking: first visible line of previous frame.
-    diff_last_first: usize = 0,
-    /// Differential render tracking: last visible line of previous frame.
-    diff_last_last: usize = 0,
-    /// Differential render tracking: whether the live paragraph was active last frame.
-    diff_last_live_active: bool = false,
     /// Phase 41.8: cached render of the streaming paragraph. `live_src` is
     /// re-copied into `live_lines_arena` every time the text CHANGES, so the
     /// cached cells never point at a previous frame's arena.
@@ -4051,7 +4029,6 @@ pub const Model = struct {
         self.perm_answer = a;
         self.permUnlock();
         // Wakes the worker (which may be in a `nanosleep` of up to 20 ms).
-        _ = self.perm_epoch.fetchAdd(1, .seq_cst);
         self.redraw_requested.store(true, .seq_cst);
     }
 
@@ -4934,7 +4911,6 @@ pub const Model = struct {
         if (self.ask_answer) |old| self.allocator.free(old);
         self.ask_answer = text;
         self.askUnlock();
-        _ = self.ask_epoch.fetchAdd(1, .seq_cst);
         self.requestRedraw();
         self.dirty = true;
     }
@@ -4962,7 +4938,6 @@ pub const Model = struct {
         self.ask_active = false;
         self.ask_typing = false;
         self.askUnlock();
-        _ = self.ask_epoch.fetchAdd(1, .seq_cst);
         self.requestRedraw();
         self.dirty = true;
     }
@@ -7844,7 +7819,6 @@ pub const Autocomplete = struct {
     /// ~99 commands (and their fuzzy tiers) several times per frame.
     /// Keys are static string literals from `commands.commands` — no ownership.
     cmd_keys: std.ArrayList([]const u8) = .empty,
-    cmd_count: usize = 0,
     cmd_cache_valid: bool = false,
     /// EVERY file of the project, walked once and kept (`filesearch.collect`).
     /// The popup is refiltered on every keystroke, so the disk is read once per
@@ -8792,7 +8766,6 @@ fn commandDescTierOn(q: []const u8) bool {
 /// more for `desc_on` inside each of those calls).
 fn rebuildCommandMatches(self: *Model) void {
     self.ac.cmd_keys.clearRetainingCapacity();
-    self.ac.cmd_count = 0;
     self.ac.cmd_cache_valid = true;
     const prefix = acPrefix(self) orelse return;
     const desc_on = commandDescTierOn(prefix);
@@ -8805,7 +8778,6 @@ fn rebuildCommandMatches(self: *Model) void {
             self.ac.cmd_keys.append(self.allocator, c.key) catch continue;
         }
     }
-    self.ac.cmd_count = self.ac.cmd_keys.items.len;
 }
 
 fn ensureCommandMatches(self: *Model) void {
@@ -8817,7 +8789,7 @@ pub fn matchCount(self: *Model) usize {
     switch (self.ac.mode) {
         .command => {
             ensureCommandMatches(self);
-            return self.ac.cmd_count;
+            return self.ac.cmd_keys.items.len;
         },
         .file => return self.ac.file_matches.items.len,
         .none => return 0,

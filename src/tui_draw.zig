@@ -220,11 +220,6 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
             live_src = ctx.arena.dupe(u8, line) catch "";
             live_is_tool = true;
         }
-        // The spinner advances with `workingLocked` and NOT with `busy`: during
-        // a tool, `busy` is already false (the stream closed) and without this
-        // the face kept the same expression for the whole `bash`, which is
-        // exactly when you most need to notice the app is alive.
-        if (self.workingLocked()) self.spinner_frame +%= 1;
     }
 
     // The footer is the single owner of phase and elapsed time. Do not repeat
@@ -346,10 +341,6 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
         tui.drawLines(&p, live_lines, live_abs_start, first_visible, history_h, pad, hero.x_off);
     }
 
-    // ── update differential tracking state ──
-    self.diff_last_first = first_visible;
-    self.diff_last_last = last_visible;
-    self.diff_last_live_active = live_active;
     tui.drawHistoryScrollbar(&p, width, history_h, first_visible, vis.max_offset);
     // ── prompt rail (dots) ── computed every frame so the mouse handler has
     // current data, but only painted when show_prompt_dots is enabled (off by
