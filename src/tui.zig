@@ -2427,6 +2427,7 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        self.ac.cmd_keys.deinit(self.allocator);
         if (self.live_inited) self.live_lines_arena.deinit();
         // Custom keybindings are owned by the model's allocator.
         if (self.keybindings.len > 0) {
@@ -7838,6 +7839,13 @@ pub const Autocomplete = struct {
     /// via `freeFileMatches`). Strings, not a `Palette`: the popup is one
     /// column and the paths need no descriptions.
     file_matches: std.ArrayList([]u8) = .empty,
+    /// COMMANDS: the matching keys, in list order, materialized once per query
+    /// by `recomputeMatches`. The draw reads this instead of re-scanning all
+    /// ~99 commands (and their fuzzy tiers) several times per frame.
+    /// Keys are static string literals from `commands.commands` — no ownership.
+    cmd_keys: std.ArrayList([]const u8) = .empty,
+    cmd_count: usize = 0,
+    cmd_cache_valid: bool = false,
     /// EVERY file of the project, walked once and kept (`filesearch.collect`).
     /// The popup is refiltered on every keystroke, so the disk is read once per
     /// `file_pool_ttl_s` and not once per character. A test Model has no `Io`,
@@ -8562,6 +8570,7 @@ pub fn setAcMode(self: *Model, mode: Autocomplete.Mode, prefix_len: usize) void 
     self.ac.active = mode != .none;
     self.ac.mode = mode;
     self.ac.prefix_len = prefix_len;
+    self.ac.cmd_cache_valid = false;
     if (!self.ac.active) {
         self.ac.sel = 0;
         self.ac.first = 0;
@@ -8587,6 +8596,7 @@ pub fn resetAutocomplete(self: *Model) void {
     self.ac.active = false;
     self.ac.mode = .none;
     self.ac.prefix_len = 0;
+    self.ac.cmd_cache_valid = false;
     self.ac.sel = 0;
     self.ac.first = 0;
 }
@@ -8702,6 +8712,7 @@ pub fn commandToken(key: []const u8) []const u8 {
 
 /// Recomputes how many items match and where the selection is.
 pub fn recomputeMatches(self: *Model) void {
+    if (self.ac.mode == .command) rebuildCommandMatches(self);
     const n = matchCount(self);
     if (n == 0) {
         self.ac.active = false;
@@ -8775,47 +8786,53 @@ fn commandDescTierOn(q: []const u8) bool {
     return true;
 }
 
+/// Materialize the command matches once for the current query. Four ranks,
+/// one pass over the command table per rank; the old draw did this several
+/// TIMES per frame (once for the count, once per visible row's label, and once
+/// more for `desc_on` inside each of those calls).
+fn rebuildCommandMatches(self: *Model) void {
+    self.ac.cmd_keys.clearRetainingCapacity();
+    self.ac.cmd_count = 0;
+    self.ac.cmd_cache_valid = true;
+    const prefix = acPrefix(self) orelse return;
+    const desc_on = commandDescTierOn(prefix);
+    var rank: u8 = 0;
+    while (rank < 4) : (rank += 1) {
+        if (rank == 3 and !desc_on) break;
+        var i: usize = 0;
+        while (agent.commandAt(i)) |c| : (i += 1) {
+            if (commandTier(c, prefix) != rank) continue;
+            self.ac.cmd_keys.append(self.allocator, c.key) catch continue;
+        }
+    }
+    self.ac.cmd_count = self.ac.cmd_keys.items.len;
+}
+
+fn ensureCommandMatches(self: *Model) void {
+    if (!self.ac.cmd_cache_valid) rebuildCommandMatches(self);
+}
+
 /// Number of items matching the current prefix.
-pub fn matchCount(self: *const Model) usize {
-    return switch (self.ac.mode) {
-        .command => blk: {
-            const prefix = acPrefix(self) orelse break :blk 0;
-            const desc_on = commandDescTierOn(prefix);
-            var n: usize = 0;
-            var i: usize = 0;
-            while (agent.commandAt(i)) |c| : (i += 1) {
-                const tier = commandTier(c, prefix);
-                if (tier < 3 or (tier == 3 and desc_on)) n += 1;
-            }
-            break :blk n;
+pub fn matchCount(self: *Model) usize {
+    switch (self.ac.mode) {
+        .command => {
+            ensureCommandMatches(self);
+            return self.ac.cmd_count;
         },
-        .file => self.ac.file_matches.items.len,
-        .none => 0,
-    };
+        .file => return self.ac.file_matches.items.len,
+        .none => return 0,
+    }
 }
 
 /// The label of match number `n` (in list order). COMMANDS: the full command
 /// line. FILES: the path, with a leading `@` so the row shows the mention as
 /// the user will read it.
-pub fn matchLabel(self: *const Model, n: usize) ?[]const u8 {
+pub fn matchLabel(self: *Model, n: usize) ?[]const u8 {
     return switch (self.ac.mode) {
         .command => blk: {
-            const prefix = acPrefix(self) orelse break :blk null;
-            const desc_on = commandDescTierOn(prefix);
-            var seen: usize = 0;
-            // Walks the ranks in order, so the list reads "best match first"
-            // without scoring or sorting anything.
-            var rank: u8 = 0;
-            while (rank < 4) : (rank += 1) {
-                if (rank == 3 and !desc_on) break;
-                var i: usize = 0;
-                while (agent.commandAt(i)) |c| : (i += 1) {
-                    if (commandTier(c, prefix) != rank) continue;
-                    if (seen == n) break :blk c.key;
-                    seen += 1;
-                }
-            }
-            break :blk null;
+            ensureCommandMatches(self);
+            if (n >= self.ac.cmd_keys.items.len) break :blk null;
+            break :blk self.ac.cmd_keys.items[n];
         },
         .file => blk: {
             if (n >= self.ac.file_matches.items.len) break :blk null;
@@ -9300,7 +9317,7 @@ fn putMatchPath(p: *Painter, col: u16, row: u16, path: []const u8, positions: []
 /// List of commands matching what was typed after the `/`.
 pub fn drawAutocomplete(
     p: *Painter,
-    self: *const Model,
+    self: *Model,
     top: u16,
     width: u16,
     rows: u16,

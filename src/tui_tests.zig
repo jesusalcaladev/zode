@@ -6900,3 +6900,30 @@ test "keybinds: a bound key resolves to its command, vim normal mode wins" {
     m.vim_normal = false;
 }
 
+
+test "autocomplete: matches are materialized once per query, not per frame" {
+    // The draw used to re-scan all ~99 commands several times per frame while
+    // the popup was open (count, every visible label, and desc_on inside each).
+    // recomputeMatches now builds the ordered key list once and draw reads it.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.ed.insert("/mo") catch {};
+    syncAutocomplete(&m);
+    try std.testing.expect(m.ac.cmd_cache_valid);
+    const n = matchCount(&m);
+    try std.testing.expect(n >= 2);
+    try std.testing.expectEqual(n, m.ac.cmd_keys.items.len);
+    for (0..n) |i| {
+        try std.testing.expectEqualStrings(m.ac.cmd_keys.items[i], matchLabel(&m, i).?);
+    }
+    try std.testing.expectEqualStrings("/model", m.ac.cmd_keys.items[0]);
+    try std.testing.expectEqualStrings("/mode", m.ac.cmd_keys.items[1]);
+
+    // A query change must rebuild the cache: "/zzzzqqqq" matches nothing.
+    m.ed.clear();
+    m.ed.insert("/zzzzqqqq") catch {};
+    syncAutocomplete(&m);
+    try std.testing.expectEqual(@as(usize, 0), matchCount(&m));
+    try std.testing.expectEqual(@as(usize, 0), m.ac.cmd_keys.items.len);
+}
