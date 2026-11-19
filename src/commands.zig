@@ -241,13 +241,13 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
     var prbuf: [640]u8 = undefined;
     const project_path = agent.resolvedProjectRulesPath(&prbuf);
     const project_exists = if (m.io_ready) blk: {
-        _ = std.Io.Dir.cwd().statFile(agent.io_global, project_path, .{}) catch break :blk false;
+        _ = std.Io.Dir.cwd().statFile(m.io, project_path, .{}) catch break :blk false;
         break :blk true;
     } else false;
     var upbuf: [512]u8 = undefined;
     const user_path = agent.permissionsFilePath(&upbuf);
     const user_exists = if (m.io_ready) if (user_path) |p| blk: {
-        _ = std.Io.Dir.cwd().statFile(agent.io_global, p, .{}) catch break :blk false;
+        _ = std.Io.Dir.cwd().statFile(m.io, p, .{}) catch break :blk false;
         break :blk true;
     } else false else false;
     m.pushInfoOwned(gpa.dupe(u8, "loaded from (effective paths, resolved like the loader):") catch return);
@@ -288,7 +288,7 @@ pub fn cmdHooks(m: *tui.Model, arg: ?[]const u8) void {
     var hpbuf: [640]u8 = undefined;
     const hooks_path = agent.resolvedProjectHooksPath(&hpbuf);
     const file_exists = if (m.io_ready) blk: {
-        _ = std.Io.Dir.cwd().statFile(agent.io_global, hooks_path, .{}) catch break :blk false;
+        _ = std.Io.Dir.cwd().statFile(m.io, hooks_path, .{}) catch break :blk false;
         break :blk true;
     } else false;
     const file_line = std.fmt.allocPrint(gpa, "  loaded from (effective project path): {s} ({s}; loaded on startup/reload)", .{ hooks_path, if (!m.io_ready) "unknown" else if (file_exists) "exists" else "missing" }) catch return;
@@ -367,7 +367,7 @@ pub fn cmdMcp(m: *tui.Model) void {
 /// `/sandbox`: sandbox availability for flagged bash commands (35.13 panel, partial).
 pub fn cmdSandbox(m: *tui.Model) void {
     const path = agent.envGet(m.environ, "PATH");
-    const kind = sandbox_mod.detect(agent.io_global, std.Io.Dir.cwd(), path);
+    const kind = sandbox_mod.detect(m.io, std.Io.Dir.cwd(), path);
     m.pushInfoOwned(m.allocator.dupe(u8, "sandbox  ·  availability for flagged bash commands") catch return);
     switch (kind) {
         .none => {
@@ -1933,12 +1933,12 @@ pub fn cmdSession(m: *tui.Model) void {
 
     const project_root = agent.project_info.root() orelse agent.project_info.cwd();
 
-    const all_sessions = sessionindex.scan(arena, agent.io_global, session_mod.sessions_dir);
+    const all_sessions = sessionindex.scan(arena, m.io, session_mod.sessions_dir);
 
     // Filter: only sessions that belong to this project (29.6).
     var owned_count: usize = 0;
     for (all_sessions) |s| {
-        if (sessionpath.sessionBelongsToProject(arena, agent.io_global, agent.environ_global, project_root, s.path)) {
+        if (sessionpath.sessionBelongsToProject(arena, m.io, agent.environ_global, project_root, s.path)) {
             owned_count += 1;
         }
     }
@@ -1978,7 +1978,7 @@ pub fn cmdSession(m: *tui.Model) void {
 
     var idx: usize = 0;
     for (all_sessions) |s| {
-        if (sessionpath.sessionBelongsToProject(arena, agent.io_global, agent.environ_global, project_root, s.path)) {
+        if (sessionpath.sessionBelongsToProject(arena, m.io, agent.environ_global, project_root, s.path)) {
             // Deep-copy the entry into gpa-owned strings (arena dies after cmdSession).
             const e = sessionindex.Entry{
                 .path = gpa.dupe(u8, s.path) catch "",
@@ -2019,7 +2019,7 @@ pub fn cmdSession(m: *tui.Model) void {
         return;
     };
 
-    const now = std.Io.Timestamp.now(agent.io_global, .real).toSeconds();
+    const now = std.Io.Timestamp.now(m.io, .real).toSeconds();
     var buf: [64]u8 = undefined;
     for (owned[0..owned_len], 0..) |s, i| {
         const session_id = std.fs.path.basename(s.path);
@@ -2151,8 +2151,8 @@ pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
         m.pushInfo("rename: session has no path");
         return;
     };
-    const meta = sessionindex.readMeta(arena, agent.io_global, path);
-    sessionindex.writeMeta(agent.io_global, arena, path, .{
+    const meta = sessionindex.readMeta(arena, m.io, path);
+    sessionindex.writeMeta(m.io, arena, path, .{
         .name = meta.name,
         .model = meta.model,
         .created_at = meta.created_at,
@@ -2527,9 +2527,9 @@ pub fn cmdGithub(m: *tui.Model, arg: ?[]const u8) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const remote = if (m.io_ready) github_lib.context.resolve(arena, agent.io_global) else null;
+    const remote = if (m.io_ready) github_lib.context.resolve(arena, m.io) else null;
     const host: []const u8 = if (remote) |r| r.host else "github.com";
-    const auth = github_lib.api.resolveToken(arena, agent.io_global, agent.environ_global, host);
+    const auth = github_lib.api.resolveToken(arena, m.io, agent.environ_global, host);
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(m.allocator);
@@ -2543,7 +2543,7 @@ pub fn cmdGithub(m: *tui.Model, arg: ?[]const u8) void {
         out.print(m.allocator, "  host     {s} (default)\n", .{host}) catch return;
     }
     if (m.io_ready) {
-        if (github_lib.context.currentBranch(arena, agent.io_global)) |b| {
+        if (github_lib.context.currentBranch(arena, m.io)) |b| {
             out.print(m.allocator, "  branch   {s}\n", .{b}) catch return;
         }
     }
@@ -3108,7 +3108,7 @@ pub fn cmdReleaseNotes(m: *tui.Model) void {
         m.pushInfo("release notes: I/O not ready");
         return;
     }
-    const io = agent.io_global;
+    const io = m.io;
     const version = selfupdate.current_version;
 
     const body = std.Io.Dir.cwd().readFileAlloc(io, "CHANGELOG.md", gpa, .limited(1024 * 1024)) catch {
@@ -3475,7 +3475,7 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
     // the two `allocPrint` helpers below use for their own temporaries, and one
     // name cannot be both the type and the value.
     const gpa = m.allocator;
-    const inst = clean_mod.instanceDir(gpa, agent.io_global) catch null;
+    const inst = clean_mod.instanceDir(gpa, m.io) catch null;
     defer if (inst) |p| gpa.free(p);
     const cfg = cleanConfigDir(gpa, m.environ);
     var wt_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -3483,8 +3483,8 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
     const wt_root = std.mem.print(&wt_buf, "{s}/{s}", .{ project_root, worktree_mod.worktrees_subdir }) catch null;
     defer if (cfg) |p| gpa.free(p);
 
-    const now_secs = std.Io.Timestamp.now(agent.io_global, .real).toSeconds();
-    var rep = clean_mod.scan(gpa, agent.io_global, .{
+    const now_secs = std.Io.Timestamp.now(m.io, .real).toSeconds();
+    var rep = clean_mod.scan(gpa, m.io, .{
         .roots = .{ .sessions = "sessions", .instances = inst, .config = cfg, .worktrees = wt_root },
         .now_secs = now_secs,
     }) catch {
@@ -3535,7 +3535,7 @@ pub fn cmdClean(m: *tui.Model, aplicar: bool) void {
         return;
     }
 
-    const deleted = clean_mod.apply(agent.io_global, &rep, .{
+    const deleted = clean_mod.apply(m.io, &rep, .{
         .sessions = "sessions",
         .instances = inst,
         .config = cfg,
@@ -3610,7 +3610,7 @@ pub fn cmdUndo(m: *tui.Model, arg: ?[]const u8) void {
         // `writeFile` and not config.zig's `writeFileSecure`: that one is for
         // `auth.json` (0600, written to a temp and renamed) and this is a file of
         // the user's project, with the permissions it already had.
-        std.Io.Dir.cwd().writeFile(agent.io_global, .{ .sub_path = f.pathOf(), .data = f.data }) catch {
+        std.Io.Dir.cwd().writeFile(m.io, .{ .sub_path = f.pathOf(), .data = f.data }) catch {
             failed += 1;
             out.print("  {s}: could not write it back\n", .{f.pathOf()}) catch {};
             continue;
@@ -4025,7 +4025,7 @@ pub fn copyTargetedText(m: *tui.Model, text: []const u8) void {
 pub fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
     const arg = arg_in orelse "";
     if (std.ascii.eqlIgnoreCase(arg, "killall")) {
-        const n = if (m.io_ready) m.bg.killNow(agent.io_global) else m.bg.requestKillAll();
+        const n = if (m.io_ready) m.bg.killNow(m.io) else m.bg.requestKillAll();
         m.pushInfoFmt("killed {d} background command{s}", .{
             n,
             if (n == 1) @as([]const u8, "") else @as([]const u8, "s"),
@@ -4043,7 +4043,7 @@ pub fn cmdBg(m: *tui.Model, arg_in: ?[]const u8) void {
             m.pushInfo("/bg kill <id> · /bg killall");
             return;
         };
-        if (m.bg.kill(agent.io_global, id)) {
+        if (m.bg.kill(m.io, id)) {
             m.pushInfoFmt("killed job {d}", .{id});
         } else {
             m.pushInfoFmt("job {d} was not running ({s})", .{ id, m.bg.stateWord(id) });
@@ -4290,7 +4290,7 @@ pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
                     total_failed += 1;
                 }
             } else {
-                std.Io.Dir.cwd().writeFile(agent.io_global, .{ .sub_path = f.pathOf(), .data = f.data }) catch {
+                std.Io.Dir.cwd().writeFile(m.io, .{ .sub_path = f.pathOf(), .data = f.data }) catch {
                     total_failed += 1;
                     continue;
                 };

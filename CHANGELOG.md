@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - close six critical permission and token-leak holes (security) [`a2998bc7`](https://github.com/jesusalcaladev/zode/commit/a2998bc7)
 - complete Phase 40 medium items (12 of 13) (security) [`1285cbea`](https://github.com/jesusalcaladev/zode/commit/1285cbea)
 - close a real use-after-free found by the new regression test (compaction) [`6e14a3a3`](https://github.com/jesusalcaladev/zode/commit/6e14a3a3)
-- apply env timeout before the headless client is built (47) (http) [`305ccd2d`](https://github.com/jesusalcaladev/zode/commit/305ccd2d)
+- apply env timeout before the headless client is built (47) (http) [`577d6143`](https://github.com/jesusalcaladev/zode/commit/577d6143)
 
 ### Chores
 
@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - split tui tests out of tui.zig (42.9 part 2) (phase42) [`df94f80a`](https://github.com/jesusalcaladev/zode/commit/df94f80a)
 - split event and draw dispatch into modules (42.9) (tui) [`c52b7a38`](https://github.com/jesusalcaladev/zode/commit/c52b7a38)
 - drop 337 one-line agent forwarders (42.8) [`fc2ea6d8`](https://github.com/jesusalcaladev/zode/commit/fc2ea6d8)
+- use the Model's io instead of agent.io_global (25 sites) (42.8) [`47caa3e5`](https://github.com/jesusalcaladev/zode/commit/47caa3e5)
 
 ### Performance
 
