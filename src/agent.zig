@@ -4997,19 +4997,10 @@ pub fn finishAutoCheck(m: *tui.Model) void {
 /// can ask for more. Values below 32 print a warning.
 pub var iter_limit_override: usize = 0;
 
-/// How many iterations the *model itself* asked for this session.
-/// The model reasons about task complexity and declares a number; the harness
-/// respects it as the soft target (task-scoped budget). Set through the plan
-/// or goal message, or applied by the user with `/iter`.
-pub var model_requested_iter: usize = 0;
-
 /// Returns the effective iteration target for this session:
-///   model_requested_iter  (the model's own estimate, if any)
 ///   iter_limit_override   (the user's explicit /iter, if any)
 ///   ZODE_MAX_ITER env     (the environment default)
 ///   default_max_iterations (12, the compiled-in floor)
-///
-/// The model's estimate wins when it is higher — a long task must not be cut
 /// short because the user forgot to raise the limit. The user's /iter always
 /// wins when it is higher than both — the developer is in charge.
 pub fn iterationLimit() usize {
@@ -5020,7 +5011,6 @@ pub fn iterationLimit() usize {
         if (n > best) best = n;
     }
     if (iter_limit_override > best) best = iter_limit_override;
-    if (model_requested_iter > best) best = model_requested_iter;
     if (best < 8) best = 8;
     if (best > 200) best = 200;
     return best;

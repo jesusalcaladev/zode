@@ -4338,7 +4338,7 @@ pub fn cmdIter(m: *tui.Model, arg: ?[]const u8) void {
         agent.iter_limit_override = n;
     } else {
         const cur = agent.iterationLimit();
-        const src = runtime_state.iterationSource(agent.iter_limit_override > 0, agent.model_requested_iter > 0);
+        const src = runtime_state.iterationSource(agent.iter_limit_override > 0);
         m.pushInfoFmt("/iter: current budget is {d} iterations ({s})", .{ cur, src });
     }
 }

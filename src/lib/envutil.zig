@@ -5,23 +5,6 @@ fn get(env: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     return m.get(key);
 }
 
-pub fn iterationLimitFor(
-    env: ?*const std.process.Environ.Map,
-    default_max: usize,
-    iter_limit_override: usize,
-    model_requested_iter: usize,
-) usize {
-    var best: usize = default_max;
-    const raw = get(env, "ZODE_MAX_ITER") orelse "";
-    if (raw.len > 0) {
-        const n = std.fmt.parseInt(usize, raw, 10) catch default_max;
-        if (n > best) best = n;
-    }
-    if (iter_limit_override > best) best = iter_limit_override;
-    if (model_requested_iter > best) best = model_requested_iter;
-    if (best < 8) best = 8;
-    return best;
-}
 
 
 

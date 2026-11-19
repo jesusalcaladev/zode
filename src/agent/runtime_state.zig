@@ -65,9 +65,8 @@ pub fn applyContextUsage(
     ctx_real.* = u.real;
 }
 
-pub fn iterationSource(override_set: bool, model_requested: bool) []const u8 {
+pub fn iterationSource(override_set: bool) []const u8 {
     if (override_set) return "your /iter";
-    if (model_requested) return "the model's estimate";
     return "ZODE_MAX_ITER / default";
 }
 
@@ -84,9 +83,8 @@ test "computeFinishTps rejects missing start" {
 
 test "iterationSource" {
     const t = std.testing;
-    try t.expectEqualStrings("your /iter", iterationSource(true, false));
-    try t.expectEqualStrings("the model's estimate", iterationSource(false, true));
-    try t.expectEqualStrings("ZODE_MAX_ITER / default", iterationSource(false, false));
+    try t.expectEqualStrings("your /iter", iterationSource(true));
+    try t.expectEqualStrings("ZODE_MAX_ITER / default", iterationSource(false));
 }
 
 test "clearContextUsage" {
