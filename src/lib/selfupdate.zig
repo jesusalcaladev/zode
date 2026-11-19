@@ -28,6 +28,7 @@
 //! SHA-NI, SIGILL on an older one) instead of installing it.
 
 const std = @import("std");
+const io_timeout = @import("io_timeout.zig");
 const builtin = @import("builtin");
 const Io = std.Io;
 const release_mod = @import("release.zig");
@@ -202,8 +203,22 @@ const Release = struct {
     checksum_url: ?[]const u8 = null,
 };
 
+/// A 5 s bound per network operation for update traffic. Nested calls share
+/// one threadlocal wrapper (first timeout wins), so the refcount in io_timeout
+/// releases it only when the outermost caller is done.
+fn shortIo(inner: std.Io) std.Io {
+    return io_timeout.wrap(inner, .{ .duration = .{
+        .raw = .fromMilliseconds(5_000),
+        .clock = .awake,
+    } });
+}
+
 fn fetchRelease(ctx: Context) ?Release {
-    var client: std.http.Client = .{ .allocator = ctx.alloc, .io = ctx.io };
+    // The startup check runs before the first prompt: a dead update server
+    // must not stall the UI. Short bound, independent of ZODE_HTTP_TIMEOUT_MS.
+    const io = shortIo(ctx.io);
+    defer io_timeout.unwrap();
+    var client: std.http.Client = .{ .allocator = ctx.alloc, .io = io };
     defer client.deinit();
 
     const uri = std.Uri.parse(api ++ "/releases/latest") catch return null;
@@ -241,7 +256,9 @@ fn fetchRelease(ctx: Context) ?Release {
 fn fetchReleaseForChannel(ctx: Context) ?Release {
     if (ctx.channel == .stable) return fetchRelease(ctx);
 
-    var client: std.http.Client = .{ .allocator = ctx.alloc, .io = ctx.io };
+    const io = shortIo(ctx.io);
+    defer io_timeout.unwrap();
+    var client: std.http.Client = .{ .allocator = ctx.alloc, .io = io };
     defer client.deinit();
 
     const uri = std.Uri.parse(api ++ "/releases?per_page=10") catch return null;
@@ -549,7 +566,9 @@ fn runs(ctx: Context, path: []const u8) bool {
 }
 
 fn download(ctx: Context, url: []const u8) ?[]const u8 {
-    var client: std.http.Client = .{ .allocator = ctx.alloc, .io = ctx.io };
+    const io = shortIo(ctx.io);
+    defer io_timeout.unwrap();
+    var client: std.http.Client = .{ .allocator = ctx.alloc, .io = io };
     defer client.deinit();
 
     const uri = std.Uri.parse(url) catch return null;

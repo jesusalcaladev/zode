@@ -326,6 +326,7 @@ minimal `GET /sessions`, `GET /sessions/<id>`, `PUT /sessions/<id>` contract.
 | `ZODE_WEB_ALLOW_LOCAL` | `0` | Let `web_fetch` reach loopback and private ranges |
 | `ZODE_BRAVE_KEY` | *(unset)* | Real search index for `web_search` instead of the free chain |
 | `ZODE_NO_SELF_UPDATE` | `0` | Disable the update check |
+| `ZODE_HTTP_TIMEOUT_MS` | `60000` | Bound for each network operation in an HTTP request (provider, models, MCP, remote sessions). `0` disables the bound; max 600000. Update-check traffic always uses 5000 ms. |
 | `ZODE_AUTO_UPDATE` | `0` | Install updates without asking |
 | `ZODE_UPDATE_CHANNEL` | `stable` | `beta` follows the newest prerelease; `stable` never installs one |
 | `ZODE_DALTONIZED` | `0` | Colour-blind-safe theme |

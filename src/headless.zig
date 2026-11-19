@@ -51,6 +51,7 @@ pub fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Envi
     agent.api_key_global = envGet(env, "ZODE_API_KEY");
     // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
     tools_mod.initMaxToolOutput(env);
+    http_client.Http.initDefaultTimeout(env);
     tools_mod.initDiffLimit(env);
     tools_mod.initGrepCapture(env);
     // The language servers. Started LAZILY (a server is spawned when a file of

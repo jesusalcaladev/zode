@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 41 - terse output style and lossless prompt trims (tokens) [`f1a20944`](https://github.com/jesusalcaladev/zode/commit/f1a20944)
 - TUI key safety, docs and CI correctness (phases44-45) [`55368ae1`](https://github.com/jesusalcaladev/zode/commit/55368ae1)
 - close four more backlog items (45.2, 43.5, 43.8, 42.7) [`5e6ca604`](https://github.com/jesusalcaladev/zode/commit/5e6ca604)
+- bound every network operation (40.10) (http) [`29acece2`](https://github.com/jesusalcaladev/zode/commit/29acece2)
 
 ### Bug Fixes
 
@@ -42,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - cache rendered tool_use blocks across requests (41.5) (chat) [`41fc4aef`](https://github.com/jesusalcaladev/zode/commit/41fc4aef)
 - cache the streaming paragraph render (41.8) (tui) [`bd606574`](https://github.com/jesusalcaladev/zode/commit/bd606574)
 - optimization pass — one style resolve per paint, zero-copy tool schema (46) [`61bc8bac`](https://github.com/jesusalcaladev/zode/commit/61bc8bac)
-- eliminate quadratic SSE tool-arg parsing and per-chunk allocations (46.6-46.11) [`789ca47c`](https://github.com/jesusalcaladev/zode/commit/789ca47c)
+- eliminate quadratic SSE tool-arg parsing and per-chunk allocations (46.6-46.11) [`14ee2362`](https://github.com/jesusalcaladev/zode/commit/14ee2362)
 
 ### Tests
 

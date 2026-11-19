@@ -268,6 +268,7 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     agent.loadUserConfig();
     defer agent.shutdownUserConfig();
     tools_mod.initMaxToolOutput(env);
+    http_client.Http.initDefaultTimeout(env);
     tools_mod.initDiffLimit(env);
     tools_mod.initGrepCapture(env);
 
@@ -464,6 +465,7 @@ fn runTui(init: std.process.Init) !u8 {
     agent.gpa_global = init.gpa;
     // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
     tools_mod.initMaxToolOutput(init.environ_map);
+    http_client.Http.initDefaultTimeout(init.environ_map);
     tools_mod.initDiffLimit(init.environ_map);
     tools_mod.initGrepCapture(init.environ_map);
     // The language servers, before the config is read: the config says which

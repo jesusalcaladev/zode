@@ -92,6 +92,7 @@ zig test src/chat.zig            # SSE parser tests
 - `ZODE_API_KEY`
 - `ZODE_MODEL` (default: `kimi-k2.6`), `ZODE_EFFORT` (low|medium|high)
 - `ZODE_MAX_TOOL_OUTPUT` (default 1 MB, hard cap 10 MB; `K`/`M`/`G` suffixes)
+- `ZODE_HTTP_TIMEOUT_MS` (default 60000, max 600000, 0 disables) — bound per network operation in every HTTP client; update-check traffic always uses 5000 ms. Implemented in `src/lib/io_timeout.zig` by wrapping only `Io.vtable.operate`.
 - `ZODE_CONTEXT_LIMIT` (unset: the model's own window, else 128k; budget = `ZODE_COMPACT_PCT`, 80% by default) — full settings reference in `docs/settings.md`
 - `ZODE_FREE_AUTO=1` / `ZODE_TASK_PARALLEL` (default 3) / `ZODE_MAX_ITER` (default 12)
 - `ZODE_COMPACT=off|elide|full` (default when unset: `elide`, Tier 1 only), `ZODE_COMPACT_PCT=10..95`

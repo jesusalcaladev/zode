@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_timeout = @import("io_timeout.zig");
 
 /// JSON HTTP client on top of std.http.Client (Zig 0.17).
 ///
@@ -9,24 +10,55 @@ const std = @import("std");
 ///
 /// NOTE: `Request` is heap-allocated because `receiveHead` and `bodyReader`
 /// keep internal pointers to the request.
+/// Bound applied by the default constructor. A dead URL must not hang a
+/// worker forever; 60 s is long enough for a slow reasoning provider and
+/// short enough that a typo'd URL is noticed in a minute.
+/// `ZODE_HTTP_TIMEOUT_MS` overrides it (0 disables the bound).
+pub var default_timeout_ms: u64 = 60_000;
+
 pub const Http = struct {
     client: std.http.Client,
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// True when `initTimed` wrapped the Io. Only that constructor releases
+    /// the threadlocal wrapper.
+    timed: bool = false,
+
+    /// Called once at startup with the process environment.
+    pub fn initDefaultTimeout(env: ?*const std.process.Environ.Map) void {
+        const map = env orelse return;
+        const raw = map.get("ZODE_HTTP_TIMEOUT_MS") orelse return;
+        const ms = std.fmt.parseInt(u64, std.mem.trim(u8, raw, " \t"), 10) catch return;
+        default_timeout_ms = @min(ms, 600_000);
+    }
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Http {
+        return initTimed(gpa, io, default_timeout_ms);
+    }
+
+    fn initUnbounded(gpa: std.mem.Allocator, io: std.Io) Http {
+        return .{ .client = .{ .allocator = gpa, .io = io }, .gpa = gpa, .io = io };
+    }
+
+    /// Bounded constructor. Each low-level network operation fails after
+    /// `timeout_ms`; without it a dead URL blocks the worker forever.
+    pub fn initTimed(gpa: std.mem.Allocator, io: std.Io, timeout_ms: u64) Http {
+        if (timeout_ms == 0) return initUnbounded(gpa, io);
+        const wrapped = io_timeout.wrap(io, .{ .duration = .{
+            .raw = .fromMilliseconds(@as(i64, @intCast(@min(timeout_ms, 600_000)))),
+            .clock = .awake,
+        } });
         return .{
-            .client = .{
-                .allocator = gpa,
-                .io = io,
-            },
+            .client = .{ .allocator = gpa, .io = wrapped },
             .gpa = gpa,
-            .io = io,
+            .io = wrapped,
+            .timed = true,
         };
     }
 
     pub fn deinit(self: *Http) void {
         self.client.deinit();
+        if (self.timed) io_timeout.unwrap();
     }
 
     pub const JsonResult = struct {
@@ -389,4 +421,36 @@ test "http_client: a malformed URL fails before opening a socket" {
     defer client.deinit();
     try std.testing.expectError(error.InvalidUrl, client.get("not a url", null));
     try std.testing.expectError(error.InvalidUrl, client.get("http://", null));
+}
+
+test "http: a non-responsive server is bounded by the default timeout" {
+    // Regression for 40.10. A listener that never accepts still completes the
+    // TCP handshake (the connection sits in the backlog), so the client blocks
+    // on the response — exactly the failure that used to hang a chat worker
+    // forever with a bad ZODE_BASE_URL. No server thread needed: not accepting
+    // IS the non-responsive server.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", 0) catch return error.SkipTest;
+    var server = addr.listen(io, .{}) catch return error.SkipTest;
+    defer server.deinit(io);
+
+    var url_buf: [128]u8 = undefined;
+    const url = std.mem.print(&url_buf, "http://127.0.0.1:{d}/v1/models", .{server.socket.address.getPort()}) catch return error.SkipTest;
+
+    const saved = default_timeout_ms;
+    defer default_timeout_ms = saved;
+    default_timeout_ms = 400;
+
+    var http = Http.init(std.testing.allocator, io);
+    defer http.deinit();
+    const t0 = std.Io.Timestamp.now(io, .real).nanoseconds;
+    const result = http.get(url, null);
+    const elapsed_ms: i128 = @divTrunc(std.Io.Timestamp.now(io, .real).nanoseconds - t0, std.time.ns_per_ms);
+
+    // It MUST fail, and it MUST fail near the bound, not after the old hang.
+    try std.testing.expect(result == error.ReadFailed or result == error.ConnectionResetByPeer);
+    try std.testing.expect(elapsed_ms < 5_000);
 }
