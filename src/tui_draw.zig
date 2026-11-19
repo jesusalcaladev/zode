@@ -415,7 +415,7 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
 
     // ── `/` autocompletion (directly above the prompt) ──
     if (ac_rows > 0) {
-        tui.drawAutocomplete(&p, self, input_top - ac_rows, width, ac_rows);
+        tui.drawAutocomplete(&p, self, input_top - ac_rows, width, ac_rows, ac_matches);
     }
 
     // ── the hairline ──

@@ -9321,6 +9321,7 @@ pub fn drawAutocomplete(
     top: u16,
     width: u16,
     rows: u16,
+    total: usize,
 ) void {
     if (width < 10 or rows < 2) return;
     p.fillRange(0, width, top, " ", .{});
@@ -9340,7 +9341,6 @@ pub fn drawAutocomplete(
     // apparently has six entries — which is exactly the "no me da la lista de
     // files" report. A picker that lies about its size is worse than no picker.
     const item_rows = rows - 1;
-    const total = matchCount(self);
     const hidden = if (total > item_rows) total - item_rows else 0;
     for (0..item_rows) |i| {
         const label = matchLabel(self, first + i) orelse break;

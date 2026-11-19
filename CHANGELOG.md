@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - split event and draw dispatch into modules (42.9) (tui) [`c52b7a38`](https://github.com/jesusalcaladev/zode/commit/c52b7a38)
 - drop 337 one-line agent forwarders (42.8) [`fc2ea6d8`](https://github.com/jesusalcaladev/zode/commit/fc2ea6d8)
 - use the Model's io instead of agent.io_global (25 sites) (42.8) [`b4436af8`](https://github.com/jesusalcaladev/zode/commit/b4436af8)
+- pass the autocomplete count into drawAutocomplete (tui) [`a8f75449`](https://github.com/jesusalcaladev/zode/commit/a8f75449)
 
 ### Performance
 
@@ -48,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - cache the streaming paragraph render (41.8) (tui) [`bd606574`](https://github.com/jesusalcaladev/zode/commit/bd606574)
 - optimization pass — one style resolve per paint, zero-copy tool schema (46) [`61bc8bac`](https://github.com/jesusalcaladev/zode/commit/61bc8bac)
 - eliminate quadratic SSE tool-arg parsing and per-chunk allocations (46.6-46.11) [`14ee2362`](https://github.com/jesusalcaladev/zode/commit/14ee2362)
-- materialize autocomplete matches once per query (47.3) (tui) [`c4edd980`](https://github.com/jesusalcaladev/zode/commit/c4edd980)
+- materialize autocomplete matches once per query (47.3) (tui) [`c99f62d1`](https://github.com/jesusalcaladev/zode/commit/c99f62d1)
 
 ### Tests
 
