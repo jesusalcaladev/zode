@@ -42,6 +42,10 @@ pub fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Envi
     // Phase 22: schema mode is a PROPERTY OF THIS RUN, never of the TUI.
     const schema_mode = schema_data != null;
     var structured_outcome = structured_run.Outcome{};
+    // Apply the env bound BEFORE constructing the client: init() snapshots
+    // default_timeout_ms, so doing it afterwards left the whole headless turn
+    // on the 60 s compile-time default regardless of ZODE_HTTP_TIMEOUT_MS.
+    http_client.Http.initDefaultTimeout(env);
     var http = http_client.Http.init(gpa, io);
     defer http.deinit();
 
@@ -51,7 +55,6 @@ pub fn runChat(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Envi
     agent.api_key_global = envGet(env, "ZODE_API_KEY");
     // Per-tool output caps from the environment (ZODE_MAX_TOOL_OUTPUT).
     tools_mod.initMaxToolOutput(env);
-    http_client.Http.initDefaultTimeout(env);
     tools_mod.initDiffLimit(env);
     tools_mod.initGrepCapture(env);
     // The language servers. Started LAZILY (a server is spawned when a file of

@@ -218,16 +218,6 @@ pub const Http = struct {
         return self.request(.PUT, url, bearer, body, &.{}, null);
     }
 
-    /// POST with extra headers (e.g: Anthropic's x-api-key).
-    pub fn postJsonWithHeaders(
-        self: *Http,
-        url: []const u8,
-        body: []u8,
-        headers: []const ExtraHeader,
-    ) !JsonResult {
-        return self.request(.POST, url, null, body, headers, null);
-    }
-
     /// Opens a request and sends the body. The caller does `deinit` + `destroy`.
     /// `streaming` adds the SSE headers.
     fn openRequest(

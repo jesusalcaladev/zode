@@ -819,15 +819,6 @@ pub var cur_provider_buf: [128]u8 = undefined;
 pub fn setProviderId(id: []const u8) void {
     cur_provider_id = runtime_buffers.copyToBuf(&cur_provider_buf, id);
 }
-/// Key state of the active provider's API key.
-///
-/// `verified` means the key has been tested and works.
-/// `saved` means the key is stored in `auth.json` but has not been verified.
-/// `invalid` means the key is known to be bad (e.g., auth error received).
-pub var cur_key_state: u8 = 0; // 0=unknown, 1=verified, 2=saved, 3=invalid
-/// Key state buffer for safe copying (avoids dangling slices).
-pub var cur_key_state_buf: [4]u8 = undefined;
-
 pub const keyStateString = agent_perms.keyStateString;
 
 pub var cur_model: []const u8 = "";
@@ -851,11 +842,6 @@ pub var cur_model_buf: [128]u8 = undefined;
 /// worker's arena dies with the request.
 pub var cur_model_ctx: u32 = 0;
 
-/// Active provider and model, for the status bar. Exposed as functions (not
-/// the raw `var`s) so the TUI does not depend on the static buffer.
-pub fn curProvider() []const u8 {
-    return cur_provider_id;
-}
 pub fn curModel() []const u8 {
     return cur_model;
 }
@@ -2680,23 +2666,6 @@ test "TurnStats: detailLine caps a long file list" {
     s.deinit();
 }
 
-/// Empties the current session's history without creating a new one.
-pub fn resetSession(m: *tui.Model) void {
-    cache_stats.session.reset();
-    // The money is per session like the tokens are: a `/new` that kept the cost
-    // of the old one would show a bill for a conversation that no longer exists.
-    cost_mod.session.reset();
-    if (session) |s| {
-        s.messages.clearRetainingCapacity();
-        s.appendUsageSnapshot(cache_stats.session) catch |err| {
-            m.pushErrorFmt("could not reset session usage: {t}", .{err});
-        };
-        s.flush();
-    }
-    session_elided = 0;
-    summary_policy.resetSummaries();
-    m.pushInfoFmt("session reset", .{});
-}
 
 /// Records one finished request against the session: tokens for `/usage`, and the
 /// same tokens against the MODEL for `/cost`.
@@ -5057,14 +5026,6 @@ pub fn iterationLimit() usize {
     return best;
 }
 
-/// Lets the model (via the plan/goal message, parsed by the harness) declare
-/// how many iterations it estimates this task needs. Values below 8 are
-/// ignored; the floor is 8 so a short question never burns the whole budget.
-pub fn setModelRequestedIterations(n: usize) void {
-    if (n < 8) return;
-    if (n > 200) return;
-    model_requested_iter = n;
-}
 
 /// The CEILING, which only a `/goal` ever reaches.
 ///
@@ -12700,38 +12661,6 @@ pub fn applyModel(m: *tui.Model, name: []const u8, ctx_tokens: u32) !void {
     persistLastModel();
 }
 
-/// Opens the prompt for a provider's API key.
-///
-/// `provider_idx` selects which one; `null` means the active provider, or the
-/// first in the list.
-pub fn openConnectPrompt(m: *tui.Model, provider_idx: ?u32) void {
-    const gpa = m.allocator;
-    if (m.pal.mode == .key_prompt) {
-        // A second ctrl+a while typing the key: cancels.
-        openConnectPalette(m);
-        return;
-    }
-    m.pal.key_return_mode = if (m.pal.mode == .models) .models else .connect;
-    if (provider_idx) |idx| {
-        if (idx >= m.pal.items.len) return;
-        if (m.pal.items[idx].kind != .provider) return;
-        m.pal.key_item = idx;
-    } else {
-        // No provider chosen: the active one, or the first in the list.
-        m.pal.key_item = 0;
-        for (m.pal.items, 0..) |it, i| {
-            if (it.kind == .provider and std.mem.eql(u8, it.label, cur_provider_id)) {
-                m.pal.key_item = @intCast(i);
-                break;
-            }
-        }
-    }
-    m.pal.mode = .key_prompt;
-    m.pal.key_len = 0;
-    m.pal.key_msg_len = 0;
-    m.pal.setKeyMessage("paste key + enter (empty = remove key)", false);
-    _ = gpa;
-}
 
 const auth_master_label = "__auth_master__";
 var cached_auth_master_key: ?[32]u8 = null;

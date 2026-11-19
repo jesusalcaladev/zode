@@ -10,6 +10,7 @@ Usage: python3 tools/headless_smoke.py
 """
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -77,5 +78,53 @@ def main() -> int:
     return 0 if ok else 1
 
 
+def timeout_scenario() -> bool:
+    """A dead endpoint must fail near ZODE_HTTP_TIMEOUT_MS, not hang the worker.
+
+    A socket that LISTENS but never ACCEPTs still completes the TCP handshake
+    from the backlog, so the client blocks waiting for a response that never
+    comes — precisely the failure that made a bad ZODE_BASE_URL hang forever.
+    """
+    if not BIN.exists():
+        return True
+    home = "/tmp/opencode/zode-http-timeout-smoke-home"
+    shutil.rmtree(home, ignore_errors=True)
+    os.makedirs(home, exist_ok=True)
+
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(5)
+    port = listener.getsockname()[1]
+    env = dict(os.environ)
+    env.update({
+        "HOME": home,
+        "ZODE_PROVIDER": "local",
+        "ZODE_MODEL": "m",
+        "ZODE_BASE_URL": f"http://127.0.0.1:{port}/v1",
+        "ZODE_HTTP_TIMEOUT_MS": "1500",
+        "ZODE_NO_SELF_UPDATE": "1",
+    })
+    t0 = time.time()
+    try:
+        try:
+            res = subprocess.run(
+                [str(BIN), "--chat", "timeout scenario"],
+                cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            print("FAIL  a dead endpoint is bounded by ZODE_HTTP_TIMEOUT_MS (hung >10s)")
+            return False
+        elapsed = time.time() - t0
+        passed = elapsed < 8.0
+        print(f"{'PASS' if passed else 'FAIL'}  a dead endpoint is bounded by ZODE_HTTP_TIMEOUT_MS ({elapsed:.1f}s)")
+        return passed
+    finally:
+        listener.close()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    ok = main()
+    if not timeout_scenario():
+        ok = 1
+    raise SystemExit(ok)

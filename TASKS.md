@@ -132,6 +132,13 @@ IDs are grouped by track so they can be worked in any order inside a track.
 
 ---
 
+## Phase 47 — 🔎 Final audit fixes (completed)
+
+- [x] 🔴 **47.1 Fix the headless init-order bug in 40.10.** `headless.zig` built its `Http` before calling `initDefaultTimeout(env)`, so `ZODE_HTTP_TIMEOUT_MS` was ignored for the entire `--chat` turn (the client snapshots the bound at construction). Moved the env call above the constructor and added an end-to-end smoke scenario: a socket that listens but never accepts must fail in ~2 s instead of hanging >10 s. The risk audit of the timeout wrapper (cross-thread vtable escape, race on the global, nested wraps, redact ownership, SSE arena lifetime, DEFLATE reuse) found no other defects.
+- [x] 🟢 **47.2 Remove six confirmed-dead declarations.** `agent.zig`: `curProvider`, `cur_key_state`, `cur_key_state_buf`, `resetSession`, `setModelRequestedIterations`, `openConnectPrompt`. `http_client.zig`: `postJsonWithHeaders`. All had zero references across the repo. Note: `model_requested_iter` is now permanently zero (its only writer was the deleted setter) — wiring that feature is a separate functional ticket, not a dead-code cleanup.
+
+---
+
 ## Suggested order
 
 1. **Security first:** 40.1 → 40.2 → 40.3 → 40.4 → 40.5 → 40.6.
