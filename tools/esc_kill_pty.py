@@ -116,7 +116,7 @@ def check(name: str, ok: bool, extra: str = "") -> bool:
 
 def main() -> int:
     if not os.path.exists(BINARY):
-        sys.exit(f"{BINARY} no existe: ejecuta `zig build` primero")
+        sys.exit(f"{BINARY} does not exist: run `zig build` first")
     if "ZODE_OPENCODE_KEY" not in os.environ:
         sys.exit("ZODE_OPENCODE_KEY is missing: `set -a && source .env && set +a`")
 

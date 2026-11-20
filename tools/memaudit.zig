@@ -30,17 +30,38 @@ pub fn main() !void {
     var total: usize = 0;
     var files: usize = 0;
     var scanned: usize = 0;
-    while (walker.next(io) catch null) |e| {
+    var skipped: usize = 0;
+    while (walker.next(io) catch |err| {
+        // A walk error used to end the loop silently: "clean (0 files scanned)"
+        // looked like a pass. It is not.
+        skipped += 1;
+        std.debug.print("memaudit: walk error {t} after {d} files\n", .{ err, scanned });
+        break;
+    }) |e| {
         if (e.kind != .file or !std.mem.endsWith(u8, e.basename, ".zig")) continue;
         // e.path borrows the walker buffer and dies on the next call: copy it.
-        const rel = gpa.dupe(u8, e.path) catch continue;
+        const rel = gpa.dupe(u8, e.path) catch {
+            skipped += 1;
+            continue;
+        };
         defer gpa.free(rel);
-        const path = std.fmt.allocPrint(gpa, "src/{s}", .{rel}) catch continue;
+        const path = std.fmt.allocPrint(gpa, "src/{s}", .{rel}) catch {
+            skipped += 1;
+            continue;
+        };
         defer gpa.free(path);
-        const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8 * 1024 * 1024)) catch continue;
+        const source = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(8 * 1024 * 1024)) catch {
+            skipped += 1;
+            std.debug.print("memaudit: SKIPPED {s} (unreadable or too large)\n", .{path});
+            continue;
+        };
         defer gpa.free(source);
 
-        const findings = audit.scan(gpa, source) catch continue;
+        const findings = audit.scan(gpa, source) catch {
+            skipped += 1;
+            std.debug.print("memaudit: SKIPPED {s} (scanner failed)\n", .{path});
+            continue;
+        };
         defer gpa.free(findings);
         scanned += 1;
         if (findings.len == 0) continue;
@@ -53,10 +74,15 @@ pub fn main() !void {
         }
     }
 
-    if (total == 0) {
+    if (total == 0 and skipped == 0) {
         std.debug.print("memaudit: clean ({d} source files scanned)\n", .{scanned});
         return;
     }
-    std.debug.print("memaudit: {d} finding(s) in {d} file(s)\n", .{ total, files });
+    if (total > 0) std.debug.print("memaudit: {d} finding(s) in {d} file(s)\n", .{ total, files });
+    // A gate that skips files and still reports success is worse than no gate:
+    // it says "clean" about a tree it never read. Fail loudly instead.
+    if (skipped > 0) {
+        std.debug.print("memaudit: {d} file(s) could not be scanned — NOT clean\n", .{skipped});
+    }
     std.process.exit(1);
 }

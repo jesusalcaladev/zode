@@ -1018,7 +1018,7 @@ test "writeFileSecure: creates the directory and writes with 0600" {
     try writeFileSecure(io, &env_map, path, "{\"a\":\"b\"}");
 
     const got = std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .limited(4096)) catch |err| {
-        std.debug.print("no se pudo leer: {t}\n", .{err});
+        std.debug.print("could not read: {t}\n", .{err});
         return err;
     };
     defer std.testing.allocator.free(got);

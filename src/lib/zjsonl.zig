@@ -99,6 +99,24 @@ test "a short payload is not compressed" {
     try std.testing.expect(compressLine(&buf, "{\"short\":1}") == null);
 }
 
+test "decompressInto refuses corrupt base64, truncated data and oversized output" {
+    const alloc = std.testing.allocator;
+    // A line can start with the marker and still be garbage: base64 decoding
+    // must fail loudly, not produce a half line that reads as a valid message.
+    try std.testing.expectError(error.BadCompressedLine, decompressInto(alloc, "z!!!not-base64!!!", 1 << 20));
+
+    var buf: [8192]u8 = undefined;
+    const payload = &repeat.rep("abcdef", 300);
+    const line = compressLine(&buf, payload) orelse return error.TestUnexpectedResult;
+    // Truncating the base64 body breaks the DEFLATE stream.
+    const cut = line[0 .. line.len -| 8];
+    try std.testing.expectError(error.BadCompressedLine, decompressInto(alloc, cut, 1 << 20));
+
+    // The decoder's max_out is the decompression-bomb guard. A legitimate
+    // line must fail when the caller asks for less than the real payload.
+    try std.testing.expectError(error.BadCompressedLine, decompressInto(alloc, line, payload.len / 2));
+}
+
 test "compressLineWith: the same window and writer work across many payloads" {
     // Session reuses one DEFLATE window and one allocating writer for every
     // persisted line. A stale byte from the previous payload or a writer that

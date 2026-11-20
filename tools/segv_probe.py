@@ -6,6 +6,8 @@ log is written before the process dies.
 """
 import argparse
 import fcntl
+from pathlib import Path
+import re
 import os
 import pty
 import select
@@ -17,6 +19,21 @@ import time
 
 HOME = "/tmp/opencode/zode-segv-home"
 CRASH_LOG = "/tmp/zode-crash.log"
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def restore_sequence() -> bytes:
+    """Read the exact bytes from termseq.zig, the single source of truth.
+
+    The probe used to hard-code `RESTORE_ALL`, so a change to the Zig constant
+    made the probe fail (or, worse, pass on a stale sequence) without anyone
+    noticing the drift.
+    """
+    src = (ROOT / "src" / "lib" / "termseq.zig").read_text(errors="replace")
+    match = re.search(r'pub const restore_all = "((?:\\.|[^"\\])*)";', src)
+    if not match:
+        raise RuntimeError("could not find restore_all in src/lib/termseq.zig")
+    return match.group(1).encode("ascii").decode("unicode_escape").encode("latin1")
 
 
 def main() -> int:
@@ -92,9 +109,8 @@ def main() -> int:
         failed = True
 
     # Require the FULL restore sequence, not one byte that could come from a
-    # normal redraw. Must match termseq.restore_all in src/lib/termseq.zig.
-    RESTORE_ALL = (b"\x1b[?2004l\x1b[?1002;1003;1004;1006;1016l"
-                   b"\x1b[<u\x1b[0m\x1b[?1049l\x1b[?25h")
+    # normal redraw. Read it from the Zig source so the two cannot drift.
+    RESTORE_ALL = restore_sequence()
     if RESTORE_ALL not in out:
         print("FAIL: the full termseq.restore_all sequence never reached the pty")
         failed = True

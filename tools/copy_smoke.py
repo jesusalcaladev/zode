@@ -22,9 +22,10 @@ script here: the app writes `~/.config/zode/auth.json` and `sessions/`, and an
 automated script must not touch the config — or the sessions — of whoever runs
 it.
 
-NOTE: no API key is set, on purpose. The ReleaseSmall build stops answering
-keys when the active provider HAS a key (an open bug, see AGENTS.md), and
-`/copy` needs no provider at all: it works on the session's own text.
+NOTE: no API key is set. `/copy` needs no provider at all — it works on the
+session's own text. Keyed startup has its own regression gate in
+`tools/key_smoke.py`; the old ReleaseSmall hang was fixed and is no longer a
+reason to avoid a key here.
 """
 import fcntl
 import os

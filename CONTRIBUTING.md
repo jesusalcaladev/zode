@@ -42,10 +42,15 @@ Phase 13 modules have reference harnesses in `tools/`: `remote_server.py` for
 
 ## Areas that need help
 
-- Windows support (the crash and terminal paths are POSIX-only today)
-- Checksum verification in the release/install chain
-- Command-reference coverage in `docs/commands.md`
-- End-to-end against Anthropic with your own key
+- **Windows support is not implemented and is not on the roadmap.** The crash
+  handler (signals, `/dev/tty`, raw terminal restore), the pty harnesses and the
+  keychain backend are POSIX-only. Use WSL or a Linux VM if you need zode on
+  Windows; a native port would be a redesign, not a patch.
+- End-to-end verification against a real Anthropic key (`zig build test -De2e`).
+- The remaining parity tickets in `TASKS.md` (Phases 49–51).
+
+Checksum verification and the generated command reference are DONE (Phases 45.2
+and 45.6); they are no longer open areas.
 
 ## Code rules
 

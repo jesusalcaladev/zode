@@ -22,6 +22,8 @@ jobs:
         run: zig build test
       - name: Memory-safety audit
         run: zig build memaudit
+      - name: English-only visible text
+        run: python3 tools/lang_check.py
       - name: Debug symbols (required)
         run: |
           zig build debug

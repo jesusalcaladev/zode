@@ -1,6 +1,8 @@
 //! Skills: core types and parsing (facade).
 //! Implementation lives in `skills/core.zig`; this path is kept stable for importers.
 
+const std = @import("std");
+
 const core = @import("skills/core.zig");
 
 pub const filename = core.filename;
@@ -28,4 +30,9 @@ pub const systemPromptSection = core.systemPromptSection;
 
 test {
     _ = core;
+}
+
+test "skills facade: a skill with no path filter applies everywhere" {
+    const entry = core.Entry{ .name = "review", .description = "review code" };
+    try std.testing.expect(skillAppliesHere(entry, null));
 }

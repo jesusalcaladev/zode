@@ -373,13 +373,24 @@ pub fn build(b: *std.Build) void {
     pty_check.dependOn(&run_smoke.step);
     pty_check.dependOn(&run_scroll.step);
     // `/copy`: the command, the picker and the file, in a real pty, with a
-    // session that has an answer in it. It sets NO api key on purpose: the
-    // ReleaseSmall build stops answering keys when the active provider has
-    // one (the open bug in AGENTS.md), and `/copy` needs no provider.
+    // session that has an answer in it. It needs no provider, so it sets no
+    // key; keyed startup is covered by key_smoke below.
     const run_copy = b.addSystemCommand(&.{ "python3", "tools/copy_smoke.py" });
     run_copy.setName("copy_smoke");
     run_copy.has_side_effects = true;
     pty_check.dependOn(&run_copy.step);
+    // 51.2: the old "ReleaseSmall + a saved key stops answering" regression.
+    // It was a use-after-free in warmupWorker and is fixed; this gate asserts
+    // it stays fixed with a fake key in an isolated HOME.
+    const run_key = b.addSystemCommand(&.{ "python3", "tools/key_smoke.py" });
+    run_key.setName("key_smoke");
+    run_key.has_side_effects = true;
+    // Serialize the pty scripts: four concurrent TUIs contend for the same
+    // terminal resources and the slower ones time out for no code reason.
+    run_scroll.step.dependOn(&run_smoke.step);
+    run_copy.step.dependOn(&run_scroll.step);
+    run_key.step.dependOn(&run_copy.step);
+    pty_check.dependOn(&run_key.step);
 
     // Phase 37: `zig build diag` — one-shot internal diagnostics. Doesn't
     // touch the network or the real HOME: --diag only reads /proc/self/status.

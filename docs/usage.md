@@ -159,7 +159,7 @@ Neither needs configuration: the block is attached only when it changed, and the
 
 The exit gate (`AutoCheck.exitGate`) runs at the top of each iteration and refuses to end on red (`refused_failed`), stale green (`refused_unverified`), or unverified writes.
 
-Project-level `zig build test` is the primary gate (800+ tests); `tools/pty_smoke.py` is the real-pty smoke test.
+Project-level `zig build test` is the primary gate (the full test suite); `tools/pty_smoke.py` is the real-pty smoke test.
 
 ## 8. Keyboard shortcuts
 

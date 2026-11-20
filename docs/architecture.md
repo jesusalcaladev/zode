@@ -140,7 +140,7 @@ Cache in `~/.cache/zode/update.json` (6 h TTL, one file, respects `XDG_CACHE_HOM
 
 ## Verification workflow
 
-- `zig build test` — the primary gate (800+ tests). Tests read `AGENTS.md` for routing rules (`systemPromptBase` + `tool_routing_prompt` must stay separate) and for banner content (only ASCII wordmark, nothing else below art).
+- `zig build test` — the primary gate (the full test suite). Tests read `AGENTS.md` for routing rules (`systemPromptBase` + `tool_routing_prompt` must stay separate) and for banner content (only ASCII wordmark, nothing else below art).
 - `tools/pty_smoke.py` — real pty (`TIOCSWINSZ` at 200×50, own `HOME`, drains pty). Checks: startup, banner, input, palette, scroll, `!cmd`, long prompt preserved, no panic, no `Invalid free`.
 - `zig build ui-frame` — design harness: renders scenes with real `drawFn` + `Model`. Finds layout bugs unit tests miss.
 - `zig build debug` — must produce a symbolized binary (`.symtab`, `.debug_info`, `nm` lists symbols).

@@ -24,6 +24,7 @@ import os
 import pty
 import re
 import select
+import signal
 import struct
 import sys
 import shutil
@@ -35,6 +36,9 @@ ROWS, COLS = 50, 200
 BINARY = "./zig-out/bin/zode"
 # A separate HOME: `auth.json` and `sessions/` belong to the person, not to the smoke.
 SANDBOX_HOME = "/tmp/opencode/zode-smoke-home"
+# Every child started by `drive`, so a timeout can reap them instead of
+# leaving orphan TUIs holding the pty open.
+SPAWNED = []
 
 
 def strip_ansi(b: bytes) -> str:
@@ -64,6 +68,8 @@ def drive(keys, budget: float = 8.0, expect=None, until=None):
         sys.exit(f"{BINARY} does not exist: run `zig build` first")
 
     pid, fd = pty.fork()
+    if pid > 0:
+        SPAWNED.append(pid)
     if pid == 0:
         # The color is PINNED, and `zig build pty-check` is why. `zig build` puts
         # `NO_COLOR=1` in the environment of every step it runs, so the app came up
@@ -452,8 +458,31 @@ def main() -> int:
 
 
 def _run_with_timeout():
-    """Wrapper that ensures clean exit even if something hangs."""
-    return main()
+    """Bound the whole smoke run. A child that ignores Ctrl+C used to hang CI
+    forever in the blocking `os.waitpid` inside `drive`: the docstring promised
+    a timeout but the function just called `main()`. SIGALRM interrupts both
+    `select` and `waitpid`; the handler kills every child before raising so the
+    harness does not leave orphan TUIs behind.
+    """
+    # The full smoke drives many scenes in series; under a loaded CI runner it
+    # legitimately takes minutes. 300 s still catches a real hang (a child that
+    # ignores Ctrl+C used to block forever) without failing on a slow machine.
+    seconds = float(os.environ.get("ZODE_SMOKE_TIMEOUT", "300"))
+
+    def on_alarm(signum, frame):
+        for child in SPAWNED:
+            try:
+                os.kill(child, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        raise TimeoutError(f"smoke test exceeded {seconds:.0f}s")
+
+    signal.signal(signal.SIGALRM, on_alarm)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        return main()
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
 
 
 if __name__ == "__main__":
