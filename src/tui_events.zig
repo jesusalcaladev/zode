@@ -229,13 +229,9 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 try self.armTick(ctx);
                 return;
             }
-            // Ctrl+P palette open: captures ALL input, scroll included.
-            if (self.pal.active) {
-                if (try self.paletteKey(ctx, key)) {
-                    try self.armTick(ctx);
-                    return;
-                }
-            }
+            // An open palette owns its keys; the only handler above that can
+            // OPEN one is Ctrl+A (Connect). Its key was already consumed by
+            // the palette gate at the top, so there is nothing to re-dispatch.
             // An open question WITH options: the panel is the menu, so the arrows
             // move the panel's own highlight and Enter takes it.
             //

@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - drop 337 one-line agent forwarders (42.8) [`fc2ea6d8`](https://github.com/jesusalcaladev/zode/commit/fc2ea6d8)
 - use the Model's io instead of agent.io_global (25 sites) (42.8) [`b4436af8`](https://github.com/jesusalcaladev/zode/commit/b4436af8)
 - pass the autocomplete count into drawAutocomplete (tui) [`9ace7f27`](https://github.com/jesusalcaladev/zode/commit/9ace7f27)
+- remove the duplicated palette key dispatch (47.6) (tui) [`2ddabd16`](https://github.com/jesusalcaladev/zode/commit/2ddabd16)
 
 ### Performance
 
@@ -57,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - coverage for the three core gaps (phase43) [`4bae7558`](https://github.com/jesusalcaladev/zode/commit/4bae7558)
 - deterministic failed-spawn test (43.6) (compaction) [`6708c1da`](https://github.com/jesusalcaladev/zode/commit/6708c1da)
 - end-to-end smoke for --chat (43.7) (headless) [`4bf7827b`](https://github.com/jesusalcaladev/zode/commit/4bf7827b)
-- wait for asserted screen state instead of fixed sleeps (47.5) (pty) [`80259a84`](https://github.com/jesusalcaladev/zode/commit/80259a84)
+- wait for asserted screen state instead of fixed sleeps (47.5) (pty) [`d8a5eb1c`](https://github.com/jesusalcaladev/zode/commit/d8a5eb1c)
 
 ## [0.3.0-beta.1] - 2026-11-16
 
