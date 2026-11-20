@@ -77,6 +77,51 @@ pub fn parse(arena: std.mem.Allocator, lines: []const []const u8) !ParseResult {
     return .{ .hunks = try out.toOwnedSlice(arena) };
 }
 
+/// Replaces the content of the listed hunks with a one-line marker.
+///
+/// The header always stays — that is what the reader folds and unfolds — and
+/// the marker says HOW MANY lines are hidden, so a folded diff never looks
+/// like a diff that simply ended early. Line indices in `folded` are indices
+/// into the hunk array returned by `parse`, not line numbers in `lines`.
+pub fn fold(
+    arena: std.mem.Allocator,
+    lines: []const []const u8,
+    folded: []const usize,
+) ![]const []const u8 {
+    const parsed = try parse(arena, lines);
+    var out: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    var hunk: usize = 0;
+    while (i < lines.len) {
+        var is_folded = false;
+        if (hunk < parsed.hunks.len and parsed.hunks[hunk].header_line == i) {
+            for (folded) |f| {
+                if (f == hunk) {
+                    is_folded = true;
+                    break;
+                }
+            }
+            hunk += 1;
+        }
+        try out.append(arena, lines[i]);
+        i += 1;
+        if (!is_folded) continue;
+        // The previous iteration appended the header; its hunk range is now in
+        // `hunk - 1`.
+        const h = parsed.hunks[hunk - 1];
+        const hidden = h.content_end - h.content_start;
+        if (hidden > 0) {
+            const marker = try std.fmt.allocPrint(arena, "  \u{2026} {d} line{s} folded", .{
+                hidden,
+                if (hidden == 1) "" else "s",
+            });
+            try out.append(arena, marker);
+        }
+        i = h.content_end;
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// Parses a single header line: `@@ -a,b +c,d @@` or `@@ -a +c @@`-style counts.
 /// Returns null for `@@ ... @@` elisions or malformed headers.
 pub fn parseHeader(line: []const u8) ?Hunk {
@@ -123,6 +168,35 @@ fn parseNum(s: []const u8) ?Num {
         n = n * 10 + (s[i] - '0');
     }
     return .{ .n = n, .rest = s[i..] };
+}
+
+test "fold: a folded hunk keeps its header and reports how many lines are hidden" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const lines = [_][]const u8{
+        "@@ -1,3 +1,3 @@",
+        " keep",
+        "-old",
+        "+new",
+        "@@ -10,2 +10,2 @@",
+        " second",
+        "-a",
+        "+b",
+    };
+    const folded = [_]usize{0};
+    const out = try fold(arena, &lines, &folded);
+    try std.testing.expectEqual(@as(usize, 6), out.len);
+    try std.testing.expectEqualStrings("@@ -1,3 +1,3 @@", out[0]);
+    try std.testing.expectEqualStrings("  \u{2026} 3 lines folded", out[1]);
+    try std.testing.expectEqualStrings("@@ -10,2 +10,2 @@", out[2]);
+    try std.testing.expectEqualStrings(" second", out[3]);
+    try std.testing.expectEqualStrings("-a", out[4]);
+    try std.testing.expectEqualStrings("+b", out[5]);
+
+    const none = try fold(arena, &lines, &.{});
+    try std.testing.expectEqual(@as(usize, 8), none.len);
 }
 
 test "parseHeader: standard unified diff header" {

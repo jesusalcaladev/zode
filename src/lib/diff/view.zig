@@ -244,9 +244,80 @@ fn readNumber(line: []const u8, i: *usize) ?usize {
     return std.fmt.parseUnsigned(usize, line[start..i.*], 10) catch null;
 }
 
+/// One row of a SIDE-BY-SIDE diff. `-`/`+` runs are paired positionally so a
+/// reader compares the old and new version on the same screen row; a run with
+/// no counterpart gets an empty cell rather than dropping a line.
+pub const SideRow = struct {
+    left: []const u8 = "",
+    right: []const u8 = "",
+    left_kind: LineKind = .other,
+    right_kind: LineKind = .other,
+    /// True for a `@@` header: it spans both columns.
+    header: bool = false,
+};
+
+/// Builds two-column rows from a unified diff. Pure: text slices point into
+/// the caller's `text`, so nothing is copied except the row array itself.
+pub fn sideBySide(arena: std.mem.Allocator, text: []const u8) ![]SideRow {
+    var out: std.ArrayList(SideRow) = .empty;
+    var pending: ?[]const u8 = null;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0) continue;
+        if (line[0] == '@') {
+            if (pending) |p| {
+                try out.append(arena, .{ .left = p, .left_kind = .del });
+                pending = null;
+            }
+            try out.append(arena, .{ .left = line, .right = line, .header = true });
+            continue;
+        }
+        switch (line[0]) {
+            '-' => {
+                if (pending) |p| try out.append(arena, .{ .left = p, .left_kind = .del });
+                pending = line;
+            },
+            '+' => {
+                if (pending) |p| {
+                    try out.append(arena, .{ .left = p, .right = line, .left_kind = .del, .right_kind = .add });
+                    pending = null;
+                } else {
+                    try out.append(arena, .{ .right = line, .right_kind = .add });
+                }
+            },
+            else => {
+                if (pending) |p| {
+                    try out.append(arena, .{ .left = p, .left_kind = .del });
+                    pending = null;
+                }
+                try out.append(arena, .{ .left = line, .right = line, .left_kind = .ctx, .right_kind = .ctx });
+            },
+        }
+    }
+    if (pending) |p| try out.append(arena, .{ .left = p, .left_kind = .del });
+    return out.toOwnedSlice(arena);
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "sideBySide: pairs del/add runs and keeps unmatched lines" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = "@@ -1,3 +1,3 @@\n keep\n-old\n+new\n+extra\n";
+    const rows = try sideBySide(arena, text);
+    try std.testing.expectEqual(@as(usize, 4), rows.len);
+    try std.testing.expect(rows[0].header);
+    try std.testing.expectEqualStrings(" keep", rows[1].left);
+    try std.testing.expectEqualStrings(" keep", rows[1].right);
+    try std.testing.expectEqualStrings("-old", rows[2].left);
+    try std.testing.expectEqualStrings("+new", rows[2].right);
+    try std.testing.expectEqualStrings("", rows[3].left);
+    try std.testing.expectEqualStrings("+extra", rows[3].right);
+}
 
 test "the numbers come from the two counters, not from the row's position" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);

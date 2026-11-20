@@ -1410,6 +1410,17 @@ pub const Model = struct {
     vim_normal: bool = false,
     /// Pending vim operator/key (e.g. 'd', 'g') in normal mode.
     vim_pending: u8 = 0,
+    /// Count prefix (`3w`, `5dd`). Digits accumulate until a command consumes
+    /// them, and are reset on Esc, a mode change and any non-command key.
+    vim_count: usize = 0,
+    vim_visual: bool = false,
+    vim_visual_anchor: usize = 0,
+    /// One unnamed register, enough for `x`/`d`/`y` then `p`.
+    vim_register: [512]u8 = undefined,
+    vim_register_len: usize = 0,
+    /// Last mutating command for `.` (one key + the count it had).
+    vim_dot: u8 = 0,
+    vim_dot_count: usize = 0,
 
     /// Additional directories added via `/add-dir` (35.13). Owned strings.
     extra_dirs: std.ArrayList([]u8) = .empty,
@@ -1994,6 +2005,9 @@ pub const Model = struct {
     diff_viewer_active: bool = false,
     diff_viewer_sel: usize = 0,
     diff_viewer_scroll: usize = 0,
+    /// Hunk indices folded in the diff viewer. Structured state, never parsed
+    /// back out of the rendered text. `f` toggles the hunk under the cursor.
+    folded_hunks: std.ArrayList(usize) = .empty,
 
     // ── transcript search (33.13) ──
     search_bar_active: bool = false,
@@ -2472,6 +2486,7 @@ pub const Model = struct {
         }
         self.shell_out.deinit(self.allocator);
         self.search_matches.deinit(self.allocator);
+        self.folded_hunks.deinit(self.allocator);
         self.destroyPalette();
         if (self.pending_items) |items| palette.freeItems(self.allocator, items);
         self.ed.deinit();
@@ -2939,6 +2954,29 @@ pub const Model = struct {
     }
 
     /// Handles keys while the diff viewer modal is active. Returns true if consumed.
+    /// Which hunk header the viewer is currently looking at. Counting the
+    /// headers above the scroll offset is enough: a hunk fold is a presentation
+    /// decision, not a cursor into the model's wire state.
+    fn diffViewerHunkAtScroll(self: *const Model) usize {
+        const idx = self.diffViewerSelectedPara() orelse return 0;
+        if (idx >= self.paras.items.len) return 0;
+        var n: usize = 0;
+        var i: usize = 0;
+        var it = std.mem.splitScalar(u8, self.paras.items[idx].text, '\n');
+        while (it.next()) |line| : (i += 1) {
+            if (i >= self.diff_viewer_scroll) break;
+            if (std.mem.startsWith(u8, line, "@@ -")) n += 1;
+        }
+        return n;
+    }
+
+    fn foldedHunkIsFolded(self: *const Model, h: usize) bool {
+        for (self.folded_hunks.items) |f| {
+            if (f == h) return true;
+        }
+        return false;
+    }
+
     pub fn diffViewerHandleKey(self: *Model, key: vaxis.Key) bool {
         if (!self.diff_viewer_active) return false;
         if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
@@ -2974,6 +3012,21 @@ pub const Model = struct {
         }
         if (key.matches('u', .{ .ctrl = true })) {
             self.diff_viewer_scroll -|= 10;
+            return true;
+        }
+        if (key.matches('f', .{})) {
+            const h = self.diffViewerHunkAtScroll();
+            if (self.foldedHunkIsFolded(h)) {
+                var i: usize = 0;
+                while (i < self.folded_hunks.items.len) : (i += 1) {
+                    if (self.folded_hunks.items[i] == h) {
+                        _ = self.folded_hunks.orderedRemove(i);
+                        break;
+                    }
+                }
+            } else {
+                self.folded_hunks.append(self.allocator, h) catch {};
+            }
             return true;
         }
         if (key.codepoint == 0x0D) { // enter: jump to diff in transcript
@@ -6125,7 +6178,7 @@ pub const Model = struct {
         self.file_focus = null;
     }
 
-    fn recordFileIntel(
+    pub fn recordFileIntel(
         self: *Model,
         path: []const u8,
         diff_para: ?usize,
@@ -8128,7 +8181,13 @@ pub fn keyToBinding(gpa: std.mem.Allocator, key: vaxis.Key) !?[]u8 {
 /// The command bound to this key, or null. Custom bindings do not fire while
 /// vim is in normal mode — in that mode vim owns every key by design.
 pub fn boundCommand(self: *const Model, gpa: std.mem.Allocator, key: vaxis.Key) !?[]const u8 {
-    if (self.vim_mode and self.vim_normal) return null;
+    // In vim normal mode a LETTER is a command and must stay one. Function keys
+    // and modifier-only combos cannot be typed as text, so a custom binding on
+    // them never steals a motion or an operator.
+    const is_fn_key = key.codepoint >= vaxis.Key.f1 and key.codepoint <= vaxis.Key.f12;
+    if (self.vim_mode and self.vim_normal and !is_fn_key and
+        key.codepoint < 128 and !key.mods.ctrl and !key.mods.alt)
+        return null;
     if (self.keybindings.len == 0) return null;
     const name = (try keyToBinding(gpa, key)) orelse return null;
     defer gpa.free(name);
@@ -8357,15 +8416,55 @@ pub fn syncAutocomplete(self: *Model) void {
 }
 
 /// Minimal vim normal-mode handling for the input editor (35.13).
+/// Clears every transient bit of vim state. Esc and mode changes must not
+/// leave a half-entered count, operator or visual selection behind.
+fn vimReset(self: *Model) void {
+    self.vim_pending = 0;
+    self.vim_count = 0;
+    self.vim_visual = false;
+}
+
+fn vimYankRange(self: *Model, start: usize, end: usize) void {
+    const text = self.ed.text();
+    if (start >= end or end > text.len) return;
+    const n = @min(end - start, self.vim_register.len);
+    @memcpy(self.vim_register[0..n], text[start..end][0..n]);
+    self.vim_register_len = n;
+}
+
+fn vimDeleteRange(self: *Model, start: usize, end: usize, dot: u8, count: usize) void {
+    vimYankRange(self, start, end);
+    self.ed.deleteRange(start, end) catch return;
+    self.vim_dot = dot;
+    self.vim_dot_count = count;
+}
+
+/// Repeats a motion `count` times. `vim_count` is a prefix, not a mode: a 0
+/// prefix means "once", exactly like every other vim.
+fn vimRepeatMotion(self: *Model, key: u8, count: usize) void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        switch (key) {
+            'h' => self.ed.moveLeft(),
+            'l' => self.ed.moveRight(),
+            'j' => self.ed.moveDown(),
+            'k' => self.ed.moveUp(),
+            'w' => self.ed.moveWordRight(),
+            'b' => self.ed.moveWordLeft(),
+            else => return,
+        }
+    }
+}
+
 fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
     // Allow Ctrl combos to fall through to normal handling when not a vim command.
     if (k.mods.ctrl) {
-        self.vim_pending = 0;
+        vimReset(self);
         return false;
     }
     // Special keys
     if (k.matches(vaxis.Key.escape, .{})) {
-        self.vim_pending = 0;
+        vimReset(self);
         ctx.redraw = true;
         return true;
     }
@@ -8374,44 +8473,89 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
             try submitInput(self, ctx);
             return true;
         }
-        self.vim_pending = 0;
+        vimReset(self);
         return false;
     }
     if (k.matches(vaxis.Key.backspace, .{}) or k.matches(vaxis.Key.left, .{})) {
         self.ed.moveLeft();
-        self.vim_pending = 0;
+        vimReset(self);
         ctx.redraw = true;
         return true;
     }
     if (k.matches(vaxis.Key.right, .{})) {
         self.ed.moveRight();
-        self.vim_pending = 0;
+        vimReset(self);
         ctx.redraw = true;
         return true;
     }
     if (k.matches(vaxis.Key.up, .{})) {
         self.ed.moveUp();
-        self.vim_pending = 0;
+        vimReset(self);
         ctx.redraw = true;
         return true;
     }
     if (k.matches(vaxis.Key.down, .{})) {
         self.ed.moveDown();
-        self.vim_pending = 0;
+        vimReset(self);
         ctx.redraw = true;
         return true;
     }
 
     const txt = k.text orelse {
-        self.vim_pending = 0;
+        vimReset(self);
         return false;
     };
     if (txt.len != 1) return false;
     const c = txt[0];
 
+    // A count prefix. Digits never form a command on their own.
+    if (c >= '0' and c <= '9') {
+        self.vim_count = self.vim_count * 10 + (c - '0');
+        ctx.redraw = true;
+        return true;
+    }
+    const count: usize = if (self.vim_count == 0) 1 else self.vim_count;
+
+    // Visual mode: motions extend the selection from the anchor; d/x/y act on
+    // the whole range and p is not meaningful here.
+    if (self.vim_visual) {
+        switch (c) {
+            'h', 'l', 'j', 'k', 'w', 'b' => {
+                vimRepeatMotion(self, c, count);
+                self.vim_count = 0;
+                ctx.redraw = true;
+                return true;
+            },
+            '0' => self.ed.moveHome(),
+            '$' => self.ed.moveEnd(),
+            'G' => self.ed.moveToEnd(),
+            'd', 'x', 'y' => {
+                const a = @min(self.vim_visual_anchor, self.ed.cursor);
+                const b = @max(self.vim_visual_anchor, self.ed.cursor);
+                vimYankRange(self, a, b);
+                if (c != 'y' and b > a) {
+                    self.ed.deleteRange(a, b) catch {};
+                    self.vim_dot = 'x';
+                    self.vim_dot_count = 1;
+                }
+                vimReset(self);
+                syncAutocomplete(self);
+                ctx.redraw = true;
+                return true;
+            },
+            else => {
+                vimReset(self);
+                return false;
+            },
+        }
+        self.vim_count = 0;
+        ctx.redraw = true;
+        return true;
+    }
+
     // Pending 'g' (gg)
     if (self.vim_pending == 'g') {
-        self.vim_pending = 0;
+        vimReset(self);
         if (c == 'g') {
             self.ed.moveToStart();
             ctx.redraw = true;
@@ -8421,7 +8565,7 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
     }
     // Pending 'd' (dd, dw, db, d$)
     if (self.vim_pending == 'd') {
-        self.vim_pending = 0;
+        vimReset(self);
         if (c == 'd') {
             // delete current logical line
             const s = self.ed.text();
@@ -8458,33 +8602,9 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
     }
 
     switch (c) {
-        'h' => {
-            self.ed.moveLeft();
-            ctx.redraw = true;
-            return true;
-        },
-        'l' => {
-            self.ed.moveRight();
-            ctx.redraw = true;
-            return true;
-        },
-        'j' => {
-            self.ed.moveDown();
-            ctx.redraw = true;
-            return true;
-        },
-        'k' => {
-            self.ed.moveUp();
-            ctx.redraw = true;
-            return true;
-        },
-        'w' => {
-            self.ed.moveWordRight();
-            ctx.redraw = true;
-            return true;
-        },
-        'b' => {
-            self.ed.moveWordLeft();
+        'h', 'l', 'j', 'k', 'w', 'b' => {
+            vimRepeatMotion(self, c, count);
+            self.vim_count = 0;
             ctx.redraw = true;
             return true;
         },
@@ -8514,13 +8634,63 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
             return true;
         },
         'x' => {
-            self.ed.deleteAfter();
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                const pos = self.ed.cursor;
+                const end = if (pos < self.ed.text().len) self.ed.graphemeEndAt(pos) else pos;
+                vimDeleteRange(self, pos, end, 'x', count);
+            }
+            self.vim_count = 0;
             syncAutocomplete(self);
             ctx.redraw = true;
             return true;
         },
         'D' => {
-            self.ed.deleteToEnd();
+            const pos = self.ed.cursor;
+            vimDeleteRange(self, pos, self.ed.text().len, 'D', count);
+            self.vim_count = 0;
+            syncAutocomplete(self);
+            ctx.redraw = true;
+            return true;
+        },
+        'v' => {
+            // Enter visual mode with the cursor as the anchor.
+            self.vim_visual = true;
+            self.vim_visual_anchor = self.ed.cursor;
+            self.vim_count = 0;
+            ctx.redraw = true;
+            return true;
+        },
+        'p' => {
+            if (self.vim_register_len > 0) {
+                vimRepeatMotion(self, 'l', 1);
+                self.ed.insert(self.vim_register[0..self.vim_register_len]) catch {};
+                self.vim_dot = 'p';
+                self.vim_dot_count = 1;
+            }
+            self.vim_count = 0;
+            syncAutocomplete(self);
+            ctx.redraw = true;
+            return true;
+        },
+        '.' => {
+            const dot = self.vim_dot;
+            const n = self.vim_dot_count;
+            if (dot == 'x') {
+                var i: usize = 0;
+                while (i < n) : (i += 1) {
+                    const pos = self.ed.cursor;
+                    const end = if (pos < self.ed.text().len) self.ed.graphemeEndAt(pos) else pos;
+                    vimDeleteRange(self, pos, end, 'x', n);
+                }
+            } else if (dot == 'D') {
+                const pos = self.ed.cursor;
+                vimDeleteRange(self, pos, self.ed.text().len, 'D', n);
+            } else if (dot == 'p' and self.vim_register_len > 0) {
+                vimRepeatMotion(self, 'l', 1);
+                self.ed.insert(self.vim_register[0..self.vim_register_len]) catch {};
+            }
+            self.vim_count = 0;
             syncAutocomplete(self);
             ctx.redraw = true;
             return true;
@@ -8558,28 +8728,28 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
         },
         'i' => {
             self.vim_normal = false;
-            self.vim_pending = 0;
+            vimReset(self);
             ctx.redraw = true;
             return true;
         },
         'I' => {
             self.ed.moveHome();
             self.vim_normal = false;
-            self.vim_pending = 0;
+            vimReset(self);
             ctx.redraw = true;
             return true;
         },
         'a' => {
             self.ed.moveRight();
             self.vim_normal = false;
-            self.vim_pending = 0;
+            vimReset(self);
             ctx.redraw = true;
             return true;
         },
         'A' => {
             self.ed.moveEnd();
             self.vim_normal = false;
-            self.vim_pending = 0;
+            vimReset(self);
             ctx.redraw = true;
             return true;
         },
@@ -8587,7 +8757,7 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
             self.ed.moveEnd();
             if (self.ed.insertChar('\n')) |_| {} else |_| {}
             self.vim_normal = false;
-            self.vim_pending = 0;
+            vimReset(self);
             syncAutocomplete(self);
             ctx.redraw = true;
             return true;
@@ -8600,14 +8770,14 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
             if (self.ed.insertChar('\n')) |_| {} else |_| {}
             self.ed.setCursor(ls);
             self.vim_normal = false;
-            self.vim_pending = 0;
+            vimReset(self);
             syncAutocomplete(self);
             ctx.redraw = true;
             return true;
         },
         else => {},
     }
-    self.vim_pending = 0;
+    vimReset(self);
     return false;
 }
 
@@ -9814,6 +9984,12 @@ pub fn setStatusModel(m: *Model, name: []const u8) void {
     m.status_model_len = n;
     m.status_model_tried = true;
     m.dirty = true;
+}
+
+/// Public seam for `/vim`: clears every transient bit of vim state so a
+/// toggled-off mode cannot be re-entered mid-count or mid-operator.
+pub fn resetVim(self: *Model) void {
+    vimReset(self);
 }
 
 /// Publishes the compact cost string shown in the footer. Copies into the
@@ -11174,7 +11350,7 @@ pub fn drawDiffViewer(p: *Painter, m: *const Model, width: u16, height: u16) voi
     var title_buf: [96]u8 = undefined;
     const title = std.mem.print(&title_buf, " Diff viewer  ({d}/{d} files) ", .{ sel + 1, n }) catch " Diff viewer ";
     _ = p.putText(x0 + 2, y0, title, theme.accent_bold);
-    const hint = " ↑↓ file · PgUp/PgDn scroll · Enter jump · Esc close ";
+    const hint = " ↑↓ file · PgUp/PgDn scroll · f fold hunk · Enter jump · Esc close ";
     _ = p.putClipped(x0 + 2, y0 + box_h - 1, hint, box_w -| 4, theme.hint);
 
     // File list area
@@ -11225,19 +11401,25 @@ pub fn drawDiffViewer(p: *Painter, m: *const Model, width: u16, height: u16) voi
         return;
     }
 
-    // Count lines and render visible window
-    var total_lines: usize = 0;
+    // Count lines and render visible window. Folding is applied to a COPY of
+    // the line list in the frame arena: the paragraph itself is the wire truth
+    // and must never be mutated by a presentation choice.
+    var raw_lines: std.ArrayList([]const u8) = .empty;
     {
         var it = std.mem.splitScalar(u8, para.text, '\n');
-        while (it.next()) |_| total_lines += 1;
+        while (it.next()) |line| raw_lines.append(p.arena, line) catch {};
     }
+    const view_lines = if (m.folded_hunks.items.len > 0)
+        diffhunks.fold(p.arena, raw_lines.items, m.folded_hunks.items) catch raw_lines.items
+    else
+        raw_lines.items;
+    const total_lines = view_lines.len;
     const max_scroll = if (total_lines > diff_rows) total_lines - diff_rows else 0;
     const scroll = @min(m.diff_viewer_scroll, max_scroll);
 
-    var line_idx: usize = 0;
     var drawn: usize = 0;
-    var it = std.mem.splitScalar(u8, para.text, '\n');
-    while (it.next()) |line| : (line_idx += 1) {
+    for (view_lines, 0..) |line, line_idx| {
+        if (line_idx < scroll) continue;
         if (line_idx < scroll) continue;
         if (drawn >= diff_rows) break;
         const row = diff_top + @as(u16, @intCast(drawn));

@@ -202,6 +202,12 @@ pub const Editor = struct {
     }
 
     /// Moves the cursor to a byte offset (clamped to the buffer).
+    /// End offset of the grapheme starting at `from`. Exposed for vim's `x`,
+    /// which deletes one grapheme, not one byte.
+    pub fn graphemeEndAt(self: *const Editor, from: usize) usize {
+        return self.nextGraphemeEnd(from);
+    }
+
     pub fn setCursor(self: *Editor, pos: usize) void {
         self.cursor = @min(pos, self.buf.items.len);
     }

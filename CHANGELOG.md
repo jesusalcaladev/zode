@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUI key safety, docs and CI correctness (phases44-45) [`55368ae1`](https://github.com/jesusalcaladev/zode/commit/55368ae1)
 - close four more backlog items (45.2, 43.5, 43.8, 42.7) [`5e6ca604`](https://github.com/jesusalcaladev/zode/commit/5e6ca604)
 - bound every network operation (40.10) (http) [`069dd1dc`](https://github.com/jesusalcaladev/zode/commit/069dd1dc)
-- reasoning block, inline markdown, search marks, undo, cost footer (49) (tui) [`4ca60316`](https://github.com/jesusalcaladev/zode/commit/4ca60316)
+- reasoning block, inline markdown, search marks, undo, cost footer (49) (tui) [`56af7c6a`](https://github.com/jesusalcaladev/zode/commit/56af7c6a)
+- counts, register, visual mode, hunk folding, side-by-side (49) (vim,diff) [`215b4838`](https://github.com/jesusalcaladev/zode/commit/215b4838)
 
 ### Bug Fixes
 

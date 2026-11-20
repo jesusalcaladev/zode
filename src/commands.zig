@@ -666,7 +666,9 @@ pub fn cmdKeybinds(m: *tui.Model, arg: ?[]const u8) void {
 pub fn cmdVim(m: *tui.Model) void {
     m.vim_mode = !m.vim_mode;
     m.vim_normal = false;
-    m.vim_pending = 0;
+    // A half-entered count, operator or visual selection must not survive a
+    // toggle: /vim off then on again used to reopen mid-command.
+    tui.resetVim(m);
     if (m.vim_mode) {
         // Start in insert mode to avoid surprising users mid-typing.
         m.pushInfo("vim mode: on (insert). Esc -> normal, i/a/... -> insert. /vim to disable.");

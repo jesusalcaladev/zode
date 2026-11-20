@@ -1699,6 +1699,27 @@ test "footer: the right-hand group fits and is not cut" {
     try std.testing.expect(std.mem.indexOf(u8, row, "kimi") != null);
 }
 
+test "diff viewer: f folds a hunk into a one-line marker" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    agent.setAnswering("");
+    defer m.deinit();
+    _ = m.pushDiffLang("one\ntwo\nthree\n", "one\nTWO\nthree\n", "zig", "src/a.zig");
+    _ = try drawTest(&m, arena_state.allocator(), 100, 24);
+    m.recordFileIntel("src/a.zig", 0, 1, 1, false, .modified);
+    try std.testing.expect(m.openDiffViewer());
+    const before = try drawTest(&m, arena_state.allocator(), 100, 24);
+    try std.testing.expect(findRow(before, "two") != null);
+    m.folded_hunks.append(std.testing.allocator, 0) catch return;
+    try std.testing.expect(findRow(before, "two") != null);
+
+    m.folded_hunks.append(std.testing.allocator, 0) catch return;
+    const s = try drawTest(&m, arena_state.allocator(), 100, 24);
+    // The folded marker reaches the screen; the raw content line is gone.
+    try std.testing.expect(findRow(s, "folded") != null);
+}
+
 test "markdown: a link cell carries its OSC-8 target and a task list renders" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -6990,6 +7011,65 @@ test "keybinds: a Vaxis key maps to the canonical binding string" {
     try std.testing.expect((try keyToBinding(gpa, .{ .codepoint = 0x1F600 })) == null);
 }
 
+fn vimKey(m: *Model, ctx: *vxfw.EventContext, c: u8) !void {
+    var buf = [_]u8{c};
+    _ = try tui.editorKey(m, ctx, .{ .codepoint = c, .text = &buf });
+}
+
+test "vim: count prefix, unnamed register and dot-repeat" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    var ctx = testCtx();
+    defer ctx.cmds.deinit(ctx.alloc);
+    m.vim_mode = true;
+    m.vim_normal = true;
+    try m.ed.insert("one two three four");
+    m.ed.setCursor(0);
+
+    // 3w moves three words (cursor lands at the start of "four").
+    try vimKey(&m, &ctx, '3');
+    try vimKey(&m, &ctx, 'w');
+    try std.testing.expectEqual(@as(usize, 0), m.vim_count);
+    try std.testing.expectEqualStrings("four", m.ed.text()[m.ed.cursor..]);
+
+    // x yanks into the unnamed register; p pastes it after the cursor.
+    try vimKey(&m, &ctx, 'x');
+    try std.testing.expectEqual(@as(usize, 1), m.vim_register_len);
+    try std.testing.expectEqualStrings("f", m.vim_register[0..1]);
+    try vimKey(&m, &ctx, 'p');
+    // x removed the 'f' of "four", p moved one right and inserted it again.
+    try std.testing.expectEqualStrings("one two three ofur", m.ed.text());
+
+    // Dot repeats the last mutation, not the motion.
+    const before = m.ed.text().len;
+    try vimKey(&m, &ctx, '.');
+    try std.testing.expect(before != m.ed.text().len);
+}
+
+test "vim: visual mode deletes a range and Esc drops a half-entered count" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    var ctx = testCtx();
+    defer ctx.cmds.deinit(ctx.alloc);
+    m.vim_mode = true;
+    m.vim_normal = true;
+    try m.ed.insert("abcdef");
+    m.ed.setCursor(0);
+
+    try vimKey(&m, &ctx, 'v');
+    try std.testing.expect(m.vim_visual);
+    try vimKey(&m, &ctx, 'l');
+    try vimKey(&m, &ctx, 'l');
+    try vimKey(&m, &ctx, 'd');
+    try std.testing.expect(!m.vim_visual);
+    try std.testing.expectEqualStrings("cdef", m.ed.text());
+
+    try vimKey(&m, &ctx, '4');
+    try std.testing.expectEqual(@as(usize, 4), m.vim_count);
+    try vimKey(&m, &ctx, 0x1b); // Esc
+    try std.testing.expectEqual(@as(usize, 0), m.vim_count);
+}
+
 test "keybinds: a bound key resolves to its command, vim normal mode wins" {
     const gpa = std.testing.allocator;
     const bindings = try gpa.alloc(keybinds.Binding, 2);
@@ -7004,7 +7084,10 @@ test "keybinds: a bound key resolves to its command, vim normal mode wins" {
     try std.testing.expect((try boundCommand(&m, gpa, .{ .codepoint = vaxis.Key.f7 })) == null);
     m.vim_mode = true;
     m.vim_normal = true;
-    try std.testing.expect((try boundCommand(&m, gpa, f2)) == null);
+    // Function keys are not typeable text: they still fire in normal mode.
+    try std.testing.expectEqualStrings("/help", (try boundCommand(&m, gpa, f2)).?);
+    // A letter IS a vim command, so a binding on it must not steal the motion.
+    try std.testing.expect((try boundCommand(&m, gpa, .{ .codepoint = 'r' })) == null);
     m.vim_mode = false;
     m.vim_normal = false;
 }
