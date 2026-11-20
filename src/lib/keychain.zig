@@ -26,6 +26,39 @@ fn commandExists(io: std.Io, name: []const u8) bool {
 }
 
 fn backend(io: std.Io) Backend {
+    // Detection spawns `sh -lc` (up to 1 s). loadAuthKeys calls available()
+    // once and lookup() once PER PROVIDER — ~11 spawns, measured at 1.8 s on
+    // every startup. The set of installed secret-store commands does not
+    // change during a process, so detect once and share the answer.
+    const raw = cached_backend.load(.acquire);
+    if (raw != backend_unset) return fromCode(raw);
+    const b = detectBackend(io);
+    cached_backend.store(toCode(b), .release);
+    return b;
+}
+
+const backend_unset: u8 = 0xff;
+var cached_backend: std.atomic.Value(u8) = .init(backend_unset);
+
+fn toCode(b: Backend) u8 {
+    return switch (b) {
+        .secret_tool => 0,
+        .security => 1,
+        .windows_cred => 2,
+        .none => 3,
+    };
+}
+
+fn fromCode(code: u8) Backend {
+    return switch (code) {
+        0 => .secret_tool,
+        1 => .security,
+        2 => .windows_cred,
+        else => .none,
+    };
+}
+
+fn detectBackend(io: std.Io) Backend {
     if (commandExists(io, "secret-tool")) return .secret_tool;
     if (builtin.os.tag == .macos and commandExists(io, "security")) return .security;
     if (builtin.os.tag == .windows and (commandExists(io, "powershell.exe") or commandExists(io, "powershell") or commandExists(io, "pwsh"))) {
@@ -42,31 +75,87 @@ fn labelFor(alloc: std.mem.Allocator, provider: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "zode/{s}", .{provider});
 }
 
-pub fn lookup(alloc: std.mem.Allocator, io: std.Io, provider: []const u8) ?[]u8 {
-    return switch (backend(io)) {
-        .secret_tool => lookupSecretTool(alloc, io, provider),
-        .security => lookupSecurity(alloc, io, provider),
-        .windows_cred => lookupWindowsCred(alloc, io, provider),
+/// Process-level lookup cache. The secret store does not change under us
+/// except through store()/clear() below, which invalidate the entry. Each
+/// lookup otherwise spawns a `secret-tool` subprocess (~50 ms), and startup
+/// asks about every provider — measured at 0.6 s of pure subprocess churn.
+const CachedKey = struct { found: bool, value: []const u8 };
+const LookupCache = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    map: std.StringHashMapUnmanaged(CachedKey) = .empty,
+};
+var lookup_cache: LookupCache = .{};
+
+fn lookupCached(io: std.Io, provider: []const u8) ?[]const u8 {
+    while (!lookup_cache.mutex.tryLock()) std.Thread.yield() catch {};
+    defer lookup_cache.mutex.unlock();
+    if (lookup_cache.map.get(provider)) |hit| {
+        // Hand back an OWNED copy: a concurrent invalidate() could free the
+        // cached buffer before the caller finishes reading it.
+        if (!hit.found) return null;
+        return std.heap.page_allocator.dupe(u8, hit.value) catch null;
+    }
+    lookup_cache.mutex.unlock();
+    // NEVER hold the cache lock across a subprocess: `secret-tool` has a 3 s
+    // timeout, and another thread asking for a different key would spin for
+    // the whole duration. Two threads racing the SAME provider may both do
+    // the one-shot lookup; the second put below just replaces the first.
+    const b = backend(io);
+    const fresh: ?[]u8 = switch (b) {
+        .secret_tool => lookupSecretTool(std.heap.page_allocator, io, provider),
+        .security => lookupSecurity(std.heap.page_allocator, io, provider),
+        .windows_cred => lookupWindowsCred(std.heap.page_allocator, io, provider),
         .none => null,
     };
+    const entry: CachedKey = if (fresh) |k|
+        .{ .found = true, .value = k }
+    else
+        .{ .found = false, .value = "" };
+    // Re-lock for the write (the function's defer unlocks it again).
+    while (!lookup_cache.mutex.tryLock()) std.Thread.yield() catch {};
+    if (lookup_cache.map.fetchRemove(provider)) |old_entry| {
+        if (old_entry.value.found) std.heap.page_allocator.free(old_entry.value.value);
+    }
+    const owned: ?[]u8 = if (entry.found) std.heap.page_allocator.dupe(u8, entry.value) catch null else null;
+    lookup_cache.map.put(std.heap.page_allocator, provider, entry) catch {};
+    return owned;
+}
+
+pub fn lookup(alloc: std.mem.Allocator, io: std.Io, provider: []const u8) ?[]u8 {
+    // The contract is caller-owned: hand back a copy so two callers (or a
+    // later store()) can never free or observe the same buffer.
+    const hit = lookupCached(io, provider) orelse return null;
+    return alloc.dupe(u8, hit) catch null;
+}
+
+fn invalidate(provider: []const u8) void {
+    while (!lookup_cache.mutex.tryLock()) std.Thread.yield() catch {};
+    defer lookup_cache.mutex.unlock();
+    if (lookup_cache.map.fetchRemove(provider)) |removed| {
+        if (removed.value.found) std.heap.page_allocator.free(removed.value.value);
+    }
 }
 
 pub fn store(alloc: std.mem.Allocator, io: std.Io, provider: []const u8, key: []const u8) bool {
-    return switch (backend(io)) {
+    const ok = switch (backend(io)) {
         .secret_tool => storeSecretTool(alloc, io, provider, key),
         .security => storeSecurity(alloc, io, provider, key),
         .windows_cred => storeWindowsCred(alloc, io, provider, key),
         .none => false,
     };
+    if (ok) invalidate(provider);
+    return ok;
 }
 
 pub fn clear(alloc: std.mem.Allocator, io: std.Io, provider: []const u8) bool {
-    return switch (backend(io)) {
+    const ok = switch (backend(io)) {
         .secret_tool => clearSecretTool(alloc, io, provider),
         .security => clearSecurity(alloc, io, provider),
         .windows_cred => clearWindowsCred(alloc, io, provider),
         .none => false,
     };
+    if (ok) invalidate(provider);
+    return ok;
 }
 
 fn lookupSecretTool(alloc: std.mem.Allocator, io: std.Io, provider: []const u8) ?[]u8 {

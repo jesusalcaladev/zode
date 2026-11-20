@@ -332,54 +332,53 @@ fn runModels(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     defer astate.deinit();
     const arena = astate.allocator();
 
-    var printed = false;
-    // The cache key is the PROVIDER, not the URL: two providers can publish the same
-    // catalogue URL and one of them changing its models must not invalidate the other.
-    // The cache key is the provider's REAL id now, not whatever the environment says.
-    // They were the same when both meant opencode and they diverge the moment a user
-    // sets `ZODE_PROVIDER` without a config.json: the fetch went to opencode and the
-    // cache entry was filed under the other name, so the next run could not find it.
+    // The cache key is the PROVIDER, not the URL: two providers can publish the
+    // same catalogue URL and one changing its models must not invalidate the
+    // other. Use the provider's REAL id, not whatever the environment says.
     const pid = def.id;
-    if (modelcache.read(io, env, arena, pid, url)) |e| {
-        if (e.models.len > 0) {
-            var out_buf: [4096]u8 = undefined;
-            var out = std.Io.File.stdout().writer(io, &out_buf);
-            for (e.models) |m| {
-                try out.interface.print("{s}\t{s}\n", .{ m.id, m.owned_by });
-            }
-            try out.interface.flush();
-            const free = blk: {
-                var n: usize = 0;
-                for (e.models) |m| {
-                    if (m.is_free) n += 1;
-                }
-                break :blk n;
-            };
-            std.debug.print("{d} models ({d} free) — saved catalog, {s}\n", .{
-                e.models.len,
-                free,
-                if (headless.ageIsStale(io, e.fetched_at)) "stale, refresh due" else "fresh",
-            });
-            printed = true;
+    const cached: ?modelcache.Entry = if (modelcache.read(io, env, arena, pid, url)) |e|
+        if (e.models.len > 0) e else null
+    else
+        null;
+
+    if (cached) |e| {
+        if (!headless.ageIsStale(io, e.fetched_at)) {
+            try printModelCatalog(io, e.models, "");
+            return 0;
         }
     }
-    if (printed) return 0;
 
+    // Stale or missing: refresh. The old code returned as soon as it had
+    // printed ANY cached list, so it said "stale, refresh due" on every run
+    // and never actually refreshed — the cache stayed old forever and every
+    // `--models` paid the full network round trip.
     var list = models.listModels(gpa, &http, url, providers.authWithKey(def.key_style, key)) catch |err| {
+        if (cached) |e| {
+            try printModelCatalog(io, e.models, " (saved catalog, refresh failed)");
+            std.debug.print("refresh failed: {t}\n", .{err});
+            return 0; // offline: the stale list is better than no answer
+        }
         std.debug.print("error: {t}\n", .{err});
         return 1;
     };
     defer list.deinit(gpa);
     modelcache.write(io, env, pid, url, list.items);
+    try printModelCatalog(io, list.items, "");
+    return 0;
+}
 
+fn printModelCatalog(io: std.Io, list: []const models.Model, note: []const u8) !void {
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &out_buf);
-    for (list.items) |m| {
+    for (list) |m| {
         try out.interface.print("{s}\t{s}\n", .{ m.id, m.owned_by });
     }
     try out.interface.flush();
-    std.debug.print("{d} modelos ({d} free)\n", .{ list.items.len, list.free_count });
-    return 0;
+    var free: usize = 0;
+    for (list) |m| {
+        if (m.is_free) free += 1;
+    }
+    std.debug.print("{d} models ({d} free){s}\n", .{ list.len, free, note });
 }
 
 fn runTui(init: std.process.Init) !u8 {

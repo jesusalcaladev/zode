@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - optimization pass — one style resolve per paint, zero-copy tool schema (46) [`61bc8bac`](https://github.com/jesusalcaladev/zode/commit/61bc8bac)
 - eliminate quadratic SSE tool-arg parsing and per-chunk allocations (46.6-46.11) [`14ee2362`](https://github.com/jesusalcaladev/zode/commit/14ee2362)
 - materialize autocomplete matches once per query (47.3) (tui) [`c99f62d1`](https://github.com/jesusalcaladev/zode/commit/c99f62d1)
+- refresh stale model cache, cache keychain lookups (47.8) (startup) [`bb2c1c04`](https://github.com/jesusalcaladev/zode/commit/bb2c1c04)
 
 ### Tests
 
@@ -59,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - deterministic failed-spawn test (43.6) (compaction) [`6708c1da`](https://github.com/jesusalcaladev/zode/commit/6708c1da)
 - end-to-end smoke for --chat (43.7) (headless) [`4bf7827b`](https://github.com/jesusalcaladev/zode/commit/4bf7827b)
 - wait for asserted screen state instead of fixed sleeps (47.5) (pty) [`d8a5eb1c`](https://github.com/jesusalcaladev/zode/commit/d8a5eb1c)
-- cover the last untested pure module (47.7) (envutil) [`abc74db6`](https://github.com/jesusalcaladev/zode/commit/abc74db6)
+- cover the last untested pure module (47.7) (envutil) [`c4425861`](https://github.com/jesusalcaladev/zode/commit/c4425861)
 
 ## [0.3.0-beta.1] - 2026-11-16
 
