@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - remove the completed task board (tasks) [`65c9ef69`](https://github.com/jesusalcaladev/zode/commit/65c9ef69)
 - remove the dead model_requested_iter path (42.8 notes) [`b9650023`](https://github.com/jesusalcaladev/zode/commit/b9650023)
+- finish the split cleanup (47.4) (tui) [`3d9e5596`](https://github.com/jesusalcaladev/zode/commit/3d9e5596)
 
 ### Documentation
 
@@ -41,7 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - split event and draw dispatch into modules (42.9) (tui) [`c52b7a38`](https://github.com/jesusalcaladev/zode/commit/c52b7a38)
 - drop 337 one-line agent forwarders (42.8) [`fc2ea6d8`](https://github.com/jesusalcaladev/zode/commit/fc2ea6d8)
 - use the Model's io instead of agent.io_global (25 sites) (42.8) [`b4436af8`](https://github.com/jesusalcaladev/zode/commit/b4436af8)
-- pass the autocomplete count into drawAutocomplete (tui) [`a8f75449`](https://github.com/jesusalcaladev/zode/commit/a8f75449)
+- pass the autocomplete count into drawAutocomplete (tui) [`9ace7f27`](https://github.com/jesusalcaladev/zode/commit/9ace7f27)
 
 ### Performance
 
@@ -56,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - coverage for the three core gaps (phase43) [`4bae7558`](https://github.com/jesusalcaladev/zode/commit/4bae7558)
 - deterministic failed-spawn test (43.6) (compaction) [`6708c1da`](https://github.com/jesusalcaladev/zode/commit/6708c1da)
 - end-to-end smoke for --chat (43.7) (headless) [`4bf7827b`](https://github.com/jesusalcaladev/zode/commit/4bf7827b)
+- wait for asserted screen state instead of fixed sleeps (47.5) (pty) [`80259a84`](https://github.com/jesusalcaladev/zode/commit/80259a84)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

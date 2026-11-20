@@ -30,7 +30,6 @@ import shutil
 import subprocess
 import termios
 import time
-import time
 
 ROWS, COLS = 50, 200
 BINARY = "./zig-out/bin/zode"
@@ -53,8 +52,14 @@ def strip_ansi(b: bytes) -> str:
     return s
 
 
-def drive(keys, budget: float = 8.0):
-    """Starts the TUI, sends `keys` spaced out, and returns (bytes, text)."""
+def drive(keys, budget: float = 8.0, expect=None, until=None):
+    """Starts the TUI, sends `keys` spaced out, and returns (bytes, text).
+
+    `expect` is a substring, `until` a predicate on the raw bytes. Both make a
+    check wait for the SCREEN STATE it asserts instead of hoping a fixed sleep
+    was long enough on this machine — the only source of the intermittent
+    "finds /free-auto" / "connect opens" failures under load.
+    """
     if not os.path.exists(BINARY):
         sys.exit(f"{BINARY} does not exist: run `zig build` first")
 
@@ -126,6 +131,27 @@ def drive(keys, budget: float = 8.0):
         if not chunk:
             break
         out += chunk
+
+    # Wait for the asserted state instead of guessing at timing. Cheap when
+    # the state is already on screen (one strip + return); bounded when it is
+    # not (half the original budget), so a real failure still fails fast.
+    if expect is not None or until is not None:
+        deadline = time.time() + budget / 2
+        while time.time() < deadline:
+            if expect is not None and expect in strip_ansi(out):
+                break
+            if until is not None and until(out):
+                break
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if not r:
+                continue
+            try:
+                chunk = os.read(fd, 1 << 16)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                break
+            out += chunk
 
     os.write(fd, b"\x03")  # ctrl+c: the prompt's own exit path
     time.sleep(0.3)
@@ -238,7 +264,7 @@ def main() -> int:
     # 3) Connecting is a guided flow: choose a provider, back out of the key
     #    field to the provider list, then close. Escape must not change the modal
     #    into the unrelated model picker.
-    out_connect, t_connect = drive([b"\x01", b"\r", b"\x1b", b"\x1b"])
+    out_connect, t_connect = drive([b"\x01", b"\r", b"\x1b", b"\x1b"], expect="Add API key")
     ok &= check("connect opens the provider list and key prompt", "Connect a provider" in t_connect and "Add API key" in t_connect, t_connect)
     ok &= check("back from key entry stays in Connect", "Choose a model" not in t_connect, t_connect)
 
@@ -309,7 +335,7 @@ def main() -> int:
     #    group among twenty others, with no alias and no state in its hint, and
     #    the report was "there is no command to rotate the free models". A
     #    feature that exists and cannot be found does not exist.
-    out6, t6 = drive([b"\x10", b"free"])
+    out6, t6 = drive([b"\x10", b"free"], expect="/free-auto")
     ok &= check("ctrl+p finds /free-auto by typing 'free'", "/free-auto" in t6, t6)
     out6b, t6b = drive([b"\x1b"])
 
@@ -410,7 +436,7 @@ def main() -> int:
     #     6 s of the idle track (~7.9 s for the whole loop) holds about five
     #     beats that change the drawing; three is the floor that still fails on
     #     a frozen face.
-    out12, t12 = drive([], budget=6.0)
+    out12, t12 = drive([], budget=6.0, until=lambda o: footer_repaints(o) >= 3)
     beats = footer_repaints(out12)
     ok &= check(f"footer: the mascot animates at rest ({beats} beats in 6 s)", beats >= 3, t12)
     ok &= check("the animated footer does not break anything", "panic" not in t12.lower(), t12)
