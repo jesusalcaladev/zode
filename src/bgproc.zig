@@ -68,6 +68,10 @@ pub const State = enum {
     killed,
     /// The slot is free again.
     free,
+    /// 50.9: the task was in the manifest when zode exited; its process is gone
+    /// now. Output files that still exist remain readable, but no exit code is
+    /// invented.
+    lost,
 };
 
 /// What the reading thread needs. File-level (not a local) because the thread
@@ -80,6 +84,17 @@ const ReaderCtx = struct {
     /// The reader thread's OWN copy of the child. `wait()` mutates it and
     /// `kill()` zeroes its `id`, so it cannot be shared with the registry slot.
     child: std.process.Child = undefined,
+};
+
+/// 50.9: one persisted background-task record. Metadata only — the output
+/// stays in its file, and a task whose process died with zode is reported as
+/// `lost` instead of being pretended to be still running.
+pub const ManifestEntry = struct {
+    id: u32,
+    command: []const u8,
+    state: State,
+    output_path: []const u8,
+    exit: ?u8,
 };
 
 pub const Job = struct {
@@ -177,6 +192,7 @@ pub const Job = struct {
             .running => "running",
             .finished => if (self.exit != null and self.exit.? == 0) "ok" else "failed",
             .killed => "killed",
+            .lost => "lost",
             .free => "gone",
         };
     }
@@ -206,6 +222,73 @@ pub fn init(gpa: std.mem.Allocator) Registry {
     return .{ .gpa = gpa };
 }
 
+/// 50.9: writes the live task metadata to `path` as one JSON object per line.
+/// Only metadata: the output stays in its session-isolated file, so a restart
+/// can read what a finished task printed without re-running it.
+pub fn writeManifest(reg: *const Registry, io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    for (reg.slots) |j| {
+        if (j.state == .free) continue;
+        const rec = struct {
+            state: []const u8,
+            id: u32,
+            command: []const u8,
+            output_path: []const u8,
+        }{
+            .state = @tagName(j.state),
+            .id = j.id,
+            .command = j.cmd_buf[0..j.cmd_len],
+            .output_path = j.output_path_buf[0..j.output_path_len],
+        };
+        const line = try std.json.Stringify.valueAlloc(gpa, rec, .{});
+        defer gpa.free(line);
+        try out.appendSlice(gpa, line);
+        try out.append(gpa, '\n');
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = out.items });
+}
+
+/// Reads a manifest into caller-owned entries. A task that was `running` when
+/// zode exited is marked `lost`: the OS process is gone, and claiming it still
+/// runs would be a lie to the model.
+pub fn readManifest(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]ManifestEntry {
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20));
+    defer gpa.free(data);
+    var out: std.ArrayList(ManifestEntry) = .empty;
+    errdefer {
+        for (out.items) |e| {
+            gpa.free(e.command);
+            gpa.free(e.output_path);
+        }
+        out.deinit(gpa);
+    }
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        var line_arena = std.heap.ArenaAllocator.init(gpa);
+        defer line_arena.deinit();
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, line_arena.allocator(), line, .{}) catch continue;
+        if (parsed != .object) continue;
+        const o = parsed.object;
+        const idv = o.get("id") orelse continue;
+        if (idv != .integer) continue;
+        const cv = o.get("command") orelse continue;
+        const pv = o.get("output_path") orelse continue;
+        const sv = o.get("state") orelse continue;
+        if (cv != .string or pv != .string or sv != .string) continue;
+        const state: State = if (std.mem.eql(u8, sv.string, "running")) .lost else if (std.mem.eql(u8, sv.string, "killed")) .killed else .finished;
+        try out.append(gpa, .{
+            .id = @intCast(@max(idv.integer, 0)),
+            .command = try gpa.dupe(u8, cv.string),
+            .state = state,
+            .output_path = try gpa.dupe(u8, pv.string),
+            .exit = null,
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// Sets the session-scoped base directory for background task output files.
 /// Duplicates the path; pass null to disable file-backed output.
 pub fn setOutputBase(self: *Registry, gpa: std.mem.Allocator, path: ?[]const u8) void {
@@ -227,6 +310,12 @@ pub fn sessionOutputDir(arena: std.mem.Allocator, session_path: []const u8) ![]c
 /// Configures file-backed output for this session. Creates the directory.
 pub fn setSession(self: *Registry, gpa: std.mem.Allocator, io: std.Io, session_path: ?[]const u8) void {
     if (self.output_base) |old| {
+        // 50.9: persist the OLD session's task metadata before switching away.
+        const old_manifest = std.fs.path.join(gpa, &.{ old, "manifest.jsonl" }) catch null;
+        if (old_manifest) |p| {
+            defer gpa.free(p);
+            writeManifest(self, io, gpa, p) catch {};
+        }
         gpa.free(old);
         self.output_base = null;
     }
@@ -235,6 +324,42 @@ pub fn setSession(self: *Registry, gpa: std.mem.Allocator, io: std.Io, session_p
     defer gpa.free(dir);
     _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, @fromBackingInt(@intCast(0o700))) catch {};
     self.output_base = gpa.dupe(u8, dir) catch null;
+
+    // Restore metadata from a previous run. A task that was running is `lost`:
+    // its process died with zode, but its output file may still be readable.
+    const manifest = std.fs.path.join(gpa, &.{ dir, "manifest.jsonl" }) catch null;
+    if (manifest) |p| {
+        defer gpa.free(p);
+        const entries = readManifest(gpa, io, p) catch &.{};
+        defer {
+            for (entries) |e| {
+                gpa.free(e.command);
+                gpa.free(e.output_path);
+            }
+            if (entries.len > 0) gpa.free(entries);
+        }
+        for (entries) |e| {
+            var slot: ?*Job = null;
+            for (&self.slots) |*j| {
+                if (j.state == .free) {
+                    slot = j;
+                    break;
+                }
+            }
+            const j = slot orelse break;
+            j.* = .{};
+            j.state = e.state;
+            j.id = e.id;
+            const n = @min(e.command.len, j.cmd_buf.len);
+            @memcpy(j.cmd_buf[0..n], e.command[0..n]);
+            j.cmd_len = n;
+            const pn = @min(e.output_path.len, j.output_path_buf.len);
+            @memcpy(j.output_path_buf[0..pn], e.output_path[0..pn]);
+            j.output_path_len = pn;
+            j.exit = e.exit;
+            j.notified = true; // do not re-notify a task from a previous run
+        }
+    }
 }
 
 pub const Completion = struct {
@@ -691,6 +816,18 @@ fn anyReading(reg: *Registry) bool {
 
 pub fn deinit(reg: *Registry, io: ?std.Io, gpa: std.mem.Allocator) void {
     killAll(reg, io, 1000);
+    // 50.9: persist what is known before the slots are freed. `killAll` has
+    // already moved running jobs to a terminal state, so no job is recorded as
+    // still running at shutdown.
+    if (io) |live_io| {
+        if (reg.output_base) |base| {
+            const p = std.fs.path.join(gpa, &.{ base, "manifest.jsonl" }) catch null;
+            if (p) |path| {
+                defer gpa.free(path);
+                writeManifest(reg, live_io, gpa, path) catch {};
+            }
+        }
+    }
     for (&reg.slots) |*j| j.deinit(gpa);
     if (reg.output_base) |b| gpa.free(b);
     reg.* = .{};
@@ -1560,6 +1697,51 @@ test "Phase 10: incremental output returns only what is new (file-backed)" {
     } else return error.TestExpectedFileBackedOutput;
     // Incremental: "one" was observed during polling (cursor advanced as we read).
     try std.testing.expect(saw_one);
+}
+
+test "50.9: a manifest round-trips metadata and reports a lost task honestly" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "/tmp/opencode/zode-bg-manifest-test.jsonl";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var reg = init(a);
+    var job = &reg.slots[0];
+    job.state = .finished;
+    job.id = 7;
+    @memcpy(job.cmd_buf[0..4], "echo");
+    job.cmd_len = 4;
+    @memcpy(job.output_path_buf[0..10], "/tmp/a.out");
+    job.output_path_len = 10;
+    job.exit = 0;
+    try writeManifest(&reg, io, a, path);
+
+    const entries = try readManifest(a, io, path);
+    defer {
+        for (entries) |e| {
+            a.free(e.command);
+            a.free(e.output_path);
+        }
+        a.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(@as(u32, 7), entries[0].id);
+    try std.testing.expectEqualStrings("echo", entries[0].command);
+    try std.testing.expectEqualStrings("/tmp/a.out", entries[0].output_path);
+
+    // A task that was running when the process died is NEVER restored as
+    // running: there is no process behind it any more.
+    job.state = .running;
+    try writeManifest(&reg, io, a, path);
+    const again = try readManifest(a, io, path);
+    defer {
+        for (again) |e| {
+            a.free(e.command);
+            a.free(e.output_path);
+        }
+        a.free(again);
+    }
+    try std.testing.expectEqual(State.lost, again[0].state);
 }
 
 test "Phase 10: killed task reports its terminal state" {

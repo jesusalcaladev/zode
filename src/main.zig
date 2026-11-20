@@ -675,7 +675,19 @@ pub fn runSelftest(init: std.process.Init) u8 {
 pub fn main(init: std.process.Init) !u8 {
     var it = std.process.Args.Iterator.init(init.minimal.args);
     _ = it.next(); // argv[0]
-    const first = it.next();
+    var first = it.next();
+    // 50.8: a caller-supplied system prompt suffix. It is process-wide and
+    // never read from the project, so a repo cannot widen its own instructions.
+    if (first) |arg0| {
+        if (std.mem.eql(u8, arg0, "--append-system-prompt")) {
+            const text = it.next() orelse {
+                std.debug.print("error: --append-system-prompt needs a text argument.\n", .{});
+                return 1;
+            };
+            agent.setAppendSystemPrompt(init.gpa, text);
+            first = it.next();
+        }
+    }
 
     if (first) |arg0| {
         if (std.mem.eql(u8, arg0, "--resume")) {

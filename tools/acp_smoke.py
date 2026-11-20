@@ -134,6 +134,18 @@ def main() -> int:
                 return 1
             print("ok: session/list")
 
+            # 50.7: a fork must return a NEW id and keep the old session usable.
+            send(p, {"jsonrpc": "2.0", "id": 31, "method": "session/fork", "params": {"sessionId": sid, "cwd": str(cwd)}})
+            msg, _ = read_until(reader, lambda m: m.get("id") == 31, timeout=20)
+            if not msg or "result" not in msg:
+                print(f"FAIL: session/fork: {msg}", file=sys.stderr)
+                return 1
+            fork_sid = msg["result"].get("sessionId")
+            if not fork_sid or fork_sid == sid:
+                print(f"FAIL: session/fork returned no new id: {msg}", file=sys.stderr)
+                return 1
+            print(f"ok: session/fork {fork_sid}")
+
             # Prompt without a configured model should still complete as a protocol turn
             # (agent returns an end_turn with an explanatory message) rather than deadlocking.
             send(p, {"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "hello"}]}})

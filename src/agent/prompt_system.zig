@@ -22,6 +22,17 @@ pub const tool_routing_prompt = prompt_mod.tool_routing_prompt;
 pub const verification_prompt = prompt_mod.verification_prompt;
 
 pub var agents_md_cache: ?[]u8 = null;
+/// 50.8: caller-supplied instructions appended to the system prompt. NEVER
+/// read from the project directory — that would let a repo change its own
+/// rules without the user seeing them. Set only by the CLI flag.
+var append_prompt: []const u8 = "";
+var append_full_cache: ?[]u8 = null;
+
+pub fn setAppendSystemPrompt(a: std.mem.Allocator, text: []const u8) void {
+    if (append_full_cache) |c| a.free(c);
+    append_full_cache = null;
+    append_prompt = text;
+}
 var cache_break_prev: ?[8]u64 = null;
 var cache_break_last_block: ?[]const u8 = null;
 var cache_break_last_pos: usize = 0;
@@ -79,8 +90,15 @@ pub fn systemPromptBase(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.pro
     if (agents_md_cache == null) {
         agents_md_cache = instructions.loadAll(gpa, io, env, ".", project_root) catch null;
     }
-    if (agents_md_cache) |c| return c;
-    return prompt_mod.default_system_prompt;
+    const base = if (agents_md_cache) |c| c else prompt_mod.default_system_prompt;
+    if (append_prompt.len == 0) return base;
+    if (append_full_cache == null) {
+        append_full_cache = std.fmt.allocPrint(gpa, "{s}\n\n## Additional instructions\n{s}", .{
+            base,
+            append_prompt,
+        }) catch null;
+    }
+    return append_full_cache orelse base;
 }
 
 pub fn readAgentsIn(gpa: std.mem.Allocator, io: std.Io, dir: ?[]const u8) ?[]u8 {
@@ -301,6 +319,26 @@ pub fn syncSystemPrompt(s: *session_mod.Session, ctx: BuildCtx) void {
 }
 
 // ── Phase 8: cache-break history tests ──────────────────────────
+
+test "append-system-prompt: the caller's text appears once in the base" {
+    const a = std.testing.allocator;
+    const saved = append_full_cache;
+    const saved_text = append_prompt;
+    const saved_agents = agents_md_cache;
+    defer {
+        if (append_full_cache) |c| a.free(c);
+        append_full_cache = saved;
+        append_prompt = saved_text;
+        if (agents_md_cache) |c| a.free(c);
+        agents_md_cache = saved_agents;
+    }
+    setAppendSystemPrompt(a, "Always answer with a checklist.");
+    const base = systemPromptBase(a, std.testing.io, null, null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "Always answer with a checklist.") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, base, "Always answer with a checklist."));
+    // Cached: a second call returns the SAME bytes, not a second append.
+    try std.testing.expectEqualStrings(base, systemPromptBase(a, std.testing.io, null, null));
+}
 
 test "cachebreak: history records breaks in order and is bounded" {
     resetCacheBreak();

@@ -323,6 +323,7 @@ const Server = struct {
         if (!self.initialized) return self.sendError(arena, id, protocol.ErrorCode.invalid_request, "Not initialized");
         if (std.mem.eql(u8, method, "authenticate")) return self.sendResponse(arena, id, .{});
         if (std.mem.eql(u8, method, "session/new")) return self.handleSessionNew(arena, id, msg.params);
+        if (std.mem.eql(u8, method, "session/fork")) return self.handleSessionFork(arena, id, msg.params);
         if (std.mem.eql(u8, method, "session/load")) return self.handleSessionLoad(arena, id, msg.params);
         if (std.mem.eql(u8, method, "session/resume")) return self.handleSessionResume(arena, id, msg.params);
         if (std.mem.eql(u8, method, "session/list")) return self.handleSessionList(arena, id);
@@ -345,6 +346,7 @@ const Server = struct {
                     .list = .{},
                     .close = .{},
                     .delete = .{},
+                    .fork = {},
                 },
             },
             .agentInfo = .{ .name = "zode", .title = "zode", .version = build_options.version },
@@ -435,6 +437,48 @@ const Server = struct {
             ss.deinit(self.gpa, self.io); self.gpa.destroy(ss);
             return self.sendError(arena, id, protocol.ErrorCode.internal_error, "Out of memory");
         };
+        self.sendResponse(arena, id, .{ .sessionId = ss.id, .modes = null, .configOptions = null });
+    }
+
+    /// 50.7: `session/fork` clones the transcript into a NEW session. Only the
+    /// messages are copied — tasks, background jobs and permissions belong to
+    /// the live session and must not leak into a fork.
+    fn handleSessionFork(self: *Server, arena: std.mem.Allocator, id: protocol.RequestId, params: ?std.json.Value) void {
+        const src_id = protocol.paramStr(params, "sessionId") orelse {
+            return self.sendError(arena, id, protocol.ErrorCode.invalid_params, "sessionId is required");
+        };
+        while (!self.sessions_mu.tryLock()) std.Thread.yield() catch {};
+        const src = self.sessions.get(src_id) orelse {
+            self.sessions_mu.unlock();
+            return self.sendError(arena, id, protocol.ErrorCode.resource_not_found, "Session not found");
+        };
+        const cwd = protocol.paramStr(params, "cwd") orelse src.cwd;
+        const zs = session_mod.Session.create(self.gpa, self.io) catch {
+            self.sessions_mu.unlock();
+            return self.sendError(arena, id, protocol.ErrorCode.internal_error, "Could not fork session");
+        };
+        if (src.zode_session) |from| {
+            for (from.messages.items) |m| {
+                zs.append(m.role, m.content) catch {};
+            }
+        }
+        zs.flush();
+        const ss = self.makeSessionState(&zs.id, cwd) catch {
+            self.sessions_mu.unlock();
+            zs.deinit();
+            self.gpa.destroy(zs);
+            return self.sendError(arena, id, protocol.ErrorCode.internal_error, "Out of memory");
+        };
+        ss.zode_session = zs;
+        // `putSession` takes the SAME mutex we already hold, so insert directly:
+        // calling it here deadlocks and the client waits forever for a reply.
+        self.sessions.put(self.gpa, ss.id, ss) catch {
+            self.sessions_mu.unlock();
+            ss.deinit(self.gpa, self.io);
+            self.gpa.destroy(ss);
+            return self.sendError(arena, id, protocol.ErrorCode.internal_error, "Out of memory");
+        };
+        self.sessions_mu.unlock();
         self.sendResponse(arena, id, .{ .sessionId = ss.id, .modes = null, .configOptions = null });
     }
 

@@ -18,7 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - counts, register, visual mode, hunk folding, side-by-side (49) (vim,diff) [`086f1b03`](https://github.com/jesusalcaladev/zode/commit/086f1b03)
 - /export and hierarchical instruction files (50.1, 50.4) (ecosystem) [`1cc3c531`](https://github.com/jesusalcaladev/zode/commit/1cc3c531)
 - hook events + user scope, MCP resources/prompts (50.2, 50.3) (ecosystem) [`ad547763`](https://github.com/jesusalcaladev/zode/commit/ad547763)
-- per-call tool collapse, side-by-side diff, subagent tree (49.8) (tui) [`321ab2a9`](https://github.com/jesusalcaladev/zode/commit/321ab2a9)
+- per-call tool collapse, side-by-side diff, subagent tree (49.8) (tui) [`c23de466`](https://github.com/jesusalcaladev/zode/commit/c23de466)
+- rewind, claude commands, acp fork, append prompt, durable bg, stats (50) (ecosystem) [`7f07f119`](https://github.com/jesusalcaladev/zode/commit/7f07f119)
 
 ### Bug Fixes
 

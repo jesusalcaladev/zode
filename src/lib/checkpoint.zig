@@ -47,6 +47,10 @@ pub const FileSnap = struct {
 pub const Checkpoint = struct {
     label: [label_max]u8 = undefined,
     label_len: u8 = 0,
+    /// 50.5: how many session messages existed when this turn began. 0 means
+    /// "not recorded" (a checkpoint opened by an old caller) and never rewinds
+    /// the conversation — file-only undo stays the default.
+    msg_count: usize = 0,
     files: [max_files]FileSnap = undefined,
     len: u8 = 0,
     /// Bytes already spent in this checkpoint (for the `snapshot_max` cap).
@@ -200,7 +204,7 @@ pub const Stack = struct {
     }
 
     /// Starts the checkpoint of a turn: the previous one becomes the second.
-    pub fn begin(self: *Stack, label: []const u8) void {
+    pub fn begin(self: *Stack, label: []const u8, msg_count: usize) void {
         if (self.len == max_checkpoints) {
             // Full: the oldest one is dropped. And it is freed BEFORE being overwritten,
             // or the memory of its photos goes away without a word (a silent
@@ -219,6 +223,7 @@ pub const Stack = struct {
         const n = @min(label.len, label_max);
         @memcpy(cp.label[0..n], label[0..n]);
         cp.label_len = @intCast(n);
+        cp.msg_count = msg_count;
         self.items[0] = cp;
     }
 
@@ -240,7 +245,7 @@ test "a snapshot is copied, not referenced: the turn arena dies" {
     var st = Stack.init(gpa);
     defer st.deinit();
 
-    st.begin("create the file");
+    st.begin("create the file", 0);
     // `src` is stack memory: if `addFile` stored it as-is, undo would write
     // garbage.
     var src = [_]u8{ 'h', 'o', 'l', 'a' };
@@ -253,7 +258,7 @@ test "the same file twice in one turn: the INITIAL snapshot wins" {
     const gpa = std.testing.allocator;
     var st = Stack.init(gpa);
     defer st.deinit();
-    st.begin("tres edits");
+    st.begin("tres edits", 0);
 
     _ = st.items[0].addFile(gpa, "a.txt", "v1", true);
     try std.testing.expectEqual(Checkpoint.Added.dup, st.items[0].addFile(gpa, "a.txt", "v2", true));
@@ -267,7 +272,7 @@ test "a file that did not exist is undone by DELETING it" {
     const gpa = std.testing.allocator;
     var st = Stack.init(gpa);
     defer st.deinit();
-    st.begin("crear");
+    st.begin("crear", 0);
 
     try std.testing.expectEqual(Checkpoint.Added.ok, st.items[0].addFile(gpa, "nuevo.txt", "", false));
     try std.testing.expect(!st.items[0].files[0].existed);
@@ -279,7 +284,7 @@ test "an oversized file is flagged, it does not swallow the memory" {
     const gpa = std.testing.allocator;
     var st = Stack.init(gpa);
     defer st.deinit();
-    st.begin("rewrite a huge file");
+    st.begin("rewrite a huge file", 0);
 
     const big = repeat.rep("x", (file_max + 1));
     try std.testing.expectEqual(Checkpoint.Added.too_big, st.items[0].addFile(gpa, "enorme.txt", &big, true));
@@ -295,7 +300,7 @@ test "the file cap truncates, and the byte cap warns" {
     const gpa = std.testing.allocator;
     var st = Stack.init(gpa);
     defer st.deinit();
-    st.begin("muchos ficheros");
+    st.begin("muchos ficheros", 0);
 
     const chunk = repeat.rep("y", (200 * 1024));
     var i: u8 = 0;
@@ -325,7 +330,7 @@ test "the ring: the last one is the most recent, and when full the old one is dr
     while (n < max_checkpoints + 2) : (n += 1) {
         var buf: [16]u8 = undefined;
         const lbl = std.mem.print(&buf, "turno {d}", .{n}) catch unreachable;
-        st.begin(lbl);
+        st.begin(lbl, 0);
         _ = st.items[0].addFile(gpa, "a.txt", "contenido", true);
     }
     // The cap rules: it does not grow.
@@ -353,7 +358,7 @@ test "summary: how many files, from which turn, and what cannot be undone" {
         vacio.summary(arena),
     );
 
-    st.begin("create the file");
+    st.begin("create the file", 0);
     _ = st.items[0].addFile(std.testing.allocator, "a.txt", "hello", true);
     const s = st.last().?.summary(arena);
     try std.testing.expect(std.mem.indexOf(u8, s, "undo: 1 file to undo") != null);
@@ -371,9 +376,9 @@ test "summary: how many files, from which turn, and what cannot be undone" {
 test "clear drops the checkpoints (session change) without leaking memory" {
     const gpa = std.testing.allocator;
     var st = Stack.init(gpa);
-    st.begin("a");
+    st.begin("a", 0);
     _ = st.items[0].addFile(gpa, "a.txt", "hola", true);
-    st.begin("b");
+    st.begin("b", 0);
     _ = st.items[0].addFile(gpa, "b.txt", "adios", true);
     try std.testing.expectEqual(@as(u8, 2), st.len);
     st.clear();

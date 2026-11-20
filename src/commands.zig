@@ -2827,6 +2827,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },
     .{ .key = "/cost", .desc = "what this session has cost, per model (USD, from the catalogue's prices)" },
     .{ .key = "/export", .desc = "export the whole session to markdown: /export [path]", .key_hint = "[path]" },
+    .{ .key = "/stats", .desc = "local-only session and usage totals (no telemetry)" },
     .{ .key = "/update", .desc = "install the newest release (says when one is available)" },
     .{ .key = "/compact", .desc = "off|elide|full|now: automatic compaction (no args: report, now = compact immediately)", .key_hint = "off|elide|full|now" },
     .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times", .palette_visible = false },
@@ -3058,6 +3059,18 @@ test "/export writes the session as markdown" {
     defer a.free(data);
     try std.testing.expect(std.mem.indexOf(u8, data, "## User") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "hello from the export test") != null);
+}
+
+test "/stats reports local totals without any network call" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.attachIo(std.testing.io);
+    cmdStats(&m);
+    // The command only pushes one info line into pending.
+    const text = try pendingText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "stats") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "nothing leaves this machine") != null);
 }
 
 test "/agents panel is dispatched" {
@@ -3679,6 +3692,18 @@ pub fn cmdUndo(m: *tui.Model, arg: ?[]const u8) void {
         out.print("  restored {s} ({d} bytes)\n", .{ f.pathOf(), f.data.len }) catch {};
     }
 
+    // 50.5: also rewind the conversation when this checkpoint recorded the
+    // message count. This is opt-in by the caller — an old checkpoint with
+    // msg_count 0 stays file-only, so the default behaviour never changes.
+    if (cp.msg_count > 0) {
+        if (agent.session) |s| {
+            s.rewindMessagesTo(cp.msg_count) catch {
+                failed += 1;
+                out.print("  conversation: could not rewind to {d} message(s)\n", .{cp.msg_count}) catch {};
+            };
+        }
+    }
+
     // CAREFUL: `allocPrint` and NOT `bufPrint` into a stack buffer.
     // `pushInfoOwned` TAKES OWNERSHIP of the text and frees it in `Model.deinit`:
     // a `bufPrint(&buf, ...)` leaves a pointer to the stack in the pending queue
@@ -3823,6 +3848,25 @@ pub fn cmdBtw(m: *tui.Model, arg: ?[]const u8) void {
 /// handoff. The content goes through the SAME redaction as the session file, so
 /// an exported transcript cannot leak an API key that the on-disk one would
 /// have scrubbed.
+/// `/stats`: local-only aggregate across the sessions on this machine. No
+/// network call, no upload, no telemetry — a CLI flag that is easy to audit.
+pub fn cmdStats(m: *tui.Model) void {
+    var arena_state = std.heap.ArenaAllocator.init(m.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const entries = sessionindex.scan(a, m.io, session_mod.sessions_dir);
+    var bytes: u64 = 0;
+    for (entries) |e| bytes +|= e.size_bytes;
+    const cur = agent.session;
+    const prompts: u32 = if (cur) |s| s.prompts_asked else 0;
+    const perms: u32 = if (cur) |s| s.permissions_asked else 0;
+    const escs: u32 = if (cur) |s| s.escs else 0;
+    m.pushInfoFmt(
+        "stats · {d} local session(s), {d} bytes on disk · this session: {d} prompts, {d} permission asks, {d} cancels · nothing leaves this machine",
+        .{ entries.len, bytes, prompts, perms, escs },
+    );
+}
+
 pub fn cmdExport(m: *tui.Model, arg: ?[]const u8) void {
     const s = agent.session orelse {
         m.pushError("no session to export");

@@ -32,11 +32,16 @@
 
 const std = @import("std");
 const skills = @import("skills.zig");
+const frontmatter = @import("frontmatter.zig");
 
 const usercmds = @This();
 
 /// Where they live, relative to the cwd and to `~/.config`.
 pub const project_dir = ".zode/commands";
+/// 50.6: the Claude Code layout is read as a compatibility root. It is
+/// SCANNED AFTER `.zode/commands`, so a project's own version of a command
+/// always wins; nothing here executes shell lines from the file body.
+pub const compat_project_dir = ".claude/commands";
 pub const user_subdir = "zode/commands";
 
 /// Above this a file is not a command, it is a document (same order as
@@ -285,6 +290,29 @@ pub fn scan(
     return out[0..n];
 }
 
+/// 50.6: reads the `allowed-tools` frontmatter from a command file into
+/// `out` (comma-separated). Parsing is pure; enforcement belongs to the
+/// permission resolver and is deliberately NOT done here — a markdown file
+/// must never be able to widen its own permissions by naming tools.
+pub fn allowedTools(text: []const u8, out: [][]const u8) usize {
+    const fm = frontmatter.split(text) orelse return 0;
+    var n: usize = 0;
+    var it = fm.iterator;
+    while (it.next()) |pair| {
+        if (!std.ascii.eqlIgnoreCase(pair.key, "allowed-tools") or n >= out.len) continue;
+        var parts = std.mem.splitScalar(u8, std.mem.trim(u8, pair.value, " \t"), ',');
+        while (parts.next()) |raw| {
+            if (n >= out.len) break;
+            const v = std.mem.trim(u8, raw, " \t");
+            if (v.len > 0) {
+                out[n] = v;
+                n += 1;
+            }
+        }
+    }
+    return n;
+}
+
 fn alreadyIn(list: []const Entry, base: []const u8) bool {
     for (list) |e| {
         if (std.mem.eql(u8, e.name(), base)) return true;
@@ -324,6 +352,20 @@ test "validName: what can be typed after a slash, and what cannot" {
     @memset(&too_long, 'a');
     try std.testing.expect(!validName(&too_long));
     try std.testing.expect(validName(too_long[0 .. max_name - 1]));
+}
+
+test "50.6: the compatibility root and allowed-tools parsing" {
+    try std.testing.expectEqualStrings(".claude/commands", compat_project_dir);
+    var slots: [4][]const u8 = undefined;
+    const n = allowedTools(
+        "---\ndescription: review\navoided-tools: not-this\navoided-line: x\nallowed-tools: Read, Bash(git *)\n---\nDo the review.\n",
+        &slots,
+    );
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualStrings("Read", slots[0]);
+    try std.testing.expectEqualStrings("Bash(git *)", slots[1]);
+    // No frontmatter: no tools are named, so no permission is widened.
+    try std.testing.expectEqual(@as(usize, 0), allowedTools("just a prompt", &slots));
 }
 
 test "descFrom: frontmatter wins, then the first real line (never a heading)" {

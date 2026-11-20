@@ -441,6 +441,12 @@ pub fn systemPromptBase(gpa: std.mem.Allocator) []const u8 {
     return prompt_system.systemPromptBase(gpa, io_global, environ_global, project_info.root());
 }
 
+/// 50.8: `--append-system-prompt` goes through here; the text is stored for the
+/// whole process and appended ONCE to the cached base, never re-sent per turn.
+pub fn setAppendSystemPrompt(a: std.mem.Allocator, text: []const u8) void {
+    prompt_system.setAppendSystemPrompt(a, text);
+}
+
 /// `AGENTS.md` then `CLAUDE.md` under `dir`, or null.
 ///
 /// `dir` is a path prefix, so it is `.` for the cwd and the absolute root
@@ -2979,6 +2985,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdCost(m);
     } else if (std.mem.eql(u8, cmd, "export")) {
         commands_mod.cmdExport(m, arg);
+    } else if (std.mem.eql(u8, cmd, "stats")) {
+        commands_mod.cmdStats(m);
     } else if (std.mem.eql(u8, cmd, "config")) {
         commands_mod.cmdConfig(m, rest);
     } else if (std.mem.eql(u8, cmd, "status")) {
@@ -3163,11 +3171,15 @@ var uc_scanned: bool = false;
 /// last one written (the `sb.path` trap).
 fn userCmdRoots(
     buf: *[std.fs.max_path_bytes]u8,
-    out: *[2][]const u8,
+    out: *[3][]const u8,
     env: ?*const std.process.Environ.Map,
 ) usize {
     var n: usize = 0;
     out[n] = usercmds_mod.project_dir; // a literal: static, no buffer needed
+    n += 1;
+    // 50.6: read the Claude Code convention too. A repo can use both layouts;
+    // `.zode/commands` wins by being scanned first (`scan` keeps the first name).
+    out[n] = usercmds_mod.compat_project_dir;
     n += 1;
     if (env) |e| {
         if (e.get("HOME")) |home| {
@@ -3259,7 +3271,7 @@ pub fn refreshUserCommands(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.
 
 pub fn refreshUserCommandsForce(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, force: bool) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    var roots: [2][]const u8 = undefined;
+    var roots: [3][]const u8 = undefined;
     const n = userCmdRoots(&buf, &roots, env);
     refreshUserCommandsFromForce(gpa, io, roots[0..n], force);
 }
@@ -3327,7 +3339,7 @@ fn runUserCommand(m: *tui.Model, idx: usize, arg: ?[]const u8) !void {
     if (!m.io_ready) return;
     const e = &uc_entries[idx];
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    var roots: [2][]const u8 = undefined;
+    var roots: [3][]const u8 = undefined;
     const n = userCmdRoots(&root_buf, &roots, m.environ);
     if (e.root >= n) {
         m.pushInfoFmt("{s}: its folder is not reachable from here (no HOME?)", .{e.key()});
@@ -3852,7 +3864,8 @@ fn startChatImplEx(
     bash_allow_rules: []const []const u8,
     expand_cmdsubst: bool,
 ) !void {
-    return chat_entry.startChatImplEx(m, input, mode, bash_allow_rules, expand_cmdsubst, chatWorker, setThinkingStatus);
+    const nmsg = if (session) |s| s.messages.items.len else 0;
+    return chat_entry.startChatImplEx(m, input, mode, bash_allow_rules, expand_cmdsubst, nmsg, chatWorker, setThinkingStatus);
 }
 
 /// Replace image references with [image.ext] placeholders for UI display.

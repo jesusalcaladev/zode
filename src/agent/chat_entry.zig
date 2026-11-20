@@ -11,6 +11,7 @@ pub fn startChatImplEx(
     mode: ChatJob.Mode,
     bash_allow_rules: []const []const u8,
     expand_cmdsubst: bool,
+    msg_count: usize,
     comptime worker: fn (*ChatJob) void,
     comptime set_thinking: fn (*tui.Model) void,
 ) !void {
@@ -24,6 +25,7 @@ pub fn startChatImplEx(
         mode,
         bash_allow_rules,
         expand_cmdsubst,
+        msg_count,
         worker,
         set_thinking,
     );

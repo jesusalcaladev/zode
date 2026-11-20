@@ -10,6 +10,7 @@ pub fn startQueuedOrSpawn(
     mode: anytype,
     bash_allow_rules: []const []const u8,
     expand_cmdsubst: bool,
+    msg_count: usize,
     comptime worker: fn (*Job) void,
     comptime set_thinking: fn (*tui.Model) void,
 ) !void {
@@ -24,7 +25,7 @@ pub fn startQueuedOrSpawn(
         return;
     }
 
-    m.beginCheckpoint(copy);
+    m.beginCheckpointWithMessages(copy, msg_count);
     m.streamStart();
     set_thinking(m);
 

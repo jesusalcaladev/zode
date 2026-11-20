@@ -812,6 +812,33 @@ pub const Session = struct {
         atomic_file.deinit(io);
     }
 
+    /// 50.5: drops every message added after `count` and rewrites the session
+    /// file atomically. The old code treated the JSONL as append-only forever;
+    /// a turn rewind is the one case where the user explicitly asks to go back,
+    /// and atomic rewrite (Phase 48) makes it safe.
+    pub fn rewindMessagesTo(self: *Session, count: usize) !void {
+        if (self.path == null or count >= self.messages.items.len) return;
+        var i = count;
+        while (i < self.messages.items.len) : (i += 1) {
+            const m = &self.messages.items[i];
+            self.allocator.free(m.content);
+            if (m.tool_calls_json) |t| self.allocator.free(t);
+            if (m.tool_call_id) |t| self.allocator.free(t);
+            if (m.tool_name) |t| self.allocator.free(t);
+        }
+        self.messages.shrinkRetainingCapacity(count);
+        try self.rewriteAll();
+    }
+
+    /// Rewrites every in-memory message to a temp file and renames it over the
+    /// session path. Used by rewind; resume uses the same primitive.
+    pub fn rewriteAll(self: *Session) !void {
+        const path = self.path orelse return;
+        var dir = try std.Io.Dir.cwd().openDir(self.io, ".", .{});
+        defer dir.close(self.io);
+        try rewriteOnResume(self.io, dir, self, path);
+    }
+
     /// Path of the most recent session (by mtime); null if there is none.
     pub fn latestSessionPath(arena: std.mem.Allocator, io: std.Io) !?[]const u8 {
         return latestSessionPathIn(arena, io, sessions_dir);
@@ -1429,6 +1456,30 @@ test "resume: a replay failure leaves the old session byte-identical" {
     const after = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20));
     defer alloc.free(after);
     try std.testing.expectEqualStrings(before, after);
+}
+
+test "rewindMessagesTo: drops later messages and persists the shorter transcript" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const s = try Session.create(alloc, io);
+    defer alloc.destroy(s);
+    defer s.deinit();
+    const path = try alloc.dupe(u8, s.path.?);
+    defer alloc.free(path);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try s.append(.user, "first");
+    try s.append(.assistant, "second");
+    try s.append(.user, "third");
+    try s.rewindMessagesTo(1);
+
+    try std.testing.expectEqual(@as(usize, 1), s.messages.items.len);
+    try std.testing.expectEqualStrings("first", s.messages.items[0].content);
+    const disk = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20));
+    defer alloc.free(disk);
+    // One line per retained message, no trace of the dropped ones.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, disk, "\"role\":\"user\""));
+    try std.testing.expect(std.mem.indexOf(u8, disk, "third") == null);
 }
 
 test "latestSessionPath: finds a .jsonl in the directory (the iterate flag)" {

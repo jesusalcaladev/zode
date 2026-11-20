@@ -7000,11 +7000,17 @@ pub const Model = struct {
     /// Opens the checkpoint of a turn (`startChat` calls it, once per prompt,
     /// before spawning the worker).
     pub fn beginCheckpoint(self: *Model, label: []const u8) void {
+        self.beginCheckpointWithMessages(label, 0);
+    }
+
+    /// 50.5: same as `beginCheckpoint`, but records how many messages the
+    /// session had before this turn so `/undo` can also rewind the conversation.
+    pub fn beginCheckpointWithMessages(self: *Model, label: []const u8, msg_count: usize) void {
         self.lock();
         defer self.unlock();
         self.clearNetBaselinesLocked();
         self.turn_file_cards.clear();
-        self.checkpoints.begin(label);
+        self.checkpoints.begin(label, msg_count);
     }
 
     fn clearNetBaselinesLocked(self: *Model) void {
