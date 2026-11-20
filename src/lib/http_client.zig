@@ -307,8 +307,12 @@ pub const Http = struct {
             if (out.len > 0) location = parseLocation(response.head, out);
         }
 
-        var transfer_buf: [256 * 1024]u8 = undefined;
-        const rd = response.reader(&transfer_buf);
+        // Same heap rationale as `streamPost` at :134: a 256 KiB stack array in
+        // a worker whose stack size someone lowers is a segfault waiting to
+        // happen, and this buffered path is used by every JSON request.
+        const transfer_buf = try self.gpa.alloc(u8, 256 * 1024);
+        defer self.gpa.free(transfer_buf);
+        const rd = response.reader(transfer_buf);
         const max = 50 * 1024 * 1024;
         const alloc_body = try rd.allocRemaining(self.gpa, .limited(max));
         errdefer self.gpa.free(alloc_body);

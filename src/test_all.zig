@@ -51,6 +51,7 @@ pub const plan = @import("lib/plan.zig");
 pub const taskstore = @import("lib/taskstore.zig");
 pub const registry = @import("tools/registry.zig");
 pub const checkpoint = @import("lib/checkpoint.zig");
+pub const atomic_write = @import("lib/atomic_write.zig");
 pub const mentions = @import("lib/mentions.zig");
 pub const clean = @import("lib/clean.zig");
 pub const ask = @import("lib/ask.zig");

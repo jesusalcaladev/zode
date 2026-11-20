@@ -3,6 +3,7 @@ const pathsafe = @import("../lib/pathsafe.zig");
 const common = @import("common.zig");
 const hint_lib = @import("../lib/edit_hint.zig");
 const permrules = @import("../lib/permrules.zig");
+const atomic = @import("../lib/atomic_write.zig");
 
 pub const max_hunks = 16;
 
@@ -193,14 +194,7 @@ pub fn toolEdit(perm_rules: ?permrules.Set, io: std.Io, obj: std.json.ObjectMap,
         }
     }
 
-    var f = try dir.createFile(io, path, .{ .truncate = true });
-    {
-        var buf: [4096]u8 = undefined;
-        var w = f.writer(io, &buf);
-        try w.interface.writeAll(out);
-        try w.interface.flush();
-        f.close(io);
-    }
+    try atomic.writeFile(dir, io, path, out);
     // The count is the REAL one, so the model is told what actually landed.
     //
     // There is deliberately no "this hunk applied fewer times than it was

@@ -29,6 +29,10 @@ jobs:
           readelf -SW zig-out/bin/zode-debug | grep -q .symtab
       - name: TUI smoke (required)
         run: zig build pty-check
+      - name: Crash path (required)
+        # src/main.zig has no unit tests: this real-pty probe is the only gate
+        # on terminal restoration and the pc: entry in the crash log.
+        run: python3 tools/segv_probe.py --bin ./zig-out/bin/zode-debug
 
   # Also test with version flag
   build-with-version:

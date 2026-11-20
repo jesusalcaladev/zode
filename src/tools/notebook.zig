@@ -32,6 +32,7 @@ const std = @import("std");
 const pathsafe = @import("../lib/pathsafe.zig");
 const common = @import("common.zig");
 const permrules = @import("../lib/permrules.zig");
+const atomic = @import("../lib/atomic_write.zig");
 
 const max_notebook_bytes = 32 * 1024 * 1024;
 /// After this many cells the outline stops printing them and says how many are
@@ -269,12 +270,10 @@ pub fn toolNotebookEdit(perm_rules: ?permrules.Set, io: std.Io, obj: std.json.Ob
         if (total > shown) try w.print("    … {d} more line(s)\n", .{total - shown});
     }
 
-    var dir = std.Io.Dir.cwd();
-    const file = try dir.createFile(io, path, .{ .truncate = true });
-    defer file.close(io);
+    const dir = std.Io.Dir.cwd();
     var body = std.Io.Writer.Allocating.init(arena);
     try std.json.Stringify.value(root, .{ .whitespace = .indent_1 }, &body.writer);
-    try file.writeStreamingAll(io, body.written());
+    try atomic.writeFile(dir, io, path, body.written());
 
     return out.written();
 }

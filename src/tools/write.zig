@@ -2,6 +2,7 @@ const std = @import("std");
 const common = @import("common.zig");
 const pathsafe = @import("../lib/pathsafe.zig");
 const permrules = @import("../lib/permrules.zig");
+const atomic = @import("../lib/atomic_write.zig");
 
 /// How many files one `write {files:[...]}` call may carry.
 ///
@@ -60,6 +61,17 @@ pub fn toolWrite(perm_rules: ?permrules.Set, io: std.Io, obj: std.json.ObjectMap
                 .{ fv.array.items.len, max_files_per_call },
             );
         }
+        // A batch is one logical change: if an I/O error hits file 4, files
+        // 1-3 are restored instead of leaving the repo half-renamed. A PERMISSION
+        // refusal is different and stays per-file (see the comment below): one
+        // dangerous path must not lose the three good ones.
+        const Saved = struct {
+            path: []const u8,
+            existed: bool,
+            old: ?[]u8,
+        };
+        var saved: [max_files_per_call]Saved = undefined;
+        var n_saved: usize = 0;
         var out: std.ArrayList(u8) = .empty;
         out.print(arena, "wrote {d} file(s):\n", .{fv.array.items.len}) catch {};
         for (fv.array.items) |item| {
@@ -84,12 +96,40 @@ pub fn toolWrite(perm_rules: ?permrules.Set, io: std.Io, obj: std.json.ObjectMap
                 continue;
             }
             var d = std.Io.Dir.cwd();
-            d.writeFile(io, .{ .sub_path = p, .data = c }) catch |err| {
+            const existed = (d.statFile(io, p, .{}) catch null) != null;
+            const old: ?[]u8 = if (existed) d.readFileAlloc(io, p, arena, .unlimited) catch null else null;
+            atomic.writeFile(d, io, p, c) catch |err| {
+                // Roll back the files already written in THIS call. Each restore
+                // is itself atomic, so a second failure cannot corrupt a file;
+                // it is reported instead of being swallowed.
+                if (n_saved > 0) {
+                    out.appendSlice(arena, "  rolled back: ") catch {};
+                    var i = n_saved;
+                    while (i > 0) {
+                        i -= 1;
+                        const s = saved[i];
+                        if (!s.existed) {
+                            d.deleteFile(io, s.path) catch {};
+                        } else if (s.old) |bytes| {
+                            atomic.writeFile(d, io, s.path, bytes) catch {
+                                out.print(arena, "[failed {s}] ", .{s.path}) catch {};
+                                continue;
+                            };
+                        } else {
+                            out.print(arena, "[no backup {s}] ", .{s.path}) catch {};
+                            continue;
+                        }
+                        out.print(arena, "{s} ", .{s.path}) catch {};
+                    }
+                    out.appendSlice(arena, "\n") catch {};
+                }
                 // One failure does not lose the others: four files and one error
                 // is a fixable answer, four failures is a broken tool.
                 out.print(arena, "  FAILED {s}: {t}\n", .{ p, err }) catch {};
                 continue;
             };
+            saved[n_saved] = .{ .path = p, .existed = existed, .old = old };
+            n_saved += 1;
             out.print(arena, "  {s} ({d} bytes, {d} lines)\n", .{ p, c.len, lineCount(c) }) catch {};
         }
         return out.items;
@@ -100,11 +140,8 @@ pub fn toolWrite(perm_rules: ?permrules.Set, io: std.Io, obj: std.json.ObjectMap
 
     if (writeAllowed(perm_rules, io, arena, path)) |why| return why;
 
-    var dir = std.Io.Dir.cwd();
-    dir.writeFile(io, .{
-        .sub_path = path,
-        .data = content,
-    }) catch |err| {
+    const dir = std.Io.Dir.cwd();
+    atomic.writeFile(dir, io, path, content) catch |err| {
         return std.fmt.allocPrint(arena, "error writing {s}: {t}", .{ path, err });
     };
     // The result is NOT just "wrote X (N bytes)": it carries a PREVIEW of what
@@ -157,4 +194,59 @@ pub fn lineCount(text: []const u8) usize {
     if (text.len == 0) return 0;
     const n = std.mem.count(u8, text, "\n");
     return if (std.mem.endsWith(u8, text, "\n")) n else n + 1;
+}
+
+// ── tests ─────────────────────────────────────────────────────
+
+test "write batch: an I/O failure restores the files written before it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    const dir = std.Io.Dir.cwd();
+    const a = "/tmp/opencode/zode-atomic-batch-a.txt";
+    const b = "/tmp/opencode/zode-atomic-batch-b.txt";
+    const bad = "/tmp/opencode/zode-atomic-batch-dir";
+    defer dir.deleteFile(io, a) catch {};
+    defer dir.deleteFile(io, b) catch {};
+    defer dir.deleteTree(io, bad) catch {};
+
+    try dir.writeFile(io, .{ .sub_path = a, .data = "old-A" });
+    try dir.writeFile(io, .{ .sub_path = b, .data = "old-B" });
+    try dir.createDirPath(io, bad);
+
+    const body = try std.fmt.allocPrint(arena,
+        \\{{"files":[{{"path":"{s}","content":"new-A"}},{{"path":"{s}","content":"new-B"}},{{"path":"{s}","content":"x"}}]}}
+    , .{ a, b, bad });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    const out = try toolWrite(null, io, parsed.object, arena);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "FAILED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "rolled back") != null);
+    const got_a = try dir.readFileAlloc(io, a, arena, .unlimited);
+    const got_b = try dir.readFileAlloc(io, b, arena, .unlimited);
+    try std.testing.expectEqualStrings("old-A", got_a);
+    try std.testing.expectEqualStrings("old-B", got_b);
+}
+
+test "write batch: a newly created file is deleted on rollback" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const io = std.testing.io;
+    const dir = std.Io.Dir.cwd();
+    const created = "/tmp/opencode/zode-atomic-batch-new.txt";
+    const bad = "/tmp/opencode/zode-atomic-batch-dir2";
+    defer dir.deleteFile(io, created) catch {};
+    defer dir.deleteTree(io, bad) catch {};
+    try dir.createDirPath(io, bad);
+
+    const body = try std.fmt.allocPrint(arena,
+        \\{{"files":[{{"path":"{s}","content":"new"}},{{"path":"{s}","content":"x"}}]}}
+    , .{ created, bad });
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    _ = try toolWrite(null, io, parsed.object, arena);
+
+    const st = dir.statFile(io, created, .{}) catch null;
+    try std.testing.expect(st == null);
 }

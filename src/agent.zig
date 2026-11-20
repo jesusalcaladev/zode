@@ -11275,9 +11275,41 @@ fn elapsedMs(t0: i128) u64 {
 
 /// 429 and 5xx are retried; 401/403 are not (the key is wrong: insisting does
 /// not help).
+///
+/// Transport failures are retried too. Before this, a single reset socket or a
+/// DNS hiccup lost the whole turn while a 429 got three careful attempts — the
+/// exact opposite of what a transient failure deserves. Only connection-level
+/// failures belong here: a REQUEST error means the server understood us and
+/// refused, and repeating it three times is three times the same refusal.
 fn isRetryable(err: anyerror) bool {
     return switch (err) {
         error.RateLimited, error.Overloaded, error.ServerError => true,
+        else => isRetryableTransport(err),
+    };
+}
+
+/// Connection-level failures that never reached the model's answer.
+///
+/// `error.Canceled` (one 'l') is what `io_timeout` maps an expired bound to;
+/// `error.Cancelled` (two 'l's) is ESC and must NEVER be retried — the user just
+/// asked for the turn to stop. `chat` handles that one before it gets here, but
+/// keeping it out of this table is the second line of defence.
+fn isRetryableTransport(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionResetByPeer,
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.BrokenPipe,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        error.UnknownHostName,
+        error.NameServerFailure,
+        error.TemporaryNameServerFailure,
+        error.EndOfStream,
+        error.Canceled, // io_timeout bound fired (one 'l'), not ESC
+        => true,
         else => false,
     };
 }
@@ -11396,19 +11428,25 @@ const Retry = struct {
 /// where it is going, why, and how long you have to put up with it. The server's
 /// text (`lastErrorBody`) is the part that really matters, because "HTTP 429"
 /// says nothing.
-fn pushRetryNotice(m: *tui.Model, err: anyerror, attempt: usize) void {
-    const gpa = m.allocator;
+/// The notice and the wait MUST come from the same number. Before this was
+/// split out, the notice used `backoffMs` while `Retry.wait` used `waitMs`: with
+/// `Retry-After: 30` the user was told "retrying in 0.5s" and waited 30 seconds.
+/// Pure so the parity is testable without a TUI.
+fn retryNoticeText(arena: std.mem.Allocator, err: anyerror, attempt: usize) []const u8 {
     const reason = chat.lastErrorBody();
-    const wait_ms = Retry.backoffMs(attempt);
-
+    const wait_ms = Retry.waitMs(attempt);
     const detail: []const u8 = if (reason.len > 0) reason else "no details from the server";
-    m.pushInfoFmt("{s}: {s} · retrying in {d}.{d}s (attempt {d}/3)", .{
+    return std.fmt.allocPrint(arena, "{s}: {s} · retrying in {d}.{d}s (attempt {d}/3)", .{
         errPhrase(err),
         detail,
         wait_ms / 1000,
         (wait_ms % 1000) / 100,
         attempt + 1,
-    });
+    }) catch "";
+}
+
+fn pushRetryNotice(m: *tui.Model, err: anyerror, attempt: usize) void {
+    m.pushInfo(retryNoticeText(m.allocator, err, attempt));
 
     // The status stays short (it is a segmented line) but has the why, which is
     // what you read at a glance: "rate limited 2/3" and not "retrying…".
@@ -11422,8 +11460,8 @@ fn pushRetryNotice(m: *tui.Model, err: anyerror, attempt: usize) void {
     //
     // Found by writing the first E2E test this repo has: the test's allocator is the
     // process heap's, and the DebugAllocator said where each leaked block came from.
-    const short = std.fmt.allocPrint(gpa, "{s} {d}/3", .{ errPhrase(err), attempt + 1 }) catch return;
-    defer gpa.free(short);
+    const short = std.fmt.allocPrint(m.allocator, "{s} {d}/3", .{ errPhrase(err), attempt + 1 }) catch return;
+    defer m.allocator.free(short);
     setStatusWithZo(m, .warn, short);
 }
 
@@ -13799,6 +13837,17 @@ test "quotaVerdict: the table of the seven signals" {
     try std.testing.expect(isRetryable(error.RateLimited));
     try std.testing.expect(isRetryable(error.Overloaded));
     try std.testing.expect(isRetryable(error.ServerError));
+    // Transport failures: the socket died, not the request. A transient reset
+    // must not lose the whole turn while a 429 gets three attempts.
+    try std.testing.expect(isRetryable(error.ConnectionResetByPeer));
+    try std.testing.expect(isRetryable(error.ConnectionRefused));
+    try std.testing.expect(isRetryable(error.ReadFailed));
+    try std.testing.expect(isRetryable(error.Canceled)); // io_timeout bound
+    // ESC is NOT a transport error, whatever spelling the caller uses.
+    try std.testing.expect(!isRetryable(error.Cancelled));
+    // A request the server understood and refused is never retried.
+    try std.testing.expect(!isRetryable(error.InvalidUrl));
+    try std.testing.expect(!isRetryable(error.ModelNotFound));
 }
 
 test "isGateMessage: the real gate phrases, and case-insensitive" {
@@ -13842,6 +13891,29 @@ test "the backoff respects the server's retry-after" {
 
     // And the ceiling: nobody waits 10 minutes in silence.
     chat.retry_after_secs = 600;
+    try std.testing.expectEqual(@as(u64, 30_000), Retry.waitMs(0));
+}
+
+test "the retry notice announces the duration actually waited" {
+    chat.retry_after_secs = null;
+    defer chat.retry_after_secs = null;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const plain = retryNoticeText(arena, error.RateLimited, 0);
+    const plain_ms = Retry.waitMs(0);
+    var want_buf: [32]u8 = undefined;
+    const want = std.mem.print(&want_buf, "retrying in {d}.{d}s", .{
+        plain_ms / 1000,
+        (plain_ms % 1000) / 100,
+    }) catch unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, plain, want) != null);
+
+    // The old bug: the notice said 0.5s while waitMs honored a 30s Retry-After.
+    chat.retry_after_secs = 30;
+    const with_ra = retryNoticeText(arena, error.RateLimited, 0);
+    try std.testing.expect(std.mem.indexOf(u8, with_ra, "retrying in 30.0s") != null);
     try std.testing.expectEqual(@as(u64, 30_000), Retry.waitMs(0));
 }
 

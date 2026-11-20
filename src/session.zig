@@ -43,6 +43,10 @@ const resultcap = @import("lib/resultcap.zig");
 const redact_mod = @import("lib/redact.zig");
 const providers = @import("lib/providers.zig");
 
+/// Test-only global used by the resume replay test: `resumePath` constructs
+/// its own Session internally, so there is no instance to configure.
+var fail_writes_for_resume: bool = false;
+
 var redact_env: ?*const std.process.Environ.Map = null;
 var redact_extra_key: []const u8 = "";
 var redact_extra_keys: []const []const u8 = &.{};
@@ -163,6 +167,11 @@ pub const Session = struct {
     /// Session path (owned, to show in the TUI).
     path: ?[]const u8 = null,
     fw: ?std.Io.File.Writer = null,
+    /// Deterministic write-failure injection for the durability tests. A real
+    /// disk-full or I/O error is not reproducible in CI; this is the same code
+    /// path with a known trigger, so a lost transcript is a failing test.
+    fail_writes: bool = false,
+
     /// Provider-reported usage for this session, persisted as metadata records
     /// in the JSONL and never sent back to the model.
     usage_stats: cache_stats.CacheStats = .{},
@@ -272,7 +281,13 @@ pub const Session = struct {
         // `createFile` takes no mode: POSIX gives 0666 & ~umask, which is 0644 on a
         // default umask. The mode is set on the open file, so there is no window in
         // which the transcript exists at 0644 — which a `create` + `chmod` would have.
-        file.setPermissions(io, session_mode) catch {};
+        // A session holds everything the user did. A silent 0644 here used to
+        // publish the whole transcript to every account on the machine, so the
+        // mode is VERIFIED, not just requested — a filesystem that ignores
+        // chmod fails the create instead of looking fine.
+        file.setPermissions(io, session_mode) catch return error.SessionPermissionsFailed;
+        const st = file.stat(io) catch return error.SessionPermissionsFailed;
+        if (@backingInt(st.permissions) & 0o077 != 0) return error.SessionPermissionsFailed;
         s.file = file;
         s.io = io;
         // Streaming writer: appends at the end of the fd (no 0xFF hole).
@@ -423,9 +438,20 @@ pub const Session = struct {
         const scrubbed = self.scrubForPersist(content) catch content;
         defer if (scrubbed.ptr != content.ptr) self.allocator.free(scrubbed);
         const copy = try self.allocator.dupe(u8, scrubbed);
-        errdefer self.allocator.free(copy);
+        var keep = false;
+        errdefer if (!keep) self.allocator.free(copy);
         try self.messages.append(self.allocator, .{ .role = role, .content = copy });
-        if (self.fw != null) try self.persist(&self.messages.items[self.messages.items.len - 1]);
+        keep = true;
+        if (self.fw != null) {
+            self.persist(&self.messages.items[self.messages.items.len - 1]) catch |err| {
+                // The disk copy did not land. Undo the in-memory append too, or
+                // the next request replays a message the file never had — and
+                // deinit frees `copy` a second time.
+                _ = self.messages.pop();
+                self.allocator.free(copy);
+                return err;
+            };
+        }
     }
 
     /// Replaces the content of the existing `system` message, or appends one if
@@ -492,18 +518,27 @@ pub const Session = struct {
         tool_calls_json: ?[]const u8,
     ) !void {
         const copy = try self.allocator.dupe(u8, content);
-        errdefer self.allocator.free(copy);
+        var keep = false;
+        errdefer if (!keep) self.allocator.free(copy);
         var tj: ?[]const u8 = null;
         if (tool_calls_json) |j| {
             tj = try self.allocator.dupe(u8, j);
         }
-        errdefer if (tj) |t| self.allocator.free(t);
+        errdefer if (!keep) if (tj) |t| self.allocator.free(t);
         try self.messages.append(self.allocator, .{
             .role = .assistant,
             .content = copy,
             .tool_calls_json = tj,
         });
-        if (self.fw != null) try self.persist(&self.messages.items[self.messages.items.len - 1]);
+        keep = true;
+        if (self.fw != null) {
+            self.persist(&self.messages.items[self.messages.items.len - 1]) catch |err| {
+                const m = self.messages.pop().?;
+                self.allocator.free(m.content);
+                if (m.tool_calls_json) |t| self.allocator.free(t);
+                return err;
+            };
+        }
     }
 
     /// Adds a tool_result.
@@ -516,18 +551,28 @@ pub const Session = struct {
         const scrubbed = self.scrubForPersist(content) catch content;
         defer if (scrubbed.ptr != content.ptr) self.allocator.free(scrubbed);
         const copy = try self.allocator.dupe(u8, scrubbed);
-        errdefer self.allocator.free(copy);
+        var keep = false;
+        errdefer if (!keep) self.allocator.free(copy);
         const id = try self.allocator.dupe(u8, tool_call_id);
-        errdefer self.allocator.free(id);
+        errdefer if (!keep) self.allocator.free(id);
         const name = try self.allocator.dupe(u8, tool_name);
-        errdefer self.allocator.free(name);
+        errdefer if (!keep) self.allocator.free(name);
         try self.messages.append(self.allocator, .{
             .role = .tool,
             .content = copy,
             .tool_call_id = id,
             .tool_name = name,
         });
-        if (self.fw != null) try self.persist(&self.messages.items[self.messages.items.len - 1]);
+        keep = true;
+        if (self.fw != null) {
+            self.persist(&self.messages.items[self.messages.items.len - 1]) catch |err| {
+                const m = self.messages.pop().?;
+                self.allocator.free(m.content);
+                if (m.tool_call_id) |t| self.allocator.free(t);
+                if (m.tool_name) |t| self.allocator.free(t);
+                return err;
+            };
+        }
     }
 
     /// Serializes and writes one JSONL line. No pretty-print: 1 line = 1 message.
@@ -535,35 +580,42 @@ pub const Session = struct {
     /// Content is redacted again at persist boundary (defense in depth).
     fn persist(self: *Session, m: *const Message) !void {
         if (self.fw == null) return;
+        // Deterministic failure injection: the same early return a disk-full or
+        // I/O error takes, so the caller sees the error and no bytes are written.
+        if (self.fail_writes) return error.SessionWriteFailed;
         const w = &self.fw.?.interface;
         const scrubbed = self.scrubForPersist(m.content) catch m.content;
         defer if (scrubbed.ptr != m.content.ptr) self.allocator.free(scrubbed);
-        w.writeAll("{\"role\":\"") catch {};
-        w.writeAll(@tagName(m.role)) catch {};
-        w.writeAll("\",\"content\":\"") catch {};
+        // Every write and the flush PROPAGATE. Swallowing them here used to let
+        // `appendUser` return success while the transcript on disk stayed one
+        // line behind (or stopped entirely on a full disk): the session then
+        // replayed an older conversation after resume, with no error anywhere.
+        try w.writeAll("{\"role\":\"");
+        try w.writeAll(@tagName(m.role));
+        try w.writeAll("\",\"content\":\"");
         if (!self.compress_writer_ready) {
             self.compress_writer = std.Io.Writer.Allocating.initCapacity(self.allocator, 4096) catch std.Io.Writer.Allocating.init(self.allocator);
             self.compress_writer_ready = true;
         }
         if (zjsonl.compressLineWith(&self.compress_buf, scrubbed, &self.compress_window, &self.compress_writer)) |cline| {
-            writeEscaped(w, cline) catch {};
+            try writeEscaped(w, cline);
         } else {
-            writeEscaped(w, scrubbed) catch {};
+            try writeEscaped(w, scrubbed);
         }
-        w.writeAll("\"") catch {};
+        try w.writeAll("\"");
         if (m.tool_calls_json) |tj| {
-            w.writeAll(",\"tool_calls\":") catch {};
-            w.writeAll(tj) catch {}; // raw JSON from the server
+            try w.writeAll(",\"tool_calls\":");
+            try w.writeAll(tj); // raw JSON from the server
         }
         if (m.tool_call_id) |id| {
-            w.writeAll(",\"tool_call_id\":\"") catch {};
-            writeEscaped(w, id) catch {};
-            w.writeAll("\",\"tool_name\":\"") catch {};
-            writeEscaped(w, m.tool_name orelse "") catch {};
-            w.writeAll("\"") catch {};
+            try w.writeAll(",\"tool_call_id\":\"");
+            try writeEscaped(w, id);
+            try w.writeAll("\",\"tool_name\":\"");
+            try writeEscaped(w, m.tool_name orelse "");
+            try w.writeAll("\"");
         }
-        w.writeAll("}\n") catch {};
-        w.flush() catch {}; // durable per line
+        try w.writeAll("}\n");
+        try w.flush(); // durable per line
         self.maybeUpdateRunningSummary();
     }
 
@@ -713,21 +765,51 @@ pub const Session = struct {
         if (meta.agent_name.len > 0) {
             s.agent_name = try allocator.dupe(u8, meta.agent_name);
         }
+        // Every failure from here on must release the loaded messages, not just
+        // the Session struct: the outer `errdefer` destroys the pointer.
+        errdefer s.deinit();
         var dir = try std.Io.Dir.cwd().openDir(io, ".", .{});
         defer dir.close(io);
-        const file = try dir.createFile(io, path, .{ .truncate = true });
-        // Resuming TRUNCATES and rewrites, so the file is recreated: its mode has to be
-        // set again, or a session that was 0600 goes back to 0644 on the next resume.
-        file.setPermissions(io, session_mode) catch {};
+        try rewriteOnResume(io, dir, s, path);
+
+        const file = try dir.createFile(io, path, .{ .truncate = false });
+        file.setPermissions(io, session_mode) catch return error.SessionPermissionsFailed;
+        const st = file.stat(io) catch return error.SessionPermissionsFailed;
+        if (@backingInt(st.permissions) & 0o077 != 0) return error.SessionPermissionsFailed;
         s.file = file;
         s.fw = std.Io.File.Writer.initStreaming(file, io, &s.write_buf);
+        return s;
+    }
+
+    /// Replays the messages into a temp file and renames it over the session.
+    ///
+    /// The old code truncated first and rewrote in place, so a crash during a
+    /// resume destroyed the transcript it was trying to restore. `s.fw`/`s.file`
+    /// are left null on BOTH paths: the temp writer points at this frame's
+    /// stack buffer and at a file `replace` has closed, and must not escape.
+    fn rewriteOnResume(io: std.Io, dir: std.Io.Dir, s: *Session, path: []const u8) !void {
+        var atomic_file = try dir.createFileAtomic(io, path, .{
+            .replace = true,
+            .permissions = session_mode,
+        });
+        errdefer atomic_file.deinit(io);
+        var rewrite_buf: [8192]u8 = undefined;
+        s.file = atomic_file.file;
+        s.fw = atomic_file.file.writer(io, &rewrite_buf);
+        defer {
+            s.fw = null;
+            s.file = null;
+        }
         for (s.messages.items) |*m| {
+            if (fail_writes_for_resume) return error.SessionWriteFailed;
             try s.persist(m);
         }
         if (s.usage_stats.requests > 0) try s.persistUsageSnapshot();
         try s.persistScrollState();
         try s.fw.?.interface.flush();
-        return s;
+        try atomic_file.file.sync(io);
+        try atomic_file.replace(io);
+        atomic_file.deinit(io);
     }
 
     /// Path of the most recent session (by mtime); null if there is none.
@@ -1294,6 +1376,59 @@ test "round trip: session compressed on disk" {
     try std.testing.expectEqual(@as(usize, 1), s2.usage_stats.requests);
     try std.testing.expectEqual(@as(i64, 1200), s2.usage_stats.prompt_tokens);
     try std.testing.expectEqual(@as(i64, 800), s2.usage_stats.cached_tokens);
+}
+
+test "persist: a write failure is reported and the last good line survives" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const s = try Session.create(alloc, io);
+    defer alloc.destroy(s);
+    defer s.deinit();
+    const path = try alloc.dupe(u8, s.path.?);
+    defer alloc.free(path);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try s.append(.user, "first line survives");
+    const before = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20));
+    defer alloc.free(before);
+
+    s.fail_writes = true;
+    try std.testing.expectError(error.SessionWriteFailed, s.append(.user, "this one fails"));
+    s.fail_writes = false;
+
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20));
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    // Memory AND disk agree: the failed message is rolled back in both, and
+    // the caller got an error it can act on instead of a silent divergence.
+    try std.testing.expectEqual(@as(usize, 1), s.messages.items.len);
+}
+
+test "resume: a replay failure leaves the old session byte-identical" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const s = try Session.create(alloc, io);
+    defer alloc.destroy(s);
+    defer s.deinit();
+    const path = try alloc.dupe(u8, s.path.?);
+    defer alloc.free(path);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try s.append(.user, "the original transcript");
+    const before = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20));
+    defer alloc.free(before);
+    s.flush();
+
+    // Load the file, then make the REPLAY fail deterministically. The old code
+    // truncated first and lost everything at this point. A global flag is used
+    // because `load` returns a Session BY VALUE and `resumePath` loads its own
+    // copy from disk — there is no instance to configure before the replay.
+    fail_writes_for_resume = true;
+    defer fail_writes_for_resume = false;
+    try std.testing.expectError(error.SessionWriteFailed, Session.resumePath(alloc, io, path));
+
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20));
+    defer alloc.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }
 
 test "latestSessionPath: finds a .jsonl in the directory (the iterate flag)" {
