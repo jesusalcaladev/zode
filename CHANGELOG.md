@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - counts, register, visual mode, hunk folding, side-by-side (49) (vim,diff) [`086f1b03`](https://github.com/jesusalcaladev/zode/commit/086f1b03)
 - /export and hierarchical instruction files (50.1, 50.4) (ecosystem) [`1cc3c531`](https://github.com/jesusalcaladev/zode/commit/1cc3c531)
 - hook events + user scope, MCP resources/prompts (50.2, 50.3) (ecosystem) [`ad547763`](https://github.com/jesusalcaladev/zode/commit/ad547763)
+- per-call tool collapse, side-by-side diff, subagent tree (49.8) (tui) [`321ab2a9`](https://github.com/jesusalcaladev/zode/commit/321ab2a9)
 
 ### Bug Fixes
 
@@ -26,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - close a real use-after-free found by the new regression test (compaction) [`6e14a3a3`](https://github.com/jesusalcaladev/zode/commit/6e14a3a3)
 - apply env timeout before the headless client is built (47) (http) [`577d6143`](https://github.com/jesusalcaladev/zode/commit/577d6143)
 - atomic agent writes, transport retries, durable sessions (48) (reliability) [`9aeada3e`](https://github.com/jesusalcaladev/zode/commit/9aeada3e)
-- Phase 51 quick wins — language gate, real timeouts, honest audits (51) (verification) [`85844399`](https://github.com/jesusalcaladev/zode/commit/85844399)
+- Phase 51 quick wins — language gate, real timeouts, honest audits (51) (verification) [`ad3ac96f`](https://github.com/jesusalcaladev/zode/commit/ad3ac96f)
 
 ### Chores
 

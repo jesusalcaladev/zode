@@ -30,6 +30,7 @@ const palette = @import("palette.zig");
 const plan_mod = @import("lib/plan.zig");
 const sleepz = @import("lib/sleep.zig");
 const zjsonl = @import("lib/zjsonl.zig");
+const treetext = @import("lib/treetext.zig");
 
 const banner = tui.banner;
 const boundCommand = tui.boundCommand;
@@ -1712,12 +1713,75 @@ test "diff viewer: f folds a hunk into a one-line marker" {
     const before = try drawTest(&m, arena_state.allocator(), 100, 24);
     try std.testing.expect(findRow(before, "two") != null);
     m.folded_hunks.append(std.testing.allocator, 0) catch return;
-    try std.testing.expect(findRow(before, "two") != null);
-
-    m.folded_hunks.append(std.testing.allocator, 0) catch return;
     const s = try drawTest(&m, arena_state.allocator(), 100, 24);
     // The folded marker reaches the screen; the raw content line is gone.
     try std.testing.expect(findRow(s, "folded") != null);
+}
+
+test "nested tree: a structured subagent tree renders task and tool rows" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    agent.setAnswering("");
+    defer m.deinit();
+
+    const nodes = [_]treetext.Node{
+        .{ .depth = 0, .label = "task: review auth", .status = .running },
+        .{ .depth = 1, .label = "Read(src/main.zig)", .status = .done },
+        .{ .depth = 1, .label = "grep(permission)", .status = .running },
+    };
+    const text = try treetext.render(a, &nodes);
+    m.pushKind(.tool_run, text);
+    const s = try drawTest(&m, a, 100, 24);
+    try std.testing.expect(findRow(s, "task: review auth") != null);
+    try std.testing.expect(findRow(s, "Read(src/main.zig)") != null);
+    try std.testing.expect(findRow(s, "grep(permission)") != null);
+}
+
+test "per-call collapse: a non-last tool result expands independently" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    agent.setAnswering("");
+    defer m.deinit();
+
+    m.pushToolDone("Read", "Read a file", 3, "FULL RESULT OF THE FIRST TOOL");
+    m.pushToolDone("Write", "Write a file", 4, "FULL RESULT OF THE SECOND TOOL");
+    _ = try drawTest(&m, arena_state.allocator(), 100, 24);
+    try std.testing.expect(m.tool_memos.items.len >= 2);
+
+    const first = &m.tool_memos.items[0];
+    try std.testing.expect(!first.expanded);
+    try std.testing.expect(m.toggleToolAt(first.para_idx));
+    try std.testing.expect(m.tool_memos.items[0].expanded);
+    // Ctrl+R still owns the LAST tool; the registry did not change that.
+    try std.testing.expect(!m.tool_memos.items[1].expanded);
+
+    const s = try drawTest(&m, arena_state.allocator(), 100, 24);
+    try std.testing.expect(findRow(s, "FULL RESULT OF THE FIRST TOOL") != null);
+}
+
+test "diff viewer: s renders deletions and additions on one row in two columns" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    agent.setAnswering("");
+    defer m.deinit();
+    _ = m.pushDiffLang("one\ntwo\nthree\n", "one\nTWO\nthree\n", "zig", "src/a.zig");
+    _ = try drawTest(&m, arena_state.allocator(), 100, 24);
+    m.recordFileIntel("src/a.zig", 0, 1, 1, false, .modified);
+    try std.testing.expect(m.openDiffViewer());
+    m.diff_side_by_side = true;
+
+    const s = try drawTest(&m, arena_state.allocator(), 100, 24);
+    const row = findRow(s, "TWO") orelse return error.TestExpectedEqual;
+    var buf: [512]u8 = undefined;
+    const text = rowText(s, row, &buf);
+    // The paired row shows BOTH sides; in the single-column view it never did.
+    try std.testing.expect(std.mem.indexOf(u8, text, "two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "TWO") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "│") != null);
 }
 
 test "markdown: a link cell carries its OSC-8 target and a task list renders" {

@@ -193,6 +193,15 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 }
                 return;
             }
+            // 49.8: expand/collapse the tool result under the view instead of
+            // always the last one. Works on any result still in scrollback.
+            if (key.matches('r', .{ .alt = true }) and !self.pal.active) {
+                const first = self.first_visible;
+                if (self.paraAtVisibleRow(first)) |idx| {
+                    if (self.toggleToolAt(idx)) ctx.redraw = true;
+                }
+                return;
+            }
             // Phase 3: hunk navigation on the last diff (alt+] next, alt+[ prev).
             if (key.matches(']', .{ .alt = true })) {
                 if (self.navigateLastDiffHunk(1)) ctx.redraw = true;

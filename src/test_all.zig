@@ -53,6 +53,7 @@ pub const registry = @import("tools/registry.zig");
 pub const checkpoint = @import("lib/checkpoint.zig");
 pub const atomic_write = @import("lib/atomic_write.zig");
 pub const instructions = @import("lib/instructions.zig");
+pub const treetext = @import("lib/treetext.zig");
 pub const mentions = @import("lib/mentions.zig");
 pub const clean = @import("lib/clean.zig");
 pub const ask = @import("lib/ask.zig");

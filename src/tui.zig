@@ -14,6 +14,7 @@ const theme = @import("lib/theme.zig");
 const lang_icons = @import("lib/lang_icons.zig");
 const filechange = @import("lib/filechange.zig");
 const diffhunks = @import("lib/diffhunks.zig");
+const diffview = @import("lib/diff/view.zig");
 const ed = @import("lib/editor.zig");
 const textcap = @import("lib/textcap.zig");
 const sleepz = @import("lib/sleep.zig");
@@ -2005,6 +2006,12 @@ pub const Model = struct {
     diff_viewer_active: bool = false,
     diff_viewer_sel: usize = 0,
     diff_viewer_scroll: usize = 0,
+    /// Presentation-only: render the diff in two columns instead of one.
+    diff_side_by_side: bool = false,
+    /// Every tool result, not just the last one, can be expanded. `last_tool`
+    /// keeps Ctrl+R's meaning; this registry lets a click or alt+R open ANY
+    /// result in the transcript.
+    tool_memos: std.ArrayList(ToolMemo) = .empty,
     /// Hunk indices folded in the diff viewer. Structured state, never parsed
     /// back out of the rendered text. `f` toggles the hunk under the cursor.
     folded_hunks: std.ArrayList(usize) = .empty,
@@ -2165,6 +2172,9 @@ pub const Model = struct {
     /// Kept small (64) so a session with long tool outputs does not OOM:
     /// 64 × 1 MB cap = 64 MB worst case, not 128 × 10 MB = 1.28 GB.
     pub const max_cached_paras = 64;
+    /// Bounded per-call result registry: the oldest memos are dropped so a
+    /// long session cannot keep every full tool result alive at once.
+    pub const max_tool_memos = 128;
 
     const SelectionPoint = struct { row: u16, col: u16 };
 
@@ -2487,6 +2497,8 @@ pub const Model = struct {
         self.shell_out.deinit(self.allocator);
         self.search_matches.deinit(self.allocator);
         self.folded_hunks.deinit(self.allocator);
+        for (self.tool_memos.items) |*memo| memo.deinit(self.allocator);
+        self.tool_memos.deinit(self.allocator);
         self.destroyPalette();
         if (self.pending_items) |items| palette.freeItems(self.allocator, items);
         self.ed.deinit();
@@ -3012,6 +3024,11 @@ pub const Model = struct {
         }
         if (key.matches('u', .{ .ctrl = true })) {
             self.diff_viewer_scroll -|= 10;
+            return true;
+        }
+        if (key.matches('s', .{})) {
+            self.diff_side_by_side = !self.diff_side_by_side;
+            self.diff_viewer_scroll = 0;
             return true;
         }
         if (key.matches('f', .{})) {
@@ -6113,12 +6130,29 @@ pub const Model = struct {
         // requested and the screen goes dead (see `armTick`).
         self.dirty = true;
         // The paragraph index is fixed on drain; `pending` is not in `paras` yet.
+        const para_idx = self.paras.items.len + self.pending.items.len - 1;
         self.last_tool = .{
-            .para_idx = self.paras.items.len + self.pending.items.len - 1,
+            .para_idx = para_idx,
             .result = full,
             .summary = sum,
             .expanded = false,
         };
+        // Independent copy for the per-call registry: `last_tool` owns the
+        // strings above and is overwritten on the next tool. Cap the registry
+        // so a long session does not keep every result's full text alive.
+        var empty: [0]u8 = .{};
+        const full_copy = self.allocator.dupe(u8, full) catch empty[0..];
+        const sum_copy = self.allocator.dupe(u8, sum) catch empty[0..];
+        var memo = ToolMemo{
+            .para_idx = para_idx,
+            .result = full_copy,
+            .summary = sum_copy,
+        };
+        if (self.tool_memos.items.len >= max_tool_memos) {
+            var old = self.tool_memos.orderedRemove(0);
+            old.deinit(self.allocator);
+        }
+        self.tool_memos.append(self.allocator, memo) catch memo.deinit(self.allocator);
     }
 
     /// A diff: ONE paragraph with the lines joined by `\n`.
@@ -6880,6 +6914,32 @@ pub const Model = struct {
         }
         self.unlock();
         return ok;
+    }
+
+    /// 49.8: expand/collapse ANY tool result, not only the last one. The
+    /// paragraph text is swapped in place (never re-parsed from rendered text)
+    /// and the layout cache is invalidated from this paragraph onward.
+    pub fn toggleToolAt(self: *Model, para_idx: usize) bool {
+        for (self.tool_memos.items) |*memo| {
+            if (memo.para_idx != para_idx) continue;
+            const ok = toggleParagraph(self, para_idx, memo.expanded, memo.result, memo.summary);
+            if (ok) memo.expanded = !memo.expanded;
+            return ok;
+        }
+        return false;
+    }
+
+    /// Which paragraph of the transcript is under a visible row. Uses the
+    /// measured heights rather than rendered strings, as the TUI rules demand.
+    pub fn paraAtVisibleRow(self: *const Model, row: usize) ?usize {
+        if (row >= self.hist_rows) return null;
+        const abs = self.first_visible + row;
+        var sum: usize = 0;
+        for (self.para_heights.items, 0..) |h, i| {
+            if (abs >= sum and abs < sum + h) return i;
+            sum += h;
+        }
+        return null;
     }
 
     /// Swaps paragraph `idx` between the two texts (`expanded` says which one
@@ -11350,7 +11410,7 @@ pub fn drawDiffViewer(p: *Painter, m: *const Model, width: u16, height: u16) voi
     var title_buf: [96]u8 = undefined;
     const title = std.mem.print(&title_buf, " Diff viewer  ({d}/{d} files) ", .{ sel + 1, n }) catch " Diff viewer ";
     _ = p.putText(x0 + 2, y0, title, theme.accent_bold);
-    const hint = " ↑↓ file · PgUp/PgDn scroll · f fold hunk · Enter jump · Esc close ";
+    const hint = " ↑↓ file · PgUp/PgDn · f fold · s side-by-side · Enter jump · Esc close ";
     _ = p.putClipped(x0 + 2, y0 + box_h - 1, hint, box_w -| 4, theme.hint);
 
     // File list area
@@ -11418,8 +11478,40 @@ pub fn drawDiffViewer(p: *Painter, m: *const Model, width: u16, height: u16) voi
     const scroll = @min(m.diff_viewer_scroll, max_scroll);
 
     var drawn: usize = 0;
+    if (m.diff_side_by_side) {
+        // Two columns from the pure pairing layer. Each side keeps its own
+        // diff style; a `@@` header spans both columns.
+        const sides = diffview.sideBySide(p.arena, para.text) catch &.{};
+        const half: u16 = (box_w -| 6) / 2;
+        const divider = x0 + 3 + half;
+        p.fillRange(divider, divider + 1, diff_top, "│", theme.rule);
+        for (sides, 0..) |row, line_idx| {
+            if (line_idx < scroll) continue;
+            if (drawn >= diff_rows) break;
+            const y = diff_top + @as(u16, @intCast(drawn));
+            if (row.header) {
+                _ = p.putClipped(x0 + 2, y, row.left, box_w -| 4, theme.diff_hunk);
+            } else {
+                const ls: vaxis.Style = switch (row.left_kind) {
+                    .del => theme.diff_del,
+                    .add => theme.diff_add,
+                    .hunk => theme.diff_hunk,
+                    else => theme.diff_ctx,
+                };
+                const rs: vaxis.Style = switch (row.right_kind) {
+                    .del => theme.diff_del,
+                    .add => theme.diff_add,
+                    .hunk => theme.diff_hunk,
+                    else => theme.diff_ctx,
+                };
+                _ = p.putClipped(x0 + 2, y, row.left, half, ls);
+                _ = p.putClipped(divider + 1, y, row.right, half, rs);
+            }
+            drawn += 1;
+        }
+        return;
+    }
     for (view_lines, 0..) |line, line_idx| {
-        if (line_idx < scroll) continue;
         if (line_idx < scroll) continue;
         if (drawn >= diff_rows) break;
         const row = diff_top + @as(u16, @intCast(drawn));
