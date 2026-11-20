@@ -419,7 +419,7 @@ pub const Session = struct {
         self.result_caps = resultcap.deserializeCaps(self.allocator, data) catch std.Io.Writer.Allocating.init(self.allocator);
     }
 
-    fn scrubForPersist(self: *Session, content: []const u8) ![]u8 {
+    pub fn scrubForPersist(self: *Session, content: []const u8) ![]u8 {
         var keys: std.ArrayList([]const u8) = .empty;
         defer keys.deinit(self.allocator);
         providers.appendSavedRedactionKeys(&keys, self.allocator);

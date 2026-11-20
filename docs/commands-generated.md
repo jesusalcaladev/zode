@@ -55,6 +55,7 @@ Do not edit by hand — the table there is the one the TUI uses.
 | `/status` | session status: model, effort, perms, compaction, context gauge | `context gauge` |
 | `/usage` | session input/output tokens, cache, and request totals | `session totals` |
 | `/cost` | what this session has cost, per model (USD, from the catalogue's prices) | — |
+| `/export` | export the whole session to markdown: /export [path] | `[path]` |
 | `/update` | install the newest release (says when one is available) | — |
 | `/compact` | off\|elide\|full\|now: automatic compaction (no args: report, now = compact immediately) | `off\|elide\|full\|now` |
 | `/bench` | session numbers: turns, iterations, first-token times | — |

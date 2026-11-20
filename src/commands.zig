@@ -2826,6 +2826,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/status", .desc = "session status: model, effort, perms, compaction, context gauge", .key_hint = "context gauge" },
     .{ .key = "/usage", .desc = "session input/output tokens, cache, and request totals", .key_hint = "session totals" },
     .{ .key = "/cost", .desc = "what this session has cost, per model (USD, from the catalogue's prices)" },
+    .{ .key = "/export", .desc = "export the whole session to markdown: /export [path]", .key_hint = "[path]" },
     .{ .key = "/update", .desc = "install the newest release (says when one is available)" },
     .{ .key = "/compact", .desc = "off|elide|full|now: automatic compaction (no args: report, now = compact immediately)", .key_hint = "off|elide|full|now" },
     .{ .key = "/bench", .desc = "session numbers: turns, iterations, first-token times", .palette_visible = false },
@@ -3032,6 +3033,31 @@ test "/hooks panel is dispatched" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "hooks") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "PreToolUse") != null);
+}
+
+test "/export writes the session as markdown" {
+    const a = std.testing.allocator;
+    const path = "/tmp/opencode/zode-export-test.md";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+
+    const s = try session_mod.Session.create(a, std.testing.io);
+    defer {
+        s.deinit();
+        a.destroy(s);
+    }
+    try s.append(.user, "hello from the export test");
+    const saved = agent.session;
+    defer agent.session = saved;
+    agent.session = s;
+
+    var m = tui.Model.init(a);
+    defer m.deinit();
+    m.attachIo(std.testing.io);
+    cmdExport(&m, path);
+    const data = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .unlimited);
+    defer a.free(data);
+    try std.testing.expect(std.mem.indexOf(u8, data, "## User") != null);
+    try std.testing.expect(std.mem.indexOf(u8, data, "hello from the export test") != null);
 }
 
 test "/agents panel is dispatched" {
@@ -3793,6 +3819,57 @@ pub fn cmdBtw(m: *tui.Model, arg: ?[]const u8) void {
 }
 
 /// `/copy [N]`: the answer, on the clipboard and in a file.
+/// `/export [path]`: the whole session as markdown, for a bug report or a
+/// handoff. The content goes through the SAME redaction as the session file, so
+/// an exported transcript cannot leak an API key that the on-disk one would
+/// have scrubbed.
+pub fn cmdExport(m: *tui.Model, arg: ?[]const u8) void {
+    const s = agent.session orelse {
+        m.pushError("no session to export");
+        return;
+    };
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path: []const u8 = if (arg) |a|
+        a
+    else
+        std.mem.print(&path_buf, "zode-session-{s}.md", .{&s.id}) catch {
+            m.pushError("could not build the export path");
+            return;
+        };
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(m.allocator);
+    out.appendSlice(m.allocator, "# Zode session\n\n") catch {
+        m.pushError("could not build the export");
+        return;
+    };
+    for (s.messages.items) |msg| {
+        const label: []const u8 = switch (msg.role) {
+            .user => "User",
+            .assistant => "Assistant",
+            .tool => "Tool result",
+            .system => "System",
+        };
+        const clean = s.scrubForPersist(msg.content) catch msg.content;
+        defer if (clean.ptr != msg.content.ptr) m.allocator.free(clean);
+        out.print(m.allocator, "## {s}\n\n{s}\n\n", .{ label, clean }) catch {
+            m.pushError("could not build the export");
+            return;
+        };
+        if (msg.tool_calls_json) |tj| {
+            out.appendSlice(m.allocator, "Tool calls:\n\n```json\n") catch return;
+            out.appendSlice(m.allocator, tj) catch return;
+            out.appendSlice(m.allocator, "\n```\n\n") catch return;
+        }
+    }
+    const dir = std.Io.Dir.cwd();
+    dir.writeFile(m.io, .{ .sub_path = path, .data = out.items }) catch |err| {
+        m.pushErrorFmt("could not write {s}: {t}", .{ path, err });
+        return;
+    };
+    m.pushInfoFmt("exported {d} messages to {s}", .{ s.messages.items.len, path });
+}
+
 pub fn cmdCopy(m: *tui.Model, arg: ?[]const u8) void {
     const s = agent.session orelse {
         m.pushInfo(copytext.no_messages_msg);

@@ -438,7 +438,7 @@ pub fn goalNote(
 /// project instructions at all. Which is the same bug class as the skills roots:
 /// the project lives in the root, and the root is what git already knows.
 pub fn systemPromptBase(gpa: std.mem.Allocator) []const u8 {
-    return prompt_system.systemPromptBase(gpa, io_global, project_info.root());
+    return prompt_system.systemPromptBase(gpa, io_global, environ_global, project_info.root());
 }
 
 /// `AGENTS.md` then `CLAUDE.md` under `dir`, or null.
@@ -2969,6 +2969,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdDoctor(m);
     } else if (std.mem.eql(u8, cmd, "cost")) {
         commands_mod.cmdCost(m);
+    } else if (std.mem.eql(u8, cmd, "export")) {
+        commands_mod.cmdExport(m, arg);
     } else if (std.mem.eql(u8, cmd, "config")) {
         commands_mod.cmdConfig(m, rest);
     } else if (std.mem.eql(u8, cmd, "status")) {

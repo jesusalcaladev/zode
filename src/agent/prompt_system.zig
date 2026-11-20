@@ -3,6 +3,7 @@ const std = @import("std");
 const goal_mod = @import("../lib/goal.zig");
 const session_mod = @import("../session.zig");
 const agentsdoc = @import("../lib/agentsdoc.zig");
+const instructions = @import("../lib/instructions.zig");
 const cache_stats = @import("../cache_stats.zig");
 const prompt_mod = @import("../lib/prompt.zig");
 const cachebreak = @import("../lib/cachebreak.zig");
@@ -74,9 +75,9 @@ pub fn forgetAgentsCache(a: std.mem.Allocator) void {
     }
 }
 
-pub fn systemPromptBase(gpa: std.mem.Allocator, io: std.Io, project_root: ?[]const u8) []const u8 {
+pub fn systemPromptBase(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, project_root: ?[]const u8) []const u8 {
     if (agents_md_cache == null) {
-        agents_md_cache = readAgentsIn(gpa, io, ".") orelse readAgentsIn(gpa, io, project_root) orelse null;
+        agents_md_cache = instructions.loadAll(gpa, io, env, ".", project_root) catch null;
     }
     if (agents_md_cache) |c| return c;
     return prompt_mod.default_system_prompt;
@@ -184,7 +185,7 @@ pub fn skillsSectionText(ctx: BuildCtx, list_buf: []u8) []const u8 {
 
 pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const u8 {
     clearCacheBreakLast();
-    const base = systemPromptBase(ctx.gpa, ctx.io, ctx.project_root);
+    const base = systemPromptBase(ctx.gpa, ctx.io, ctx.env, ctx.project_root);
 
     var list_buf: [16 * 1024]u8 = undefined;
     const section = if (include_skills) skillsSectionText(ctx, &list_buf) else "";
