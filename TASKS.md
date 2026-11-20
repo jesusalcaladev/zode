@@ -1,8 +1,13 @@
 # TASKS — zode improvement backlog
 
 > New board after the feature work was completed and the old board was removed.
-> This is a **quality backlog**: security, token efficiency, refactoring, test
-> coverage, UX polish and tooling. It is not a feature roadmap.
+> This is a **quality backlog**: security, reliability, token efficiency,
+> refactoring, test coverage, UX polish, ecosystem compatibility and tooling.
+> It is not a feature roadmap.
+>
+> Phases 40-47 are the completed quality pass. Phases 48-51 are the parity
+> backlog from the Claude Code gap audit: reliability, presentation, ecosystem
+> and verification honesty.
 >
 > One checkbox per deliverable. Ticking a box means: `zig build test` green ·
 > the item's acceptance check passes · this file updated.
@@ -12,7 +17,9 @@
 | Badge | Track | Priority | Meaning |
 | --- | --- | --- | --- |
 | 🔒 | security | 🔴 | critical — do first |
+| 🛡️ | reliability | 🔴 | critical — data loss / lost turn risk |
 | ⚡ | tokens/performance | 🟠 | high — direct cost/latency win |
+| 🔌 | ecosystem | 🟠 | high — wider agent compatibility |
 | 🏗️ | refactor | 🟡 | medium — maintainability |
 | 🧪 | tests | 🟢 | on demand |
 | 🎨 | UX/TUI | 🟢 | on demand |
@@ -151,10 +158,66 @@ IDs are grouped by track so they can be worked in any order inside a track.
 
 ---
 
+## Phase 48 — 🛡️ Reliability and durability
+
+- [ ] 🔴 **48.1 Make agent file writes atomic and backed up.** `write`/`edit`/`notebook` truncate in place (`src/tools/write.zig:87,104`, `src/tools/edit.zig:196`, `src/tools/notebook.zig:273`), so a crash, disk-full or interruption leaves a truncated source file; batch writes (`write.zig:52-95`) can be partially applied with no rollback. Reuse the symlink-safe random-temp + `O_EXCL|O_NOFOLLOW` + 0600 + rename + fsync pattern already in `writeFileSecure` (`src/config.zig:877-935`). Keep a per-turn backup next to the original for the checkpoint path. Acceptance: crash-injection test kills between temp create and rename and the original stays byte-identical; a failed batch reports which files were not written and leaves no partial file.
+- [ ] 🔴 **48.2 Retry transient transport errors, not only HTTP statuses.** `isRetryable` (`src/agent.zig:11278-11282`) only matches `RateLimited`/`Overloaded`/`ServerError`; `ConnectionResetByPeer`, `ReadFailed`, DNS failures and timeouts (`src/lib/io_timeout.zig:29`) fail the whole turn. Extend classification to idempotent transport failures and route through the existing bounded backoff (`agent.zig:11332-11389`, `src/agent/stream_retry.zig:32-83`), keeping ESC-cancellable waits and the rotation cap. Acceptance: a flaky local server that resets the first connection still completes the turn; a non-idempotent request is never auto-retried.
+- [ ] 🔴 **48.3 Make the retry notice match the actual wait.** `pushRetryNotice` prints `Retry.backoffMs(attempt)` (`agent.zig:11402`) while the wait uses `Retry.waitMs(attempt)` (`agent.zig:11359-11368`, which takes `max(backoff, min(retry-after, 30s))`); with `Retry-After: 30` the user is told "0.5s" and waits 30 s. The test at `agent.zig:13170` only checks monotonicity. Acceptance: test asserting the announced duration equals the waited duration with and without `Retry-After`.
+- [ ] 🟠 **48.4 Stop swallowing session write errors and enforce 0600.** `src/session.zig:291,299,340-354,394,549-566` use `catch {}` on writes and `w.flush() catch {}`; `setPermissions` at `:275,721,874` can silently leave a 0644 transcript containing the whole session. Surface I/O failures to the user, fail the append instead of corrupting the transcript, and verify the mode after setting it. Acceptance: fail-injection test asserts an error is reported and the last good line is intact; a permissions test asserts 0600.
+- [ ] 🟠 **48.5 Wire the crash path into CI.** `src/main.zig` has zero tests and `tools/segv_probe.py` runs only manually; it is absent from `.github/workflows/zig.yml`. Add a CI job that runs the probe against a real pty and asserts terminal restoration plus a `pc:` entry in the crash log. Acceptance: deliberately corrupting the restore sequence fails CI.
+- [ ] 🟡 **48.6 Move the 256 KiB stack buffer in the buffered HTTP path to the heap.** `src/lib/http_client.zig:310` declares `var transfer_buf: [256*1024]u8` on the stack, contradicting the heap rationale at `:134-138` and risking overflow on small-stack workers. Acceptance: no large stack arrays in `request()`; the streaming regression test still passes.
+- [ ] 🟡 **48.7 Make the threadlocal `io_timeout` invariant explicit or safe.** `src/lib/io_timeout.zig:21,41,48` returns an `Io` whose vtable points at the calling thread's slot; a wrong-thread `deinit` (`http_client.zig:59-62`) decrements the wrong slot and leaks the real one. Current callers happen to build `Http` on their own worker. Add a thread-id assertion in `wrap`/`deinit`, or make the slot safe to release cross-thread. Acceptance: wrong-thread use fails loudly in debug and leaks nothing.
+
+---
+
+## Phase 49 — 🎨 Presentation parity
+
+- [ ] 🟠 **49.1 Surface model reasoning in the transcript.** Reasoning deltas are buffered and discarded (`src/chat.zig:672-675,1032-1037`) and the `think` tool only returns `noted (N chars)` (`src/tools/think.zig:4-8`); the signature dim/italic thinking panel is absent. Render a compact, collapsible reasoning block with a token budget, reusing markdown styles and respecting `ZODE_NO_ANIMATION`. Acceptance: `ui-frame` scene plus a `drawTest` for a reasoning block; no reasoning bytes enter the cache prefix twice.
+- [ ] 🟠 **49.2 Complete inline markdown.** Only `**bold**` and `` `code` `` are parsed (`src/lib/markdown.zig:951-972`); `[text](url)` renders as literal punctuation and there is no italic, strikethrough or task-list checkbox. Bare URLs are already OSC-8 clickable (`src/tui.zig:807-858`) — reuse that path for markdown links. Acceptance: parser tests for each new inline form plus a `drawTest` with a link and a task list.
+- [ ] 🟡 **49.3 Highlight Ctrl+F matches in the rendered transcript.** Search navigates and counts but leaves matches unmarked (`src/tui.zig:2785-2854,10942-10951`); no regex, paragraph-level only. Add match ranges to the painted PLines (no allocation per frame) and an optional regex mode using `src/lib/regex.zig`. Acceptance: `drawTest` asserts matched cells carry the search style; long transcripts do not regress frame time.
+- [ ] 🟡 **49.4 Broaden syntax highlighting.** `src/lib/highlight/config.zig:30-190` covers ~9 languages via keyword tables; json, yaml, html, css, ruby, lua, toml and diff fall to `generic`. Add at least json/yaml/html/css tables and bracket matching plus indentation guides inside fences. Acceptance: segment-style tests per new language (current tests only assert text preservation).
+- [ ] 🟡 **49.5 Add composer undo/redo.** `src/lib/editor.zig:22-330` has insert/delete/history navigation but no text undo stack; `/undo` is file-level (`src/commands.zig:2764`). Add a bounded undo stack covering inserts, deletes and paste, reachable by Ctrl+Z / Ctrl+Shift+Z. Acceptance: editor tests for grouped typing, multiline paste, and redo after a new edit.
+- [ ] 🟡 **49.6 Expand the vim subset.** `src/tui.zig:8286-8537` has motions and `dd/dw/x` but no visual mode, registers/paste, counts (`3w`) or dot-repeat; custom bindings also do not fire in normal mode (`docs/commands.md:62`). Acceptance: tests for visual selection, one register, counts and dot-repeat; document the remaining unsupported motions.
+- [ ] 🟢 **49.7 Show cost in the status line.** The footer shows model, mode, ctx%, cache% and tok/s (`src/tui.zig:11148-11282`) but not USD; `/cost` is a command away (`src/commands.zig:2794`). Add a compact session-cost segment that degrades out first on narrow terminals. Acceptance: `ui-frame` at wide and 40-column widths; no layout shift when the price is unknown.
+- [ ] 🟢 **49.8 Improve tool and diff presentation.** Only one running tool is tracked (`src/tui.zig:1904`) and arbitrary tool outputs are not individually collapsible (only diffs). Add per-call collapse, nested subagent tool trees, side-by-side diff mode and per-hunk folding on top of `src/lib/diff/view.zig:158-194`. Acceptance: `drawTest` for a nested tree and a folded hunk; Ctrl+R expansion still works.
+
+---
+
+## Phase 50 — 🔌 Ecosystem and compatibility
+
+- [ ] 🟠 **50.1 Add session export and sharing.** No `/export` or `/share` exists — only `/copy` of one answer (`src/commands.zig:2813,3761`) and a read-only transcript view (`src/tui_draw.zig:389-395`). Export the current session to markdown and/or HTML with redaction applied. Acceptance: export test compares against a fixture with a tool call and a compressed line; no raw API key appears.
+- [ ] 🟠 **50.2 Broaden hook coverage.** `src/lib/hooks.zig:27-64` supports only 5 events (Pre/PostToolUse, UserPromptSubmit, Stop, PermissionRequest) and only `command` hooks, with project-only scope (`src/agent/project_rules.zig:9-10,59-64`). Add SessionStart/End, PreCompact, Notification, SubagentStart/Stop, PostToolUseFailure; add prompt/agent/http hook types; add a user-level scope with project overriding user. Acceptance: one test per new event plus a precedence test; malformed hooks are still skipped.
+- [ ] 🟠 **50.3 Broaden MCP beyond tools/stdio.** `src/mcp/protocol.zig:30-38` and `src/mcp/client.zig:220-223` implement tools only; `resources/*`, `prompts/*`, HTTP/SSE transport, `roots` and `sampling` are missing. Keep the deliberate refusal to read `.mcp.json` (RCE risk, `AGENTS.md:161`) and keep schemas out of the request `tools` array. Acceptance: fake MCP server test for `resources/list|read` and `prompts/get`; the cache-prefix test is unchanged.
+- [ ] 🟠 **50.4 Fix memory hierarchy and the dead `CLAUDE.local.md`.** `/init` writes `CLAUDE.local.md` (`src/lib/init.zig:80`) but nothing ever reads it; `src/agent/prompt_system.zig:77-95` loads only one AGENTS.md/CLAUDE.md from cwd/project root, with no parent walk, no user-level file, and no `/memory` command. Either load `CLAUDE.local.md` or stop writing it. Add parent-directory hierarchy, a user-level memory file and `/memory`. Acceptance: prompt composition test with nested dirs and precedence (local > project > user); no duplicate instructions.
+- [ ] 🟡 **50.5 Add conversation-level rewind.** Checkpoints are files-only with hard caps (8 / 24 files / 256 KB / 1 MB) and explicitly "undo undoes files, not messages" (`src/lib/checkpoint.zig:4-27`); `/branch` can fork but cannot restore a deleted turn. Add message-level restore alongside file snapshots, with the existing confirm gate. Acceptance: round-trip test restores files and transcript to the same turn; caps and confirmation are still enforced.
+- [ ] 🟡 **50.6 Accept `.claude/commands/` and command frontmatter.** `src/lib/usercmds.zig:5-25,39-40` loads only `.zode/commands`; existing `.claude/commands/` configs are invisible and commands lack `!` shell lines and `allowed-tools` frontmatter (skills have it). Add the compatibility directory with project > user precedence and keep the RCE-safe shell handling. Acceptance: loader tests for both directories and frontmatter keys.
+- [ ] 🟡 **50.7 Complete ACP capabilities.** `src/acp/server.zig:319-352` advertises `image=false`, no `session/fork`, and MCP http/sse false. Add image attachment support and `session/fork`, plus editor context/diagnostics injection. Acceptance: `acp_smoke.py` covers a fork request and an image-bearing prompt.
+- [ ] 🟢 **50.8 Add custom system-prompt injection.** There is no `--append-system-prompt` or config equivalent (`src/config.zig:23-26`); the only levers are AGENTS.md/CLAUDE.md and output styles. Add a CLI flag and a config key that append to the compiled system prompt without duplicating the cache prefix. Acceptance: prompt test pins the appended block and the cache breakpoint position.
+- [ ] 🟢 **50.9 Make background tasks durable.** The registry lives in `Model` and is lost on restart (`src/bgproc.zig:19-27,205`). Persist task metadata to the session and add a generic "background the running command" flow. Acceptance: resume test restores task state and drains completions once.
+- [ ] 🟢 **50.10 Add local-only aggregate stats.** `/cost`, `/usage` and `/bench` are per-session (`src/commands.zig:2793-2797`); there is no `/stats`. Add an opt-in, local-only cross-session aggregate with no telemetry. Acceptance: stats test over two fixture sessions; no network call in the code path.
+
+---
+
+## Phase 51 — 🧪 Verification, test honesty and quick wins
+
+- [ ] 🔴 **51.1 Fix the last user-visible Spanish string.** `src/config.zig:1021` prints `"no se pudo leer"`; AGENTS.md requires English in all visible text. Translate it and add a CI grep that fails on non-English source strings. Acceptance: language-grep gate in `.github/workflows/zig.yml`.
+- [ ] 🟠 **51.2 Fix the known ReleaseSmall key bug.** `build.zig:377-378` and `tools/copy_smoke.py:26` reference a bug where a ReleaseSmall build stops answering keys when the active provider has a key. Reproduce with `copy_smoke.py` under ReleaseSmall, fix, and add a gate. Acceptance: `copy_smoke.py` green in ReleaseSmall with a keyed provider.
+- [ ] 🟠 **51.3 Replace placeholder tests in persistence modules.** 14 modules have only a bare `refAllDecls` block — `src/lib/skills.zig:29`, `skillstore.zig:13`, `memory.zig:21`, `memory_store.zig:11`, `sessionindex.zig:19`, `sessionpath.zig:20`, `session_search.zig:15`, `diffview.zig:12`, `diff_tokenizer.zig:18`, `outputstyles.zig:23`, `outputstyle_store.zig:14`, `bundled_outputstyles.zig:11`, `bundled_skills.zig:13`, `github.zig:6`. Add behavioral assertions to each module that touches the model or writes state. Acceptance: each named module has at least one behavioral test.
+- [ ] 🟠 **51.4 Harden `zjsonl` tests.** `src/lib/zjsonl.zig:81-126` has only 3 tests (happy round trip, short skip, writer reuse) for the session format; no corrupt/truncated-line or decompression-bomb cases despite `max_out` at `:58-75`. Acceptance: tests for corrupt line skip, truncated payload and `max_out` rejection.
+- [ ] 🟡 **51.5 Make `memaudit` report skipped files.** `tools/memaudit.zig:33,36,40,43` use `catch continue`/`catch null`, so a CI gate can report "clean (N scanned)" while silently skipping unreadable files. Print skipped paths and fail when any file was skipped. Acceptance: test with an unreadable fixture exits 1.
+- [ ] 🟡 **51.6 Make the pty smoke timeout real.** `tools/pty_smoke.py:454-456` defines `_run_with_timeout()` but calls `main()` directly with no timeout, and `drive()` ends in a blocking `os.waitpid(pid, 0)` (`:162`) — a child ignoring Ctrl+C hangs CI forever. Implement the timeout and prefer the existing `expect`/`until` state waits over fixed sleeps. Acceptance: a child that ignores SIGINT makes the smoke fail within the budget.
+- [ ] 🟡 **51.7 Stop duplicating the terminal restore bytes in `segv_probe.py`.** `tools/segv_probe.py:96-97` hard-codes `RESTORE_ALL`, so a future `src/lib/termseq.zig` change silently breaks the probe. Import or generate the sequence from the Zig source. Acceptance: the probe still passes after a deliberate termseq change in a fixture.
+- [ ] 🟢 **51.8 Update stale test-count docs.** `docs/usage.md:162` and `docs/architecture.md:143` still say "800+ tests"; the tree has 2,115 named tests. Generate the number or assert it in CI. Acceptance: no "800+" string remains; the docs test passes.
+- [ ] 🟢 **51.9 Complete deferred functional tickets.** `model_requested_iter` is permanently zero after its only writer was deleted (`47.2`); `/file open` only copies the path because in-TUI editor spawn was deferred (`src/commands.zig:3067`); `ZODE_FREE_AUTO=status` has an unbuilt branch (`src/free_auto.zig:326`). Wire each or remove the dead branch. Acceptance: one test per wired behavior.
+- [ ] 🟢 **51.10 Close remaining platform gaps.** Windows support is absent (crash and terminal paths are POSIX-only, `CONTRIBUTING.md:45`). Assess scope and either add a minimal supported path or document it as unsupported in the release notes. Acceptance: documented decision with a test or an explicit doc change.
+
+---
+
 ## Suggested order
 
-1. **Security first:** 40.1 → 40.2 → 40.3 → 40.4 → 40.5 → 40.6.
-2. **Then the highest-ROI token wins:** 41.1 → 41.2 → 41.5 → 41.8.
-3. **Release integrity:** 45.1 → 45.2 → 45.3 → 45.5.
-4. **Docs that lie:** 45.6 → 45.7 → 44.5 → 44.4.
-5. **Everything else** by track, taking the small mechanical items (42.2, 42.10, 44.10, 45.12) whenever there is a spare slot.
+1. **Reliability first (Phase 48):** 48.1 → 48.2 → 48.3 → 48.4 → 48.5. Data loss and lost turns outrank every feature.
+2. **Presentation parity (Phase 49):** 49.1 → 49.2 → 49.3 → 49.5 — all localized, testable with `src/lib/` + `drawTest` + `ui-frame`.
+3. **Verification honesty (Phase 51):** 51.1 → 51.2 → 51.3 → 51.5 → 51.6, then the small mechanical items (51.7, 51.8).
+4. **Ecosystem (Phase 50):** 50.1 → 50.2 → 50.3 → 50.4, then the rest by priority.
+5. **Legacy tracks** by track, taking the small mechanical items (42.2, 42.10, 44.10, 45.12) whenever there is a spare slot.
+6. **42.8 last** — it is a redesign, not a refactor, and it conflicts with "radical simplicity".

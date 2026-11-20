@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bring the board up to date and close the quality gaps (tasks) [`2f3254d5`](https://github.com/jesusalcaladev/zode/commit/2f3254d5)
 - new improvement backlog from a six-track code audit (tasks) [`a674eb1b`](https://github.com/jesusalcaladev/zode/commit/a674eb1b)
 - record the two remaining deferrals with their real blockers (tasks) [`5d2c8cd2`](https://github.com/jesusalcaladev/zode/commit/5d2c8cd2)
+- add Claude Code parity backlog (phases 48-51) (tasks) [`be67f6ff`](https://github.com/jesusalcaladev/zode/commit/be67f6ff)
 
 ### Refactors
 
@@ -52,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - optimization pass — one style resolve per paint, zero-copy tool schema (46) [`61bc8bac`](https://github.com/jesusalcaladev/zode/commit/61bc8bac)
 - eliminate quadratic SSE tool-arg parsing and per-chunk allocations (46.6-46.11) [`14ee2362`](https://github.com/jesusalcaladev/zode/commit/14ee2362)
 - materialize autocomplete matches once per query (47.3) (tui) [`c99f62d1`](https://github.com/jesusalcaladev/zode/commit/c99f62d1)
-- refresh stale model cache, cache keychain lookups (47.8) (startup) [`bb2c1c04`](https://github.com/jesusalcaladev/zode/commit/bb2c1c04)
+- refresh stale model cache, cache keychain lookups (47.8) (startup) [`50081b94`](https://github.com/jesusalcaladev/zode/commit/50081b94)
 
 ### Tests
 
