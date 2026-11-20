@@ -40,6 +40,12 @@ pub fn run(
 
     m.streamEnd();
 
+    // Reasoning is its own block, NEVER part of `text`: the wire message (and
+    // therefore the cache prefix) must carry it once at most. The stream layer
+    // suppresses its old reasoning-only fallback when our callback is wired,
+    // so a reasoning model cannot put the same bytes in both places.
+    if (tstate.reasoning.items.len > 0) m.pushReasoning(tstate.reasoning.items);
+
     const calls_json = if (tstate.calls.items.len > 0)
         ops.toolCallsJsonFromCalls(gpa, tstate.calls.items)
     else

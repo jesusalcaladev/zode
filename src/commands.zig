@@ -836,6 +836,38 @@ pub fn cmdCost(m: *tui.Model) void {
     m.pushInfoOwned(text);
 }
 
+/// Compact cost for the footer: a single number plus `*` when part of the
+/// session is unpriced (the total is then a FLOOR, never a bill). Returns null
+/// when there is no usage yet, so the footer omits the segment instead of
+/// showing a fabricated `$0.00`.
+pub fn costCompactText(m: *tui.Model, a: std.mem.Allocator) ?[]const u8 {
+    const tr = &cost_mod.session;
+    if (tr.len == 0 and tr.spill_requests == 0) return null;
+    var rows: std.ArrayList(cost_mod.Row) = .empty;
+    var i: usize = 0;
+    while (i < tr.len) : (i += 1) {
+        const e = &tr.entries[i];
+        rows.append(a, .{
+            .model = e.text(),
+            .prompt = e.prompt_tokens,
+            .completion = e.completion_tokens,
+            .price = priceForModel(m, a, e.text()),
+        }) catch return null;
+    }
+    if (tr.spill_requests > 0) {
+        rows.append(a, .{
+            .model = "other models",
+            .prompt = tr.spill_prompt,
+            .completion = tr.spill_completion,
+            .price = null,
+        }) catch {};
+    }
+    var buf: [24]u8 = undefined;
+    const money = cost_mod.formatUsd(&buf, cost_mod.totalOf(rows.items));
+    if (cost_mod.unpricedCount(rows.items) == 0) return a.dupe(u8, money) catch null;
+    return std.fmt.allocPrint(a, "{s}*", .{money}) catch null;
+}
+
 /// The published price of ONE model, from the cached catalogue of a provider that
 /// has a key.
 ///

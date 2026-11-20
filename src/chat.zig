@@ -464,6 +464,11 @@ pub const Callbacks = struct {
     userdata: ?*anyopaque = null,
     /// Text fragment from the assistant.
     onDelta: *const fn (?*anyopaque, []const u8) void = defaultOnDelta,
+    /// Reasoning fragment. Null keeps the old behaviour: reasoning stays
+    /// buffered and is used only as the fallback for reasoning-only models.
+    /// A non-null callback means the block is shown, so the fallback must NOT
+    /// also emit the same bytes as assistant text (cache-prefix duplication).
+    onReasoning: ?*const fn (?*anyopaque, []const u8) void = null,
     /// Complete tool call (id + name + arguments already assembled).
     onToolCall: ?*const fn (?*anyopaque, id: []const u8, name: []const u8, args_json: []const u8) void = null,
     /// finish_reason ("stop", "tool_calls", ...).
@@ -1033,7 +1038,7 @@ pub const StreamCtx = struct {
         // else was said: a model that thought and then called a tool said what
         // it had to say with the call, and pasting its reasoning in front of the
         // call would put the same paragraph in the history on every turn.
-        if (!self.content_seen and self.thinking.items.len > 0 and self.parts.items.len == 0) {
+        if (self.user.onReasoning == null and !self.content_seen and self.thinking.items.len > 0 and self.parts.items.len == 0) {
             self.user.onDelta(self.user.userdata, self.thinking.items);
             self.content_seen = true; // `finish` can be called twice; say it once
         }
@@ -1114,7 +1119,11 @@ pub const StreamCtx = struct {
                 self.content_seen = true;
                 self.user.onDelta(self.user.userdata, d);
             },
-            .reasoning => |t| self.thinking.appendSlice(self.gpa, t) catch {},
+            .reasoning => |t| {
+                // Copy into the buffer: the SSE event arena is reset per line.
+                self.thinking.appendSlice(self.gpa, t) catch {};
+                if (self.user.onReasoning) |f| f(self.user.userdata, t);
+            },
             .finish => |r| {
                 self.finish_count += 1;
                 // Only the first finish matters; servers sometimes

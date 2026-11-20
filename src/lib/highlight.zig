@@ -272,6 +272,29 @@ test "zig: keyword, number, comment, builtin and the text intact" {
     try std.testing.expectEqual(theme.code_builtin, b.style);
 }
 
+test "json/yaml/html/css: new language tables keep the text and style their tokens" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const cases = [_]struct { lang: []const u8, line: []const u8, token: []const u8, style: @import("vaxis").Style }{
+        .{ .lang = "json", .line = "{\"ok\": true, \"n\": 42}", .token = "true", .style = theme.code_builtin },
+        .{ .lang = "yaml", .line = "enabled: true # note", .token = "true", .style = theme.code_kw },
+        .{ .lang = "html", .line = "<div class=\"box\">hi</div>", .token = "div", .style = theme.code_kw },
+        .{ .lang = "css", .line = ".x { display: flex; }", .token = "display", .style = theme.code_kw },
+    };
+    for (cases) |c| {
+        const segs = try highlightLine(arena, c.line, c.lang);
+        // Text preservation is the invariant that catches a broken scanner.
+        try std.testing.expectEqualStrings(c.line, try joinedText(arena, segs));
+        const tok = findSeg(segs, c.token) orelse {
+            std.debug.print("missing token {s} in {s}\n", .{ c.token, c.lang });
+            return error.TestExpectedEqual;
+        };
+        try std.testing.expectEqual(c.style, tok.style);
+    }
+}
+
 test "python: def kw, print builtin, self type, # comment" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

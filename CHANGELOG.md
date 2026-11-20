@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUI key safety, docs and CI correctness (phases44-45) [`55368ae1`](https://github.com/jesusalcaladev/zode/commit/55368ae1)
 - close four more backlog items (45.2, 43.5, 43.8, 42.7) [`5e6ca604`](https://github.com/jesusalcaladev/zode/commit/5e6ca604)
 - bound every network operation (40.10) (http) [`069dd1dc`](https://github.com/jesusalcaladev/zode/commit/069dd1dc)
+- reasoning block, inline markdown, search marks, undo, cost footer (49) (tui) [`4ca60316`](https://github.com/jesusalcaladev/zode/commit/4ca60316)
 
 ### Bug Fixes
 
@@ -21,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - complete Phase 40 medium items (12 of 13) (security) [`1285cbea`](https://github.com/jesusalcaladev/zode/commit/1285cbea)
 - close a real use-after-free found by the new regression test (compaction) [`6e14a3a3`](https://github.com/jesusalcaladev/zode/commit/6e14a3a3)
 - apply env timeout before the headless client is built (47) (http) [`577d6143`](https://github.com/jesusalcaladev/zode/commit/577d6143)
-- atomic agent writes, transport retries, durable sessions (48) (reliability) [`b0aa6db8`](https://github.com/jesusalcaladev/zode/commit/b0aa6db8)
+- atomic agent writes, transport retries, durable sessions (48) (reliability) [`9aeada3e`](https://github.com/jesusalcaladev/zode/commit/9aeada3e)
 
 ### Chores
 

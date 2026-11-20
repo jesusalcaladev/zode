@@ -83,6 +83,7 @@ pub fn main(init: std.process.Init) !void {
     const scenes = [_]Scene{
         .{ .name = "welcome", .fill = sceneWelcome },
         .{ .name = "turn", .fill = sceneTurn },
+        .{ .name = "reasoning", .fill = sceneReasoning },
         .{ .name = "tools", .fill = sceneTools },
         .{ .name = "running", .fill = sceneRunning },
         .{ .name = "bash", .fill = sceneBash },
@@ -280,6 +281,23 @@ fn sceneTurn(m: *tui.Model) void {
     m.streamDelta("- Cada color lleva su test de contraste.\n");
     m.streamDelta("\nEs el unico cambio que hace falta:\n\n");
     m.streamDelta("```zig\npub const ink = fg(0xf2f2f2); // 18:1\npub const line = fg(0x2e2e2e); // 1.6:1\n```\n");
+    m.streamEnd();
+}
+
+fn sceneReasoning(m: *tui.Model) void {
+    m.pushHeader(.idle);
+    m.pushKind(.user, "check the compaction boundary and tell me what breaks");
+    m.pushReasoning(
+        \\The boundary marker is written by trimToBoundary but resumed sessions
+        \\read compact_summary from the sidecar. If the summary is stale, the
+        \\next request replays turns that were already summarised, so the real
+        \\risk is double billing rather than a wrong answer.
+        \\
+        \\I should check the sidecar fallback before changing the writer.
+        \\
+    );
+    m.streamStart();
+    m.streamDelta("The fallback is honest: a stale sidecar is reported, not trusted.\n");
     m.streamEnd();
 }
 

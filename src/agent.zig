@@ -2677,6 +2677,16 @@ test "TurnStats: detailLine caps a long file list" {
 fn recordSessionUsage(m: *tui.Model, usage: chat.Usage, kind: chat.ProviderKind, model: []const u8) void {
     cache_stats.session.recordFor(usage, kind);
     cost_mod.session.record(model, cache_stats.totalInputTokens(usage, kind), usage.completion);
+    // Publish the footer's cost ONCE here, not on every frame: /cost does the
+    // same catalogue lookup, and doing it in `drawStateFooter` would turn a
+    // 60 fps repaint into a disk read per frame.
+    {
+        var cost_arena = std.heap.ArenaAllocator.init(m.allocator);
+        defer cost_arena.deinit();
+        if (commands_mod.costCompactText(m, cost_arena.allocator())) |txt| {
+            tui.setStatusCost(m, txt);
+        }
+    }
     if (session) |s| {
         s.appendUsageSnapshot(cache_stats.session) catch |err| {
             m.pushErrorFmt("could not save session usage: {t}", .{err});
@@ -5313,6 +5323,14 @@ fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
     t.m.streamDelta(delta);
 }
 
+/// Reasoning deltas are accumulated once and shown as their own block. They
+/// never reach `t.text`, so the wire message and the cache prefix contain the
+/// reasoning at most once (and only if the model emitted no text at all).
+fn onReasoning(ud: ?*anyopaque, delta: []const u8) void {
+    const t: *TurnCtx = @ptrCast(@alignCast(ud.?));
+    t.reasoning.appendSlice(t.m.allocator, delta) catch {};
+}
+
 /// How often the live tok/s is recomputed while tokens arrive. 250 ms: fine
 /// enough that the number feels live, coarse enough that one clock read per
 /// quarter second instead of one per delta.
@@ -6649,6 +6667,7 @@ fn executeTurnRequest(
             .{
                 .userdata = tstate,
                 .onDelta = onDelta,
+                .onReasoning = onReasoning,
                 .onToolCall = onToolCall,
                 .onFinish = onFinish,
             },

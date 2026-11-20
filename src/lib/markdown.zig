@@ -11,6 +11,10 @@ pub const Style = vaxis.Style;
 pub const Segment = struct {
     text: []const u8,
     style: Style,
+    /// OSC-8 target for a markdown `[label](url)`. The TUI already emits
+    /// hyperlinks for bare URLs; this carries the same information through the
+    /// segment pipeline so `[text](url)` is clickable too.
+    link: ?[]const u8 = null,
 };
 
 pub const Kind = enum {
@@ -94,6 +98,14 @@ const styles = struct {
     const quote_bar: Style = theme.quote;
     const rule: Style = theme.line;
     const bold = Style{ .bold = true };
+    /// `*italic*`: the marker is stripped, only the weight changes. Bold and
+    /// italic are different styles on purpose — a model saying *important* is
+    /// not the same emphasis as **important**.
+    const italic = Style{ .italic = true };
+    const strike = Style{ .strikethrough = true };
+    const task_done = theme.task_done;
+    const task_open = theme.task_open;
+    const link = theme.link;
     /// Inline `code`. Amber, to match the number tokens: an inline code span and
     /// a numeric literal are the same kind of thing you look up.
     const inline_code = Style{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
@@ -956,6 +968,70 @@ pub fn inlineSegmentsLang(
                 i = end + 2;
                 start = i;
                 continue;
+            }
+        }
+        // *italic* (single star). Checked AFTER `**bold**` above, so a bold
+        // span is never mistaken for two adjacent italics.
+        if (line[i] == '*' and (i == 0 or line[i - 1] != '*')) {
+            if (constClose(line, i + 1, "*")) |end| {
+                if (end > i + 1) {
+                    if (i > start) try segs.append(arena, .{ .text = line[start..i], .style = base });
+                    try segs.append(arena, .{ .text = line[i + 1 .. end], .style = styles.italic });
+                    i = end + 1;
+                    start = i;
+                    continue;
+                }
+            }
+        }
+        // ~~strikethrough~~
+        if (i + 1 < line.len and line[i] == '~' and line[i + 1] == '~') {
+            if (constClose(line, i + 2, "~~")) |end| {
+                if (end > i + 2) {
+                    if (i > start) try segs.append(arena, .{ .text = line[start..i], .style = base });
+                    try segs.append(arena, .{ .text = line[i + 2 .. end], .style = styles.strike });
+                    i = end + 2;
+                    start = i;
+                    continue;
+                }
+            }
+        }
+        // Task list markers: `- [x] done` / `- [ ] todo`. The marker text stays
+        // (so copy/paste and width are unchanged) but it gets its own color:
+        // a checklist is information, not punctuation.
+        if (i + 2 < line.len and line[i] == '[' and line[i + 2] == ']' and
+            (i + 3 >= line.len or line[i + 3] != '('))
+        {
+            const mark: ?Style = if (line[i + 1] == 'x' or line[i + 1] == 'X') styles.task_done else if (line[i + 1] == ' ') styles.task_open else null;
+            if (mark) |st| {
+                if (i > start) try segs.append(arena, .{ .text = line[start..i], .style = base });
+                try segs.append(arena, .{ .text = line[i .. i + 3], .style = st });
+                i += 3;
+                start = i;
+                continue;
+            }
+        }
+        // [label](url). The label is painted as text and the URL travels in
+        // `Segment.link` to the TUI's existing OSC-8 emitter. A failed parse is
+        // left as ordinary punctuation — no character is ever swallowed.
+        if (line[i] == '[') {
+            if (constClose(line, i + 1, "](") ) |close| {
+                if (constClose(line, close + 2, ")")) |end| {
+                    if (end > close + 2) {
+                        const label = line[i + 1 .. close];
+                        const url = line[close + 2 .. end];
+                        if (label.len > 0 and url.len > 0) {
+                            if (i > start) try segs.append(arena, .{ .text = line[start..i], .style = base });
+                            try segs.append(arena, .{
+                                .text = label,
+                                .style = styles.link,
+                                .link = try arena.dupe(u8, url),
+                            });
+                            i = end + 1;
+                            start = i;
+                            continue;
+                        }
+                    }
+                }
             }
         }
         // `code`
@@ -1828,6 +1904,69 @@ test "tool_res_bold is bold FOR REAL (the 'two tones' was not a no-op)" {
     const plain = try inlineSegments(arena, "salida", .tool_res);
     try std.testing.expect(!plain[0].style.bold);
     try std.testing.expectEqual(styles.tool_res.fg, plain[0].style.fg);
+}
+
+test "inline: italic, strikethrough and task markers get their own styles" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ital = try inlineSegments(arena, "keep *this* word", .assistant);
+    var saw_italic = false;
+    for (ital) |s| {
+        if (std.mem.eql(u8, s.text, "this")) {
+            saw_italic = true;
+            try std.testing.expect(s.style.italic);
+            try std.testing.expect(!s.style.bold);
+        }
+    }
+    try std.testing.expect(saw_italic);
+
+    const struck = try inlineSegments(arena, "~~old~~ new", .assistant);
+    var saw_strike = false;
+    for (struck) |s| {
+        if (std.mem.eql(u8, s.text, "old")) {
+            saw_strike = true;
+            try std.testing.expect(s.style.strikethrough);
+        }
+    }
+    try std.testing.expect(saw_strike);
+
+    // The markers are STRIPPED from italic/strike text, but a task checkbox
+    // keeps its literal bytes so copy/paste and cell width stay unchanged.
+    const tasks = try inlineSegments(arena, "- [x] done and [ ] todo", .assistant);
+    var saw_done = false;
+    var saw_open = false;
+    for (tasks) |s| {
+        if (std.mem.eql(u8, s.text, "[x]")) saw_done = true;
+        if (std.mem.eql(u8, s.text, "[ ]")) saw_open = true;
+    }
+    try std.testing.expect(saw_done);
+    try std.testing.expect(saw_open);
+}
+
+test "inline: [label](url) keeps the label and carries the OSC-8 target" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const segs = try inlineSegments(arena, "see [the docs](https://example.com/x) now", .assistant);
+    var saw_link = false;
+    for (segs) |s| {
+        if (std.mem.eql(u8, s.text, "the docs")) {
+            saw_link = true;
+            try std.testing.expect(s.link != null);
+            try std.testing.expectEqualStrings("https://example.com/x", s.link.?);
+        }
+        // The markdown punctuation is NEVER painted as literal text.
+        try std.testing.expect(std.mem.indexOf(u8, s.text, "](") == null);
+    }
+    try std.testing.expect(saw_link);
+
+    // A one-letter label must not be mistaken for a `[x]` task marker.
+    const one = try inlineSegments(arena, "[a](https://example.com)", .assistant);
+    try std.testing.expectEqualStrings("a", one[0].text);
+    try std.testing.expect(one[0].link != null);
 }
 
 test "info: the (+64 −95) stat reads green/red and the text around it does not" {

@@ -461,6 +461,9 @@ const CellRun = struct {
     w: u8, // 1 o 2 columnas
     style: vaxis.Style,
     link: vaxis.Cell.Hyperlink = .{},
+    /// Part of a Ctrl+F hit. Computed at LAYOUT time (once per paragraph), so
+    /// the paint loop only reads a bool and never allocates or searches.
+    match: bool = false,
 };
 
 pub const PLine = struct {
@@ -711,8 +714,9 @@ pub fn buildLines(
     para: *Model.Para,
     width: u16,
     nerd_icons: bool,
+    search: ?[]const u8,
 ) ![]const PLine {
-    return buildLinesBase(pa, ctx, para, width, nerd_icons);
+    return buildLinesBase(pa, ctx, para, width, nerd_icons, search);
 }
 
 fn appendTextRun(
@@ -1177,12 +1181,31 @@ fn buildDiffBlockLines(
 }
 
 /// `buildLines` with an imposed base style (see `md.parseBase`).
+/// Is the byte at `off` inside a case-insensitive occurrence of `query`?
+/// Layout-time only (never called from the paint loop); byte offsets into the
+/// segment are enough because cell graphemes keep their source offsets.
+fn searchHitAt(text: []const u8, off: usize, query: ?[]const u8) bool {
+    const q = query orelse return false;
+    if (q.len == 0) return false;
+    var pos: usize = 0;
+    while (pos + q.len <= text.len) {
+        const rel = textcase.indexOf(text[pos..], q) orelse return false;
+        const start = pos + rel;
+        const end = start + q.len;
+        if (off >= start and off < end) return true;
+        if (start >= off) return false;
+        pos = start + 1; // this hit ended before `off`; look at the next one
+    }
+    return false;
+}
+
 fn buildLinesBase(
     pa: std.mem.Allocator,
     ctx: vxfw.DrawContext,
     para: *Model.Para,
     width: u16,
     nerd_icons: bool,
+    search: ?[]const u8,
 ) ![]const PLine {
     // The width goes to the parser so a TABLE knows how much room it has: a
     // table that does not fit is degraded into `name: value` rows, and that
@@ -1251,12 +1274,15 @@ fn buildLinesBase(
                 while (it.next()) |g| {
                     const b = g.bytes(seg.text);
                     const off: usize = @intFromPtr(b.ptr) - @intFromPtr(seg.text.ptr);
-                    const uri = linkForOffset(spans, off);
+                    // A markdown `[label](url)` carries its target on the
+                    // segment; bare URLs are still found by detectLinks.
+                    const uri = seg.link orelse linkForOffset(spans, off);
                     try cells.append(pa, .{
                         .text = b,
                         .w = theme.graphemeWidth(ctx, b),
                         .style = seg.style,
                         .link = if (uri) |u| .{ .uri = u } else .{},
+                        .match = searchHitAt(seg.text, off, search),
                     });
                 }
             }
@@ -2058,6 +2084,12 @@ pub const Model = struct {
     /// "empty", because "not yet" is the one that should look up again.
     status_model_len: usize = 0,
     status_model_buf: [128]u8 = undefined,
+    /// Compact session cost for the footer, published by the worker at turn
+    /// end. Computed ONCE from the cached price catalogue; the paint path only
+    /// copies these bytes, so a 60 fps redraw never reads a file or races the
+    /// tracker that the worker is still writing.
+    status_cost_len: usize = 0,
+    status_cost_buf: [24]u8 = undefined,
     /// The lazy resolve ran once already. Without it, every frame of a session
     /// with no catalogue on disk would open, parse and free a JSON file that is
     /// not there — a stat and two open attempts per frame, forever, for a value
@@ -2786,6 +2818,10 @@ pub const Model = struct {
         self.search_matches.clearRetainingCapacity();
         self.search_current = 0;
         self.search_has_query = self.search_query_len > 0;
+        // Match cells are baked into the cached PLines at layout time. The
+        // cache is keyed by paragraph index only, so a new query MUST evict it
+        // or the highlight from the previous search stays on screen.
+        self.clearSegCache();
         if (self.search_query_len == 0) return;
         const q = self.search_query_buf[0..self.search_query_len];
         for (self.paras.items, 0..) |*p, i| {
@@ -2838,6 +2874,8 @@ pub const Model = struct {
         }
         if (key.matches(vaxis.Key.backspace, .{})) {
             if (self.search_query_len > 0) self.search_query_len -= 1;
+            self.search_has_query = self.search_query_len > 0;
+            self.clearSegCache();
             self.dirty = true;
             self.redraw_requested.store(true, .seq_cst);
             return true;
@@ -2850,6 +2888,8 @@ pub const Model = struct {
                     @memcpy(self.search_query_buf[self.search_query_len..][0..ncopy], txt[0..ncopy]);
                     self.search_query_len += ncopy;
                 }
+                self.search_has_query = self.search_query_len > 0;
+                self.clearSegCache();
                 self.dirty = true;
                 self.redraw_requested.store(true, .seq_cst);
                 return true;
@@ -2859,6 +2899,8 @@ pub const Model = struct {
             if (self.search_query_len < self.search_query_buf.len) {
                 self.search_query_buf[self.search_query_len] = @intCast(key.codepoint);
                 self.search_query_len += 1;
+                self.search_has_query = true;
+                self.clearSegCache();
                 self.dirty = true;
                 self.redraw_requested.store(true, .seq_cst);
             }
@@ -4345,7 +4387,11 @@ pub const Model = struct {
         // Rehydrate if the paragraph was pruned to its compressed form.
         _ = p_.textLive(self.allocator);
 
-        var lines = try buildLinesBase(para_arena.allocator(), ctx, p_, width, self.nerd_icons);
+        const query: ?[]const u8 = if (self.search_has_query and self.search_query_len > 0)
+            self.search_query_buf[0..self.search_query_len]
+        else
+            null;
+        var lines = try buildLinesBase(para_arena.allocator(), ctx, p_, width, self.nerd_icons, query);
         // A blank row BETWEEN paragraphs: without it the history is a wall of
         // text and you can't see where one response ends and another begins.
         //
@@ -5144,6 +5190,22 @@ pub const Model = struct {
         self.dirty = true;
         // Ask for a frame now: the tick can be up to 120 ms away.
         self.redraw_requested.store(true, .seq_cst);
+    }
+
+    /// Shows a compact reasoning block. Called ONCE at turn end, not per
+    /// delta: a reasoning-only model then appears in the transcript as a
+    /// thinking block, never as assistant text (which would re-send it on the
+    /// next request and break the single cache breakpoint).
+    pub fn pushReasoning(self: *Model, text: []const u8) void {
+        if (text.len == 0) return;
+        const shown: usize = @min(text.len, 800);
+        var buf: [960]u8 = undefined;
+        const block = std.mem.print(&buf, "◇ thinking · {d} chars\n{s}{s}", .{
+            text.len,
+            text[0..shown],
+            if (text.len > shown) "…" else "",
+        }) catch return;
+        self.pushKind(.info, block);
     }
 
     pub fn pushInfo(self: *Model, text: []const u8) void {
@@ -8172,9 +8234,21 @@ pub fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
         return true;
     }
 
-    // Movement
     const ctrl = k.mods.ctrl;
     const alt = k.mods.alt;
+
+    // Text undo/redo (49.5). Ctrl+Z is the one every editor teaches; the redo
+    // spelling accepts both Ctrl+Shift+Z and a shifted 'Z' from terminals that
+    // report the uppercase codepoint.
+    if (ctrl and (k.codepoint == 'z' or k.codepoint == 'Z')) {
+        const redoing = k.mods.shift;
+        const changed = if (redoing) self.ed.redo() else self.ed.undo();
+        if (changed) syncAutocomplete(self);
+        ctx.redraw = true;
+        return true;
+    }
+
+    // Movement
     if (k.matches(vaxis.Key.left, .{})) {
         if (ctrl or alt) self.ed.moveWordLeft() else self.ed.moveLeft();
         ctx.redraw = true;
@@ -9638,7 +9712,12 @@ pub fn drawLines(
         if (row >= hh) break;
         var col: u16 = margin;
         for (ln.cells) |cell| {
-            p.putStableLinked(col, row, cell.text, cell.w, cell.style, cell.link);
+            // Matches were resolved when the paragraph was laid out; the paint
+            // loop just swaps in a background style and keeps the grapheme's
+            // own foreground so the text stays readable under NO_COLOR.
+            var st = cell.style;
+            if (cell.match) st.bg = theme.search_match.bg;
+            p.putStableLinked(col, row, cell.text, cell.w, st, cell.link);
             const new_col: usize = @as(usize, col) + @as(usize, cell.w);
             col = if (new_col > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(new_col);
             if (col >= p.width) break;
@@ -9734,6 +9813,19 @@ pub fn setStatusModel(m: *Model, name: []const u8) void {
     @memcpy(m.status_model_buf[0..n], name[0..n]);
     m.status_model_len = n;
     m.status_model_tried = true;
+    m.dirty = true;
+}
+
+/// Publishes the compact cost string shown in the footer. Copies into the
+/// Model's own buffer for the same reason `setStatusModel` does: `putStable`
+/// never copies the bytes it is handed, and the renderer reads them after the
+/// draw function returns.
+pub fn setStatusCost(m: *Model, text: []const u8) void {
+    m.lock();
+    defer m.unlock();
+    const n = @min(text.len, m.status_cost_buf.len);
+    @memcpy(m.status_cost_buf[0..n], text[0..n]);
+    m.status_cost_len = n;
     m.dirty = true;
 }
 
@@ -10812,9 +10904,25 @@ pub fn drawStateFooter(
         }
     }
 
+    // Session cost, LAST in the right group: the tail-first degradation below
+    // drops it before the scroll hint, the throughput and the context gauge.
+    // The string is a copy published by the worker, never a live read of the
+    // cost tracker from the paint thread.
+    if (self.status_cost_len > 0 and rn + 1 < right.len) {
+        const owned = arena.dupe(u8, self.status_cost_buf[0..self.status_cost_len]) catch "";
+        if (owned.len > 0) {
+            if (rn > 0) {
+                right[rn] = .{ .text = " · ", .style = theme.line };
+                rn += 1;
+            }
+            right[rn] = .{ .text = owned, .style = theme.tool };
+            rn += 1;
+        }
+    }
+
     // The right group gives up pieces, from the tail, until the state fits.
     //
-    // The tail is the scroll hint first, then the throughput, then the
+    // The tail is the cost first, then the scroll hint, the throughput and the
     // context gauge: the model is the last thing to go, because it is the one
     // that says which model is answering.
     const room: u16 = if (right_edge > left_core + 2) right_edge - left_core - 2 else 0;

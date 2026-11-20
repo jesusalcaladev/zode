@@ -104,7 +104,37 @@ pub const langs = struct {
         .line_comments = &.{ "--", "#" },
         .template_literal = false,
     };
-    // Fallback for any untagged fence, or a rare one (`json`, `tsx`,
+    pub const json = Cfg{
+        // JSON has no keywords, but the scanner's type heuristic needs a
+        // non-empty table; the three literals are the only named tokens.
+        .types = &.{ "true", "false", "null" },
+        .builtins = &.{ "true", "false", "null" },
+        .template_literal = false,
+    };
+    pub const yaml = Cfg{
+        .keywords = &.{ "true", "false", "null", "yes", "no", "on", "off" },
+        .types = &.{ "true", "false", "null", "yes", "no", "on", "off" },
+        .builtins = &.{ "true", "false", "null" },
+        .line_comments = &.{"#"},
+        .template_literal = false,
+    };
+    pub const html = Cfg{
+        .keywords = &.{ "html", "head", "body", "div", "span", "a", "p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "table", "tr", "td", "th", "form", "input", "button", "img", "script", "style", "link", "meta", "title", "section", "article", "nav", "header", "footer", "main", "br", "hr", "pre", "code" },
+        .builtins = &.{ "class", "id", "href", "src", "type", "name", "value", "style", "alt", "title", "lang", "charset", "content", "rel", "role" },
+        .types = &.{ "true", "false", "null" },
+        .block_comment_start = "<!--",
+        .block_comment_end = "-->",
+        .template_literal = false,
+    };
+    pub const css = Cfg{
+        .keywords = &.{ "color", "background", "background-color", "margin", "padding", "border", "display", "position", "width", "height", "font", "font-size", "font-family", "flex", "grid", "gap", "opacity", "transform", "transition", "align-items", "justify-content", "text-align", "overflow", "z-index", "box-shadow" },
+        .types = &.{ "none", "block", "flex", "grid", "inline", "absolute", "relative", "fixed", "solid", "dashed", "auto", "red", "blue", "green", "black", "white", "transparent", "inherit" },
+        .builtins = &.{ "hover", "focus", "active", "before", "after", "root", "important" },
+        .block_comment_start = "/*",
+        .block_comment_end = "*/",
+        .template_literal = false,
+    };
+    // Fallback for any untagged fence, or a rare one (`tsx`,
     // `diff`, `text`).
     //
     // `builtins` and `types` were EMPTY, and that is not just about missing
@@ -153,14 +183,14 @@ pub fn normalizeLang(lang: []const u8, buf: []u8) []const u8 {
         .{ "haskell", "generic" },   .{ "elixir", "generic" },
         .{ "ruby", "generic" },      .{ "rb", "generic" },
         .{ "lua", "generic" },       .{ "toml", "generic" },
-        .{ "yaml", "generic" },      .{ "yml", "generic" },
-        .{ "html", "generic" },      .{ "xml", "generic" },
-        .{ "css", "generic" },       .{ "scss", "generic" },
+        .{ "yaml", "yaml" },         .{ "yml", "yaml" },
+        .{ "html", "html" },         .{ "xml", "html" },
+        .{ "css", "css" },           .{ "scss", "css" },
         .{ "markdown", "generic" },  .{ "md", "generic" },
         .{ "text", "generic" },      .{ "plain", "generic" },
         .{ "plaintext", "generic" }, .{ "txt", "generic" },
         .{ "diff", "generic" },      .{ "patch", "generic" },
-        .{ "json", "generic" },      .{ "jsonc", "generic" },
+        .{ "json", "json" },         .{ "jsonc", "json" },
     };
     inline for (table) |pair| {
         if (std.mem.eql(u8, low, pair[0])) return pair[1];
@@ -186,6 +216,10 @@ pub fn cfgFor(lang: []const u8) Cfg {
     if (std.mem.eql(u8, l, "rust")) return langs.rust;
     if (std.mem.eql(u8, l, "go")) return langs.go;
     if (std.mem.eql(u8, l, "sql")) return langs.sql;
+    if (std.mem.eql(u8, l, "json")) return langs.json;
+    if (std.mem.eql(u8, l, "yaml")) return langs.yaml;
+    if (std.mem.eql(u8, l, "html")) return langs.html;
+    if (std.mem.eql(u8, l, "css")) return langs.css;
     return langs.generic;
 }
 

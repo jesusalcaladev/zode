@@ -6,6 +6,9 @@ pub const TurnCtx = struct {
     m: *tui.Model,
     /// Assistant text of this turn (dumped into the session at the end).
     text: std.ArrayList(u8) = .empty,
+    /// Reasoning lives ONLY here and in the TUI. It is never appended to
+    /// `text`, so it cannot enter the wire message or the cache prefix twice.
+    reasoning: std.ArrayList(u8) = .empty,
     /// Tool calls requested in this turn.
     calls: std.ArrayList(Call) = .empty,
     /// A tool in flight: its header is already painted and the line has to be
@@ -37,6 +40,7 @@ pub const TurnCtx = struct {
         }
         self.calls.deinit(gpa);
         self.text.deinit(gpa);
+        self.reasoning.deinit(gpa);
     }
 
 };

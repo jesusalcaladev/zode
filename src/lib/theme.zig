@@ -245,6 +245,18 @@ pub const accent_bold = brand;
 pub const hint = ink2;
 pub const hint_faint = ink3;
 pub const dim = ink3;
+/// Task-list markers: a checked box is an affirmative mark, an unchecked one
+/// is metadata. Both come from existing roles so `NO_COLOR` and daltonized
+/// handling keep working without a second palette.
+pub const task_done = ok;
+pub const task_open = dim;
+/// A markdown `[label](url)`: same brand hue as the prompt rail, so links are
+/// recognisable without underlining prose that is not a link.
+pub const link = brand;
+/// Ctrl+F matches: a permanent, visible mark on the transcript, not a marker
+/// painted over it. The "current" hit is brighter so n/N has a target.
+pub const search_match: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x3b, 0x3b, 0x1f } } };
+pub const search_match_current: vaxis.Style = .{ .bg = .{ .rgb = .{ 0x5a, 0x4a, 0x1a } }, .bold = true };
 pub const text = ink;
 pub const assistant_bold = heading;
 pub const tool = ink2;
@@ -328,9 +340,11 @@ pub const text_pairs = [_][2]vaxis.Style{
     .{ ink3, panel_bg },
     .{ ink3, well_bg },
     .{ brand, well_bg },
+    .{ link, well_bg },
     .{ brand_hi, panel_bg },
     .{ brand_soft, well_bg },
     .{ ok, diff_add_bg },
+    .{ ok, well_bg },
     .{ err, diff_del_bg },
     .{ diff_gutter, well_bg },
     .{ diff_ctx, well_bg },

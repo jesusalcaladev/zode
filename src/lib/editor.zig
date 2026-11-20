@@ -18,6 +18,21 @@ const std = @import("std");
 pub const max_history: usize = 100;
 /// Buffer cap so that a huge paste doesn't bring down the TUI.
 pub const max_bytes: usize = 256 * 1024;
+/// Text undo is a bounded ring of whole-buffer snapshots. A prompt is capped at
+/// 256 KB, so an inverse-operation stack would save memory but cost a dozen
+/// mutation sites and a cursor-recovery algorithm; snapshots are one code path
+/// and fit the "radical simplicity" rule.
+pub const max_undo: usize = 64;
+
+const UndoEntry = struct {
+    text: []u8,
+    cursor: usize,
+    /// Cursor after the edit that created this snapshot. Consecutive
+    /// single-grapheme edits that end where the previous one ended are grouped
+    /// (typing a word, holding Backspace), but a cursor move breaks the run.
+    end_cursor: usize,
+    single: bool,
+};
 
 pub const Editor = struct {
     gpa: std.mem.Allocator,
@@ -32,6 +47,8 @@ pub const Editor = struct {
     draft: std.ArrayList(u8) = .empty,
     /// Number of logical lines in the current text.
     visual_lines: usize = 1,
+    undo_stack: std.ArrayList(UndoEntry) = .empty,
+    redo_stack: std.ArrayList(UndoEntry) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Editor {
         return .{ .gpa = gpa };
@@ -42,6 +59,100 @@ pub const Editor = struct {
         for (self.history.items) |h| self.gpa.free(h);
         self.history.deinit(self.gpa);
         self.draft.deinit(self.gpa);
+        self.clearUndoStacks();
+        self.undo_stack.deinit(self.gpa);
+        self.redo_stack.deinit(self.gpa);
+    }
+
+    fn clearUndoStacks(self: *Editor) void {
+        for (self.undo_stack.items) |e| self.gpa.free(e.text);
+        self.undo_stack.clearRetainingCapacity();
+        for (self.redo_stack.items) |e| self.gpa.free(e.text);
+        self.redo_stack.clearRetainingCapacity();
+    }
+
+    /// Snapshot the text BEFORE a mutation. `single` marks a one-grapheme edit
+    /// so consecutive typing (or Backspace) is one undo step, not one per key.
+    fn recordUndo(self: *Editor, single: bool, end_cursor: usize) void {
+        if (single and self.undo_stack.items.len > 0) {
+            const last = &self.undo_stack.items[self.undo_stack.items.len - 1];
+            if (last.single and last.end_cursor == self.cursor) {
+                // Continue the same run: the stored TEXT is still the state
+                // before the first keystroke, which is exactly what undo needs.
+                last.end_cursor = end_cursor;
+                self.clearRedo();
+                return;
+            }
+        }
+        const copy = self.gpa.dupe(u8, self.buf.items) catch return;
+        while (self.undo_stack.items.len >= max_undo) {
+            const old = self.undo_stack.orderedRemove(0);
+            self.gpa.free(old.text);
+        }
+        self.undo_stack.append(self.gpa, .{
+            .text = copy,
+            .cursor = self.cursor,
+            .end_cursor = end_cursor,
+            .single = single,
+        }) catch {
+            self.gpa.free(copy);
+            return;
+        };
+        self.clearRedo();
+    }
+
+    fn clearRedo(self: *Editor) void {
+        for (self.redo_stack.items) |e| self.gpa.free(e.text);
+        self.redo_stack.clearRetainingCapacity();
+    }
+
+    fn pushRedo(self: *Editor) void {
+        const copy = self.gpa.dupe(u8, self.buf.items) catch return;
+        self.redo_stack.append(self.gpa, .{
+            .text = copy,
+            .cursor = self.cursor,
+            .end_cursor = self.cursor,
+            .single = false,
+        }) catch self.gpa.free(copy);
+    }
+
+    fn restoreEntry(self: *Editor, e: UndoEntry) void {
+        self.buf.clearRetainingCapacity();
+        self.buf.appendSlice(self.gpa, e.text) catch {};
+        self.cursor = @min(e.cursor, self.buf.items.len);
+        self.gpa.free(e.text);
+        self.hist_idx = -1;
+        self.draft.clearRetainingCapacity();
+        self.recountLines();
+    }
+
+    /// Ctrl+Z. Returns false when there is nothing left to undo.
+    pub fn undo(self: *Editor) bool {
+        if (self.undo_stack.items.len == 0) return false;
+        const snap = self.undo_stack.orderedRemove(self.undo_stack.items.len - 1);
+        self.pushRedo();
+        self.restoreEntry(snap);
+        return true;
+    }
+
+    /// Ctrl+Shift+Z. Returns false when there is nothing to redo.
+    pub fn redo(self: *Editor) bool {
+        if (self.redo_stack.items.len == 0) return false;
+        const snap = self.redo_stack.orderedRemove(self.redo_stack.items.len - 1);
+        // The inverse of an undo goes back on the undo stack. It is not an
+        // independent edit, so it must never be grouped with typing.
+        const copy = self.gpa.dupe(u8, self.buf.items) catch return false;
+        self.undo_stack.append(self.gpa, .{
+            .text = copy,
+            .cursor = self.cursor,
+            .end_cursor = self.cursor,
+            .single = false,
+        }) catch {
+            self.gpa.free(copy);
+            return false;
+        };
+        self.restoreEntry(snap);
+        return true;
     }
 
     pub fn text(self: *const Editor) []const u8 {
@@ -62,6 +173,7 @@ pub const Editor = struct {
     pub fn insert(self: *Editor, s: []const u8) !void {
         if (s.len == 0) return;
         if (self.buf.items.len + s.len > max_bytes) return error.InputTooLong;
+        self.recordUndo(s.len == 1, self.cursor + s.len);
         try self.buf.insertSlice(self.gpa, self.cursor, s);
         self.cursor += s.len;
         self.hist_idx = -1;
@@ -81,6 +193,7 @@ pub const Editor = struct {
     /// accepting mid-sentence keeps the rest of the sentence.
     pub fn deleteRange(self: *Editor, start: usize, end: usize) !void {
         if (start >= end or end > self.buf.items.len) return error.BadRange;
+        self.recordUndo(false, start);
         try self.buf.replaceRange(self.gpa, start, end - start, &.{});
         self.cursor = start;
         self.hist_idx = -1;
@@ -199,6 +312,7 @@ pub const Editor = struct {
     pub fn deleteBefore(self: *Editor) void {
         if (self.cursor == 0) return;
         const start = self.prevGraphemeStart(self.cursor);
+        self.recordUndo(self.cursor - start == 1, start);
         self.buf.replaceRange(self.gpa, start, self.cursor - start, &.{}) catch return;
         self.cursor = start;
         self.recountLines();
@@ -207,18 +321,21 @@ pub const Editor = struct {
     pub fn deleteAfter(self: *Editor) void {
         if (self.cursor >= self.buf.items.len) return;
         const end = self.nextGraphemeEnd(self.cursor);
+        self.recordUndo(end - self.cursor == 1, self.cursor);
         self.buf.replaceRange(self.gpa, self.cursor, end - self.cursor, &.{}) catch return;
         self.recountLines();
     }
 
     pub fn deleteToEnd(self: *Editor) void {
         if (self.cursor >= self.buf.items.len) return;
+        self.recordUndo(false, self.cursor);
         self.buf.shrinkRetainingCapacity(self.cursor);
         self.recountLines();
     }
 
     pub fn deleteToStart(self: *Editor) void {
         if (self.cursor == 0) return;
+        self.recordUndo(false, 0);
         const rest = self.buf.items[self.cursor..];
         self.buf.shrinkRetainingCapacity(self.cursor);
         const copy = self.gpa.alloc(u8, rest.len) catch return;
@@ -232,6 +349,8 @@ pub const Editor = struct {
 
     pub fn deleteWordBefore(self: *Editor) void {
         const start = self.moveWordLeftTarget();
+        if (start == self.cursor) return;
+        self.recordUndo(false, start);
         self.buf.replaceRange(self.gpa, start, self.cursor - start, &.{}) catch return;
         self.cursor = start;
         self.recountLines();
@@ -941,4 +1060,82 @@ test "rowsInWindow returns the LAST rows when there are more than fit" {
     try std.testing.expectEqual(@as(usize, 2), w.len);
     // The window is the tail, which is where the cursor is.
     try std.testing.expectEqualStrings(w[w.len - 1].bytes, w[1].bytes);
+}
+
+test "undo/redo: a typed word is one step and the cursor returns with the text" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+    for ("hello") |c| try e.insertChar(c);
+    // Consecutive single-grapheme inserts coalesce into one group.
+    try std.testing.expectEqual(@as(usize, 1), e.undo_stack.items.len);
+
+    try std.testing.expect(e.undo());
+    try std.testing.expectEqualStrings("", e.text());
+    try std.testing.expectEqual(@as(usize, 0), e.cursor);
+
+    try std.testing.expect(e.redo());
+    try std.testing.expectEqualStrings("hello", e.text());
+    try std.testing.expectEqual(@as(usize, 5), e.cursor);
+}
+
+test "undo/redo: every deletion path leaves a snapshot, and a new edit clears redo" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+    try e.insert("one two three");
+    const baseline = e.undo_stack.items.len;
+
+    e.setCursor(3);
+    e.deleteBefore(); // "otwo three"
+    try std.testing.expectEqual(baseline + 1, e.undo_stack.items.len);
+    // Backspace followed by Delete at the SAME cursor is one contiguous run,
+    // so it shares the snapshot: one undo restores both characters.
+    e.deleteAfter();
+    try std.testing.expectEqual(baseline + 1, e.undo_stack.items.len);
+    e.deleteToEnd(); // multi-char: always its own step
+    try std.testing.expectEqual(baseline + 2, e.undo_stack.items.len);
+    e.setCursor(0);
+    e.deleteWordBefore(); // no-op at 0: no snapshot
+    try std.testing.expectEqual(baseline + 2, e.undo_stack.items.len);
+
+    while (e.undo()) {}
+    try std.testing.expectEqualStrings("", e.text());
+    // A NEW edit after an undo invalidates the redo branch.
+    try e.insert("fresh");
+    try std.testing.expect(!e.redo());
+}
+
+test "undo/redo: a multiline paste is one snapshot and survives a grapheme boundary" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+    try e.insert("before ");
+    const before = e.undo_stack.items.len;
+    try e.insert("line one\nline two\n");
+    try std.testing.expectEqual(before + 1, e.undo_stack.items.len);
+    try std.testing.expectEqual(@as(usize, 3), e.visual_lines);
+
+    try std.testing.expect(e.undo());
+    try std.testing.expectEqualStrings("before ", e.text());
+    try std.testing.expectEqual(@as(usize, 1), e.visual_lines);
+
+    // A cursor move breaks a typing run: the next character is a NEW step.
+    try e.insertChar('x');
+    e.moveLeft();
+    try e.insertChar('y');
+    try std.testing.expect(e.undo());
+    try std.testing.expectEqualStrings("before x", e.text());
+}
+
+test "undo/redo: the bounded ring evicts the oldest snapshot without leaking" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+    var i: usize = 0;
+    while (i < max_undo + 5) : (i += 1) {
+        try e.insert("ab "); // multi-byte: never grouped
+    }
+    try std.testing.expectEqual(@as(usize, max_undo), e.undo_stack.items.len);
+    var n: usize = 0;
+    while (e.undo()) : (n += 1) {}
+    try std.testing.expectEqual(@as(usize, max_undo), n);
+    // The 5 oldest snapshots were evicted, so those 5 inserts are permanent.
+    try std.testing.expectEqual(@as(usize, 5 * 3), e.text().len);
 }

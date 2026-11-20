@@ -1699,6 +1699,71 @@ test "footer: the right-hand group fits and is not cut" {
     try std.testing.expect(std.mem.indexOf(u8, row, "kimi") != null);
 }
 
+test "markdown: a link cell carries its OSC-8 target and a task list renders" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    agent.setAnswering("");
+    defer m.deinit();
+    m.pushKind(.assistant, "see [the docs](https://example.com/x)\n- [x] done\n- [ ] todo");
+    const s = try drawTest(&m, arena_state.allocator(), 100, 20);
+    const row = findRow(s, "the docs") orelse return error.TestExpectedEqual;
+    var found_link = false;
+    var col: u16 = 0;
+    while (col < 100) : (col += 1) {
+        const c = s.readCell(col, row);
+        if (std.mem.eql(u8, c.link.uri, "https://example.com/x")) found_link = true;
+    }
+    try std.testing.expect(found_link);
+    try std.testing.expect(findRow(s, "[x] done") != null);
+    try std.testing.expect(findRow(s, "[ ] todo") != null);
+}
+
+test "reasoning: a thinking block is its own paragraph, not assistant text" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    agent.setAnswering("");
+    agent.cur_model = "";
+    defer m.deinit();
+
+    m.pushReasoning("checking the sidecar before rewriting the writer");
+    _ = try drawTest(&m, arena_state.allocator(), 100, 20);
+    const s = try drawTest(&m, arena_state.allocator(), 100, 20);
+    const row = findRow(s, "thinking") orelse return error.TestExpectedEqual;
+    var buf: [512]u8 = undefined;
+    const text = rowText(s, row, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, text, "◇ thinking") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "chars") != null);
+}
+
+test "footer: cost is shown when published and dropped first on a narrow row" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    agent.setAnswering("");
+    agent.cur_model = "";
+    defer m.deinit();
+    const name = "kimi-k2.6";
+    @memcpy(m.status_model_buf[0..name.len], name);
+    m.status_model_len = name.len;
+    m.status_model_tried = true;
+    tui.setStatusCost(&m, "$0.0142*");
+
+    var buf: [512]u8 = undefined;
+    const wide = try drawTest(&m, arena_state.allocator(), 110, 16);
+    const wide_row = rowText(wide, 15, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, wide_row, "$0.0142*") != null);
+
+    // At 30 columns the model is all that survives; the cost vanishes without
+    // clipping the row or leaving a dangling separator.
+    const narrow = try drawTest(&m, arena_state.allocator(), 30, 16);
+    const narrow_row = rowText(narrow, 15, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_row, "$0.0142*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_row, " · ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_row, "\u{fffd}") == null);
+}
+
 test "status: ctxColor changes at the compaction thresholds" {
     // The intent, not the palette: below the budget a gauge should NOT shout,
     // near it it warns, past it it is an error. The old version pinned "green"
@@ -2818,6 +2883,49 @@ test "status: the token counters moved to /context and are off the row" {
     for ([_][]const u8{ "ctx ", "cached", "prompt", " tok" }) |gone| {
         try std.testing.expect(std.mem.indexOf(u8, joined.items, gone) == null);
     }
+}
+
+test "search: Ctrl+F matches are marked on the transcript cells" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    agent.setAnswering("");
+    agent.cur_model = "";
+    defer m.deinit();
+
+    m.pushKind(.assistant, "the needle is here");
+    // `pushKind` only queues into `pending`; a draw flushes it into `paras`.
+    _ = try drawTest(&m, arena_state.allocator(), 100, 20);
+    m.openTranscriptSearch();
+    const query = "needle";
+    @memcpy(m.search_query_buf[0..query.len], query);
+    m.search_query_len = query.len;
+    m.runTranscriptSearch();
+    m.closeTranscriptSearch();
+    try std.testing.expect(m.search_matches.items.len > 0);
+
+    const s = try drawTest(&m, arena_state.allocator(), 100, 20);
+    const row = findRow(s, "needle") orelse return error.TestExpectedEqual;
+    var marked = false;
+    var col: u16 = 0;
+    while (col < 100) : (col += 1) {
+        const cell = s.readCell(col, row);
+        if (cell.style.bg.eql(theme.search_match.bg)) marked = true;
+    }
+    try std.testing.expect(marked);
+
+    // Clearing the query removes the marks: the cache was invalidated.
+    m.search_query_len = 0;
+    m.search_has_query = false;
+    m.clearSegCache();
+    const s2 = try drawTest(&m, arena_state.allocator(), 100, 20);
+    const row2 = findRow(s2, "needle") orelse return error.TestExpectedEqual;
+    var still_marked = false;
+    col = 0;
+    while (col < 100) : (col += 1) {
+        if (s2.readCell(col, row2).style.bg.eql(theme.search_match.bg)) still_marked = true;
+    }
+    try std.testing.expect(!still_marked);
 }
 
 /// First row whose text contains `needle` (render tests).

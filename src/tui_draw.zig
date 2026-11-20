@@ -258,7 +258,11 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
                 .text = stable_src,
                 .lang = if (live_kind == .diff) "zig" else "",
             };
-            live_lines = tui.buildLines(pa, ctx, &live_para, wrap_width, self.nerd_icons) catch &.{};
+            const query: ?[]const u8 = if (self.search_has_query and self.search_query_len > 0)
+                self.search_query_buf[0..self.search_query_len]
+            else
+                null;
+            live_lines = tui.buildLines(pa, ctx, &live_para, wrap_width, self.nerd_icons, query) catch &.{};
             self.live_lines = live_lines;
             self.live_hash = h;
             self.live_width = wrap_width;
