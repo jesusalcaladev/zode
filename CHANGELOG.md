@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - bound every network operation (40.10) (http) [`069dd1dc`](https://github.com/jesusalcaladev/zode/commit/069dd1dc)
 - reasoning block, inline markdown, search marks, undo, cost footer (49) (tui) [`56af7c6a`](https://github.com/jesusalcaladev/zode/commit/56af7c6a)
 - counts, register, visual mode, hunk folding, side-by-side (49) (vim,diff) [`086f1b03`](https://github.com/jesusalcaladev/zode/commit/086f1b03)
-- /export and hierarchical instruction files (50.1, 50.4) (ecosystem) [`fcc7da4a`](https://github.com/jesusalcaladev/zode/commit/fcc7da4a)
+- /export and hierarchical instruction files (50.1, 50.4) (ecosystem) [`1cc3c531`](https://github.com/jesusalcaladev/zode/commit/1cc3c531)
+- hook events + user scope, MCP resources/prompts (50.2, 50.3) (ecosystem) [`c2161e36`](https://github.com/jesusalcaladev/zode/commit/c2161e36)
 
 ### Bug Fixes
 

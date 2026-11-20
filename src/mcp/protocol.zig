@@ -31,6 +31,12 @@ pub const method_initialize = "initialize";
 pub const method_initialized = "notifications/initialized";
 pub const method_tools_list = "tools/list";
 pub const method_tools_call = "tools/call";
+/// 50.3: the other two halves of MCP. A server that only implements tools is
+/// still fully usable; these are additive, never required at handshake time.
+pub const method_resources_list = "resources/list";
+pub const method_resources_read = "resources/read";
+pub const method_prompts_list = "prompts/list";
+pub const method_prompts_get = "prompts/get";
 
 /// The JSON-RPC error code for "I do not implement this method".
 ///
@@ -193,6 +199,90 @@ pub fn parseMessage(arena: std.mem.Allocator, line: []const u8) !Message {
 }
 
 /// The `tools/list` result: the tools and the cursor for the next page.
+pub const Resource = struct {
+    uri: []const u8,
+    name: []const u8 = "",
+    description: []const u8 = "",
+    mime_type: []const u8 = "",
+};
+
+pub const Prompt = struct {
+    name: []const u8,
+    description: []const u8 = "",
+    /// The argument definitions, verbatim JSON text (same reason as a tool
+    /// schema: the model reads it, so it must not be re-serialized).
+    arguments_json: []const u8 = "[]",
+};
+
+pub const ResourcePage = struct {
+    resources: []Resource = &.{},
+    next_cursor: ?[]const u8 = null,
+};
+
+pub const PromptPage = struct {
+    prompts: []Prompt = &.{},
+    next_cursor: ?[]const u8 = null,
+};
+
+fn strField(obj: std.json.ObjectMap, key: []const u8) []const u8 {
+    const v = obj.get(key) orelse return "";
+    return if (v == .string) v.string else "";
+}
+
+fn cursorField(obj: std.json.ObjectMap) ?[]const u8 {
+    const v = obj.get("nextCursor") orelse return null;
+    if (v != .string or v.string.len == 0) return null;
+    return v.string;
+}
+
+pub fn parseResourcePage(arena: std.mem.Allocator, result: std.json.Value) !ResourcePage {
+    if (result != .object) return error.BadResult;
+    const obj = result.object;
+    var out: std.ArrayList(Resource) = .empty;
+    if (obj.get("resources")) |rv| {
+        if (rv == .array) {
+            for (rv.array.items) |item| {
+                if (item != .object) continue;
+                const uri = strField(item.object, "uri");
+                if (uri.len == 0) continue;
+                try out.append(arena, .{
+                    .uri = try arena.dupe(u8, uri),
+                    .name = try arena.dupe(u8, strField(item.object, "name")),
+                    .description = try arena.dupe(u8, strField(item.object, "description")),
+                    .mime_type = try arena.dupe(u8, strField(item.object, "mimeType")),
+                });
+            }
+        }
+    }
+    return .{ .resources = try out.toOwnedSlice(arena), .next_cursor = cursorField(obj) };
+}
+
+pub fn parsePromptPage(arena: std.mem.Allocator, result: std.json.Value) !PromptPage {
+    if (result != .object) return error.BadResult;
+    const obj = result.object;
+    var out: std.ArrayList(Prompt) = .empty;
+    if (obj.get("prompts")) |pv| {
+        if (pv == .array) {
+            for (pv.array.items) |item| {
+                if (item != .object) continue;
+                const name = strField(item.object, "name");
+                if (name.len == 0) continue;
+                const av = item.object.get("arguments");
+                const args: []const u8 = if (av) |a| blk: {
+                    const txt = std.json.Stringify.valueAlloc(arena, a, .{}) catch break :blk "[]";
+                    break :blk txt;
+                } else "[]";
+                try out.append(arena, .{
+                    .name = try arena.dupe(u8, name),
+                    .description = try arena.dupe(u8, strField(item.object, "description")),
+                    .arguments_json = args,
+                });
+            }
+        }
+    }
+    return .{ .prompts = try out.toOwnedSlice(arena), .next_cursor = cursorField(obj) };
+}
+
 pub const ToolPage = struct {
     tools: []Tool = &.{},
     /// The cursor for the next page, when the server has more.
@@ -431,6 +521,28 @@ test "a paginated tool list carries the cursor" {
     , .{});
     const page = try parseToolPage(a, result);
     try t.expectEqualStrings("page2", page.next_cursor.?);
+}
+
+test "resources and prompts are parsed without losing their fields" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const rjson = "{\"resources\":[{\"uri\":\"file:///tmp/a.txt\",\"name\":\"a\",\"description\":\"A file\",\"mimeType\":\"text/plain\"}],\"nextCursor\":\"page2\"}";
+    const rparsed = try std.json.parseFromSliceLeaky(std.json.Value, a, rjson, .{});
+    const rpage = try parseResourcePage(a, rparsed);
+    try std.testing.expectEqual(@as(usize, 1), rpage.resources.len);
+    try std.testing.expectEqualStrings("file:///tmp/a.txt", rpage.resources[0].uri);
+    try std.testing.expectEqualStrings("text/plain", rpage.resources[0].mime_type);
+    try std.testing.expectEqualStrings("page2", rpage.next_cursor.?);
+
+    const pjson = "{\"prompts\":[{\"name\":\"review\",\"description\":\"Review code\",\"arguments\":[{\"name\":\"path\",\"required\":true}]}]}";
+    const pparsed = try std.json.parseFromSliceLeaky(std.json.Value, a, pjson, .{});
+    const ppage = try parsePromptPage(a, pparsed);
+    try std.testing.expectEqual(@as(usize, 1), ppage.prompts.len);
+    try std.testing.expectEqualStrings("review", ppage.prompts[0].name);
+    try std.testing.expect(std.mem.indexOf(u8, ppage.prompts[0].arguments_json, "required") != null);
+    try std.testing.expect(ppage.next_cursor == null);
 }
 
 test "a call result is the text of its text blocks" {

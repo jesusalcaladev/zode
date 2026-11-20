@@ -63,6 +63,17 @@ pub const Error = error{
 };
 
 /// One MCP server.
+fn cursorParams(arena: std.mem.Allocator, cursor: ?[]const u8) ![]const u8 {
+    if (cursor) |c| {
+        var aw = std.Io.Writer.Allocating.init(arena);
+        try aw.writer.writeAll("{\"cursor\":");
+        try protocol.writeJsonString(&aw.writer, c);
+        try aw.writer.writeAll("}");
+        return aw.written();
+    }
+    return "{}";
+}
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -167,6 +178,62 @@ pub const Client = struct {
     ) !protocol.CallResult {
         const params = try protocol.toolsCallParams(arena, name, arguments_json);
         const result = try self.request(arena, protocol.method_tools_call, params);
+        return protocol.parseCallResult(arena, result);
+    }
+
+    /// 50.3: every resource the server publishes (paged like tools).
+    pub fn listResources(self: *Client, arena: std.mem.Allocator) ![]protocol.Resource {
+        var all: std.ArrayList(protocol.Resource) = .empty;
+        var cursor: ?[]const u8 = null;
+        var pages: usize = 0;
+        while (pages < max_pages) : (pages += 1) {
+            const params = try cursorParams(arena, cursor);
+            const result = try self.request(arena, protocol.method_resources_list, params);
+            const page = try protocol.parseResourcePage(arena, result);
+            try all.appendSlice(arena, page.resources);
+            cursor = page.next_cursor;
+            if (cursor == null) break;
+        }
+        return all.items;
+    }
+
+    /// 50.3: contents of one resource, as the text blocks the server sent.
+    pub fn readResource(self: *Client, arena: std.mem.Allocator, uri: []const u8) !protocol.CallResult {
+        var aw = std.Io.Writer.Allocating.init(arena);
+        try aw.writer.writeAll("{\"uri\":");
+        try protocol.writeJsonString(&aw.writer, uri);
+        try aw.writer.writeAll("}");
+        const result = try self.request(arena, protocol.method_resources_read, aw.written());
+        return protocol.parseCallResult(arena, result);
+    }
+
+    /// 50.3: every prompt the server publishes (paged like tools).
+    pub fn listPrompts(self: *Client, arena: std.mem.Allocator) ![]protocol.Prompt {
+        var all: std.ArrayList(protocol.Prompt) = .empty;
+        var cursor: ?[]const u8 = null;
+        var pages: usize = 0;
+        while (pages < max_pages) : (pages += 1) {
+            const params = try cursorParams(arena, cursor);
+            const result = try self.request(arena, protocol.method_prompts_list, params);
+            const page = try protocol.parsePromptPage(arena, result);
+            try all.appendSlice(arena, page.prompts);
+            cursor = page.next_cursor;
+            if (cursor == null) break;
+        }
+        return all.items;
+    }
+
+    /// 50.3: one prompt with its arguments as a JSON object string.
+    pub fn getPrompt(self: *Client, arena: std.mem.Allocator, name: []const u8, arguments_json: []const u8) !protocol.CallResult {
+        var aw = std.Io.Writer.Allocating.init(arena);
+        try aw.writer.writeAll("{\"name\":");
+        try protocol.writeJsonString(&aw.writer, name);
+        if (arguments_json.len > 0) {
+            try aw.writer.writeAll(",\"arguments\":");
+            try aw.writer.writeAll(arguments_json);
+        }
+        try aw.writer.writeAll("}");
+        const result = try self.request(arena, protocol.method_prompts_get, aw.written());
         return protocol.parseCallResult(arena, result);
     }
 

@@ -32,6 +32,18 @@ pub const Event = enum {
     /// 34.14: fired before a permission dialog / permission decision, so hooks
     /// can allow or deny in headless or automated runs.
     PermissionRequest,
+    /// Lifecycle and provider events (50.2). They are parsed and matched by the
+    /// same engine as the original five; the call sites fire them where the
+    /// runtime has the corresponding moment.
+    SessionStart,
+    SessionEnd,
+    PreCompact,
+    Notification,
+    SubagentStart,
+    SubagentStop,
+    PostToolUseFailure,
+    ConfigChange,
+    InstructionsLoaded,
 
     pub fn parse(s: []const u8) ?Event {
         if (std.ascii.eqlIgnoreCase(s, "PreToolUse") or std.ascii.eqlIgnoreCase(s, "pre_tool_use")) return .PreToolUse;
@@ -39,6 +51,20 @@ pub const Event = enum {
         if (std.ascii.eqlIgnoreCase(s, "UserPromptSubmit") or std.ascii.eqlIgnoreCase(s, "user_prompt_submit")) return .UserPromptSubmit;
         if (std.ascii.eqlIgnoreCase(s, "Stop") or std.ascii.eqlIgnoreCase(s, "stop")) return .Stop;
         if (std.ascii.eqlIgnoreCase(s, "PermissionRequest") or std.ascii.eqlIgnoreCase(s, "permission_request")) return .PermissionRequest;
+        const extra = [_]struct { name: []const u8, snake: []const u8, event: Event }{
+            .{ .name = "SessionStart", .snake = "session_start", .event = .SessionStart },
+            .{ .name = "SessionEnd", .snake = "session_end", .event = .SessionEnd },
+            .{ .name = "PreCompact", .snake = "pre_compact", .event = .PreCompact },
+            .{ .name = "Notification", .snake = "notification", .event = .Notification },
+            .{ .name = "SubagentStart", .snake = "subagent_start", .event = .SubagentStart },
+            .{ .name = "SubagentStop", .snake = "subagent_stop", .event = .SubagentStop },
+            .{ .name = "PostToolUseFailure", .snake = "post_tool_use_failure", .event = .PostToolUseFailure },
+            .{ .name = "ConfigChange", .snake = "config_change", .event = .ConfigChange },
+            .{ .name = "InstructionsLoaded", .snake = "instructions_loaded", .event = .InstructionsLoaded },
+        };
+        for (extra) |e| {
+            if (std.ascii.eqlIgnoreCase(s, e.name) or std.ascii.eqlIgnoreCase(s, e.snake)) return e.event;
+        }
         return null;
     }
 
@@ -49,6 +75,15 @@ pub const Event = enum {
             .UserPromptSubmit => "UserPromptSubmit",
             .Stop => "Stop",
             .PermissionRequest => "PermissionRequest",
+            .SessionStart => "SessionStart",
+            .SessionEnd => "SessionEnd",
+            .PreCompact => "PreCompact",
+            .Notification => "Notification",
+            .SubagentStart => "SubagentStart",
+            .SubagentStop => "SubagentStop",
+            .PostToolUseFailure => "PostToolUseFailure",
+            .ConfigChange => "ConfigChange",
+            .InstructionsLoaded => "InstructionsLoaded",
         };
     }
 };
@@ -121,9 +156,9 @@ pub fn matches(hook: Hook, ctx: MatchCtx) bool {
     // matcher: tool name or regex
     if (hook.matcher.len > 0) {
         const target = switch (ctx.event) {
-            .PreToolUse, .PostToolUse, .PermissionRequest => ctx.tool,
-            .UserPromptSubmit => ctx.prompt,
-            .Stop => ctx.prompt,
+            .PreToolUse, .PostToolUse, .PostToolUseFailure, .PermissionRequest,
+            .SubagentStart, .SubagentStop => ctx.tool,
+            else => ctx.prompt,
         };
         if (!matchMatcher(hook.matcher, target)) return false;
     }
@@ -484,6 +519,21 @@ test "hooks: parse event names" {
     try t.expectEqual(Event.PostToolUse, Event.parse("post_tool_use").?);
     try t.expectEqual(Event.UserPromptSubmit, Event.parse("UserPromptSubmit").?);
     try t.expectEqual(Event.Stop, Event.parse("stop").?);
+    // 50.2: the lifecycle/provider events are first-class names.
+    for ([_]struct { s: []const u8, n: []const u8, e: Event }{
+        .{ .s = "SessionStart", .n = "SessionStart", .e = .SessionStart },
+        .{ .s = "session_end", .n = "SessionEnd", .e = .SessionEnd },
+        .{ .s = "PreCompact", .n = "PreCompact", .e = .PreCompact },
+        .{ .s = "notification", .n = "Notification", .e = .Notification },
+        .{ .s = "SubagentStart", .n = "SubagentStart", .e = .SubagentStart },
+        .{ .s = "subagent_stop", .n = "SubagentStop", .e = .SubagentStop },
+        .{ .s = "PostToolUseFailure", .n = "PostToolUseFailure", .e = .PostToolUseFailure },
+        .{ .s = "config_change", .n = "ConfigChange", .e = .ConfigChange },
+        .{ .s = "instructions_loaded", .n = "InstructionsLoaded", .e = .InstructionsLoaded },
+    }) |c| {
+        try t.expectEqual(c.e, Event.parse(c.s).?);
+        try t.expectEqualStrings(c.n, c.e.name());
+    }
     try t.expect(Event.parse("bogus") == null);
 }
 

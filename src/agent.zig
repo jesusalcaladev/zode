@@ -1149,7 +1149,15 @@ pub fn loadHooks() void {
     else
         project_hooks_file;
     if (hooks_arena == null) hooks_arena = std.heap.ArenaAllocator.init(gpa_global);
-    project_rules.loadHooksAt(&hooks_set, hooks_arena.?.allocator(), io_global, project_path);
+    // 50.2: a user-level hooks file is loaded too, with the project file taking
+    // precedence on an identical event+matcher+condition.
+    var ucfg_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var upath_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const user_path: ?[]const u8 = if (config_mod.configDir(environ_global, &ucfg_buf)) |d|
+        std.mem.print(&upath_buf, "{s}/hooks.json", .{d}) catch null
+    else
+        null;
+    project_rules.loadHooksMerged(&hooks_set, hooks_arena.?.allocator(), io_global, user_path, project_path);
 }
 
 pub fn loadPermRules() void {
