@@ -461,6 +461,7 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
             self.permAllowAlways(),
             self.permSandboxAvailable(),
             self.permSuggestion(),
+            self.perm_detail_scroll,
         );
     }
 

@@ -5014,7 +5014,9 @@ pub fn finishAutoCheck(m: *tui.Model) void {
             // fact — `pollTouchedFiles` drops it on the next change, instead
             // of it answering for code it never saw.
             _ = m.addFact(.fact, line, "", 0);
-            m.pushInfo(line);
+            // The verdict word is a fact from `proofWord`, and the colour comes
+            // from that same enum — no sniffing of the rendered sentence.
+            m.pushProof(line, m.auto_check.proof);
         }
     }
 }
@@ -5346,6 +5348,9 @@ fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
     t.tps_win_chars = r.win_chars;
     tps_live = r.tps_live;
     tps_last = r.tps_last;
+    // Once actual text arrives, the live "◇ N chars" indicator belongs to the
+    // answer, not to the reasoning that preceded it.
+    t.m.reason_live_chars.store(0, .seq_cst);
     t.m.streamDelta(delta);
 }
 
@@ -5355,6 +5360,9 @@ fn onDelta(ud: ?*anyopaque, delta: []const u8) void {
 fn onReasoning(ud: ?*anyopaque, delta: []const u8) void {
     const t: *TurnCtx = @ptrCast(@alignCast(ud.?));
     t.reasoning.appendSlice(t.m.allocator, delta) catch {};
+    // Publish the growth for the footer. The transcript block is still emitted
+    // ONCE at turn end: only the live indicator reads this atomic.
+    t.m.reason_live_chars.store(t.reasoning.items.len, .seq_cst);
 }
 
 /// How often the live tok/s is recomputed while tokens arrive. 250 ms: fine

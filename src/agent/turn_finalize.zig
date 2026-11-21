@@ -54,6 +54,7 @@ pub fn run(
     // suppresses its old reasoning-only fallback when our callback is wired,
     // so a reasoning model cannot put the same bytes in both places.
     if (tstate.reasoning.items.len > 0) m.pushReasoning(tstate.reasoning.items);
+    m.reason_live_chars.store(0, .seq_cst);
 
     const calls_json = if (tstate.calls.items.len > 0)
         ops.toolCallsJsonFromCalls(gpa, tstate.calls.items)

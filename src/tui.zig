@@ -17,6 +17,7 @@ const diffhunks = @import("lib/diffhunks.zig");
 const diffview = @import("lib/diff/view.zig");
 const ed = @import("lib/editor.zig");
 const textcap = @import("lib/textcap.zig");
+const typecheck_mod = @import("lib/typecheck.zig");
 const sleepz = @import("lib/sleep.zig");
 const taskstore = @import("lib/taskstore.zig");
 const team_mod = @import("lib/team.zig");
@@ -1611,6 +1612,10 @@ pub const Model = struct {
     /// purpose: it is the only signal the TUI thread can read without taking
     /// the model lock (which the worker may hold in `requestPermission`).
     redraw_requested: std.atomic.Value(bool) = .init(false),
+    /// Bytes of reasoning received so far in this turn. The worker writes it,
+    /// the draw reads it: an atomic keeps the footer honest without letting the
+    /// worker touch the paragraph tree (which would be a use-after-free).
+    reason_live_chars: std.atomic.Value(usize) = .init(0),
 
     /// First history line on screen, in ABSOLUTE terms. This is an ANCHOR, not a
     /// distance from the bottom: that is the difference between being able to
@@ -1764,6 +1769,9 @@ pub const Model = struct {
     perm_tool_len: usize = 0,
     perm_detail: [384]u8 = undefined,
     perm_detail_len: usize = 0,
+    /// First wrapped row of the command shown in the dialog. Presentation-only
+    /// state: scrolling never changes the permission decision.
+    perm_detail_scroll: usize = 0,
     perm_active: bool = false,
     /// The rule that matched and caused this permission question.
     ///
@@ -4100,6 +4108,7 @@ pub const Model = struct {
         const n_det = @min(detail.len, self.perm_detail.len);
         @memcpy(self.perm_detail[0..n_det], detail[0..n_det]);
         self.perm_detail_len = n_det;
+        self.perm_detail_scroll = 0;
         self.perm_answer = .none;
         // `perm_sandbox_available` is set by the caller before this blocks:
         // clearing it here would discard a "run sandboxed" offer (Phase 25).
@@ -5339,6 +5348,32 @@ pub const Model = struct {
         self.dirty = true;
         // Ask for a frame now: the tick can be up to 120 ms away.
         self.redraw_requested.store(true, .seq_cst);
+    }
+
+    /// Same enqueue, with an imposed base style. The style travels with the
+    /// paragraph (structured state), so the draw never has to sniff the text
+    /// to decide how important it is.
+    pub fn pushKindBase(self: *Model, kind: md.Kind, text: []const u8, base: md.Style) void {
+        const copy = self.allocator.dupe(u8, text) catch return;
+        self.lock();
+        defer self.unlock();
+        self.pending.append(self.allocator, .{ .kind = kind, .text = copy, .base = base }) catch {
+            self.allocator.free(copy);
+        };
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    /// The end-of-turn proof line. `tested` is green, `typechecked` /
+    /// `syntax-checked` are warnings, and a missing check is an error — the
+    /// words stay exactly as `proofWord` wrote them, only the colour differs.
+    pub fn pushProof(self: *Model, text: []const u8, proof: typecheck_mod.Kind) void {
+        const style: md.Style = switch (proof) {
+            .tests => theme.ok,
+            .types, .syntax => theme.warn,
+            .nothing => theme.err,
+        };
+        self.pushKindBase(.info, text, style);
     }
 
     /// Shows a compact reasoning block. Called ONCE at turn end, not per
@@ -10259,6 +10294,7 @@ pub fn drawPermissionModal(
     allow_always: bool,
     allow_sandbox: bool,
     suggestion: []const u8,
+    detail_scroll: usize,
 ) void {
     // Responsive width: fit the terminal, keep readable margins, and adapt
     // cleanly to zoom/resize (vaxis redraws on winsize).
@@ -10333,15 +10369,23 @@ pub fn drawPermissionModal(
     var dy: u16 = y + 5;
     const bottom_limit: u16 = y + h -| 2; // leave room for options row
 
-    // Detail, wrapped and clipped so it never crosses the modal border.
+    // Detail, wrapped and clipped so it never crosses the modal border. A long
+    // bash command used to be cut here with no way to read the rest, which meant
+    // approving text the user had never seen. PgUp/PgDn move a WINDOW over the
+    // wrapped rows; the decision itself is still made only by answerPermission.
     if (detail.len > 0 and dy < bottom_limit) {
+        const start = @min(detail_scroll, detail_rows_all.len -| detail_lines);
+        const end = @min(start + detail_lines, detail_rows_all.len);
+        const visible = detail_rows_all[start..end];
         var di: usize = 0;
-        while (di < detail_lines and dy < bottom_limit) : (di += 1) {
-            _ = p.putClipped(x + inner_x_pad, dy, detail_rows_all[di], inner_w, theme.dim);
+        while (di < visible.len and dy < bottom_limit) : (di += 1) {
+            _ = p.putClipped(x + inner_x_pad, dy, visible[di], inner_w, theme.dim);
             dy += 1;
         }
         if (detail_truncated and dy < bottom_limit) {
-            _ = p.putClipped(x + inner_x_pad, dy, "… (command truncated in dialog)", inner_w, theme.hint_faint);
+            var hb: [96]u8 = undefined;
+            const hint = std.mem.print(&hb, "… {d} more line(s) · PgUp/PgDn to read", .{detail_rows_all.len - visible.len}) catch "… (command truncated in dialog)";
+            _ = p.putClipped(x + inner_x_pad, dy, hint, inner_w, theme.hint_faint);
             dy += 1;
         }
     }
@@ -11113,7 +11157,14 @@ pub fn drawStateFooter(
     } else if (act.busy) {
         legend = "thinking";
         const ms = self.busyMillis();
-        detail = std.mem.print(&detail_buf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
+        // A reasoning model used to be indistinguishable from a hung one: only
+        // the clock moved. The atomic char count grows as deltas arrive, which
+        // answers "is it alive?" without adding a row to the viewport.
+        const reasoning = self.reason_live_chars.load(.seq_cst);
+        detail = if (reasoning > 0)
+            std.mem.print(&detail_buf, "{d}.{d}s · ◇ {d} chars", .{ ms / 1000, (ms % 1000) / 100, reasoning }) catch ""
+        else
+            std.mem.print(&detail_buf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
     } else {
         // Idle: the agent's own last word, if it said one ("done", "ready").
         legend = self.status();

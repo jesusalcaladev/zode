@@ -2992,12 +2992,18 @@ test "search: Ctrl+F matches are marked on the transcript cells" {
     const s = try drawTest(&m, arena_state.allocator(), 100, 20);
     const row = findRow(s, "needle") orelse return error.TestExpectedEqual;
     var marked = false;
+    var current = false;
     var col: u16 = 0;
     while (col < 100) : (col += 1) {
         const cell = s.readCell(col, row);
-        if (cell.style.bg.eql(theme.search_match.bg)) marked = true;
+        if (cell.style.bg.eql(theme.search_match_current.bg)) {
+            current = true; // `search_match_current` used to be defined but unused
+        } else if (cell.style.bg.eql(theme.search_match.bg)) {
+            marked = true;
+        }
     }
-    try std.testing.expect(marked);
+    try std.testing.expect(marked or current);
+    try std.testing.expect(current);
 
     // Clearing the query removes the marks: the cache was invalidated.
     m.search_query_len = 0;
@@ -7182,4 +7188,376 @@ test "autocomplete: matches are materialized once per query, not per frame" {
     syncAutocomplete(&m);
     try std.testing.expectEqual(@as(usize, 0), matchCount(&m));
     try std.testing.expectEqual(@as(usize, 0), m.ac.cmd_keys.items.len);
+}
+
+// ── TUI improvement plan, phase 0 batch 1: input correctness ──────────────
+
+test "ctrl+c: a staged image with an empty box clears the draft, it does not quit" {
+    // `hasInput()` only looked at the text, so a staged image plus an empty
+    // composer read as "nothing to lose" and the FIRST Ctrl+C exited the app.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    // `clear` owns `path`, so the test must hand it an allocator-owned copy —
+    // a string literal would trip the 0.17 length-checked free.
+    m.draft_images.images[0] = .{
+        .mime = "image/png",
+        .data_b64 = "AAAA",
+        .path = std.testing.allocator.dupe(u8, "clipboard.png") catch unreachable,
+    };
+    m.draft_images.len = 1;
+    try std.testing.expect(m.hasDraft());
+    try std.testing.expect(!m.hasInput());
+
+    var ctx = testCtx();
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
+    try std.testing.expect(!ctx.quit);
+    try std.testing.expect(m.draft_images.isEmpty());
+
+    // With nothing left, the second press behaves like the documented exit.
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'c', .mods = .{ .ctrl = true } } });
+    try std.testing.expect(ctx.quit);
+}
+
+test "ask: a free-text answer beginning with ! is captured as the answer" {
+    // The `!cmd` shortcut used to be checked first, so answering a question
+    // with "!what does this do?" started a shell command while the worker
+    // stayed parked waiting for the answer.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try openAskForTest(&m, "any question?", "", &.{});
+    const answer = "!what does this do?";
+    try std.testing.expect(m.askAnswerFromInput(answer));
+    m.askLock();
+    defer m.askUnlock();
+    try std.testing.expectEqualStrings(answer, m.ask_answer.?);
+}
+
+test "input: a TAB inside a bracketed paste survives as a TAB" {
+    // A raw 0x09 becomes Ctrl+I with no `text` in vaxis. The aggregator only
+    // kept printable text, so every indent in pasted code disappeared.
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    tui.capturePasteKey(&m, .{ .codepoint = 'i', .mods = .{ .ctrl = true } });
+    tui.capturePasteKey(&m, .{ .codepoint = 'a', .text = "a" });
+    tui.capturePasteKey(&m, .{ .codepoint = 'i', .mods = .{ .ctrl = true } });
+    try std.testing.expectEqualStrings("\ta\t", m.paste_buf.items);
+}
+
+fn keyTestCtx(arena: std.mem.Allocator, threaded: *std.Io.Threaded) vxfw.EventContext {
+    var ctx = testCtx();
+    ctx.io = threaded.io();
+    ctx.alloc = arena;
+    ctx.cmds = .empty;
+    return ctx;
+}
+
+test "input: Ctrl+U and Ctrl+D edit the buffer while text is present" {
+    // The global half-page scroll branch ran before the editor and swallowed
+    // both keys, leaving `deleteToStart`/`deleteAfter` unreachable.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(arena);
+    defer m.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx = keyTestCtx(arena, &threaded);
+
+    try m.ed.insert("hello world");
+    m.ed.cursor = 6;
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try std.testing.expectEqualStrings("world", m.ed.text());
+
+    m.ed.clear();
+    try m.ed.insert("abcdef");
+    m.ed.cursor = 0;
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'd', .mods = .{ .ctrl = true } } });
+    try std.testing.expectEqualStrings("bcdef", m.ed.text());
+
+    // With an empty box both keys are still the documented half-page scroll.
+    m.ed.clear();
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'u', .mods = .{ .ctrl = true } } });
+    try std.testing.expect(m.ed.isEmpty());
+}
+
+test "input: Up/Down navigate a multiline draft before browsing history" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(arena);
+    defer m.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx = keyTestCtx(arena, &threaded);
+
+    const draft = "line one\nline two\nline three";
+    try m.ed.insert(draft);
+    m.ed.moveToEnd();
+    const end = m.ed.cursor;
+
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
+    const after_up = m.ed.cursor;
+    try std.testing.expect(after_up < end);
+    try std.testing.expectEqualStrings(draft, m.ed.text());
+
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.down } });
+    // The column is preserved, not the raw byte offset: "line three" is longer
+    // than "line two", so coming back lands before the old end.
+    try std.testing.expect(m.ed.cursor > after_up);
+    try std.testing.expect(m.ed.cursor <= end);
+    try std.testing.expectEqualStrings(draft, m.ed.text());
+
+    // At the first line the arrow falls through to history, without eating the
+    // draft: an empty history leaves the text exactly as it was.
+    m.ed.moveToStart();
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.up } });
+    try std.testing.expectEqualStrings(draft, m.ed.text());
+}
+
+test "input: Ctrl+A with text moves home instead of opening the Connect palette" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(arena);
+    defer m.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx = keyTestCtx(arena, &threaded);
+
+    try m.ed.insert("hello");
+    m.ed.cursor = 5;
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'a', .mods = .{ .ctrl = true } } });
+    try std.testing.expectEqual(@as(usize, 0), m.ed.cursor);
+    try std.testing.expect(!m.pal.active);
+
+    // Empty box: the same key is the documented Connect shortcut.
+    m.ed.clear();
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = 'a', .mods = .{ .ctrl = true } } });
+    try std.testing.expect(m.pal.active);
+}
+
+test "search: Ctrl+F finds and highlights a symbol inside a fenced code block" {
+    // The match set already used `textLive()` (so the CODE counted), but the
+    // code-block builder never called `searchHitAt`, so the cells on screen had
+    // no highlight: the footer said 1/1 while nothing was marked.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.pushKind(.assistant, "intro\n\n```zig\nconst needle_symbol = 1;\n```\n\noutro");
+    _ = try drawTest(&m, arena_state.allocator(), 100, 40);
+
+    m.openTranscriptSearch();
+    const query = "needle_symbol";
+    @memcpy(m.search_query_buf[0..query.len], query);
+    m.search_query_len = query.len;
+    m.runTranscriptSearch();
+    m.closeTranscriptSearch();
+    try std.testing.expectEqual(@as(usize, 1), m.search_matches.items.len);
+
+    const s = try drawTest(&m, arena_state.allocator(), 100, 40);
+    const row = findRow(s, "needle_symbol") orelse return error.TestExpectedEqual;
+    var marked = false;
+    var col: u16 = 0;
+    while (col < 100) : (col += 1) {
+        const bg = s.readCell(col, row).style.bg;
+        if (bg.eql(theme.search_match_current.bg) or bg.eql(theme.search_match.bg)) marked = true;
+    }
+    try std.testing.expect(marked);
+}
+
+test "footer: the context gauge is still visible on a narrow terminal" {
+    // The right group drops segments from the tail, so `ctx 87%` was the FIRST
+    // thing to disappear when the terminal got narrow — exactly when a long
+    // session most needed it. A compact copy now lives in the left group.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const saved_used = agent.ctx_used;
+    const saved_pct = agent.ctx_pct;
+    const saved_real = agent.ctx_real;
+    defer {
+        agent.ctx_used = saved_used;
+        agent.ctx_pct = saved_pct;
+        agent.ctx_real = saved_real;
+    }
+    agent.ctx_used = 20_000;
+    agent.ctx_pct = 87;
+    agent.ctx_real = true;
+
+    const s = try drawTest(&m, arena_state.allocator(), 60, 20);
+    var buf: [512]u8 = undefined;
+    var found = false;
+    var row: u16 = 0;
+    while (row < s.size.height) : (row += 1) {
+        if (std.mem.indexOf(u8, rowText(s, row, &buf), "ctx 87%") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "footer: live reasoning shows its growing char count while thinking" {
+    // A reasoning model used to look hung: the clock moved but nothing said
+    // that tokens were arriving. The count is an atomic so the worker can
+    // publish it without ever touching the paragraph tree.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.busy = true;
+    m.reason_live_chars.store(142, .seq_cst);
+    const s = try drawTest(&m, arena_state.allocator(), 100, 20);
+    var buf: [512]u8 = undefined;
+    var found = false;
+    var row: u16 = 0;
+    while (row < s.size.height) : (row += 1) {
+        if (std.mem.indexOf(u8, rowText(s, row, &buf), "◇ 142 chars") != null) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+
+    // Once text starts (or the turn ends) the indicator is cleared.
+    m.reason_live_chars.store(0, .seq_cst);
+    const s2 = try drawTest(&m, arena_state.allocator(), 100, 20);
+    var still = false;
+    row = 0;
+    while (row < s2.size.height) : (row += 1) {
+        if (std.mem.indexOf(u8, rowText(s2, row, &buf), "chars") != null) still = true;
+    }
+    try std.testing.expect(!still);
+}
+
+test "proof: the verdict line is styled by what was actually proven" {
+    // All three lines used to be pushed as `.info` with the same notice style,
+    // so "tested" and "NOT verified" looked identical in a long history. The
+    // words were honest but the visual hierarchy was not.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const cases = [_]struct {
+        text: []const u8,
+        proof: @import("lib/typecheck.zig").Kind,
+        want: vaxis.Style,
+    }{
+        .{ .text = "· tested zig build test and its tests passed.", .proof = .tests, .want = theme.ok },
+        .{ .text = "· typechecked zig build the code you just wrote.", .proof = .types, .want = theme.warn },
+        .{ .text = "· not checked the code you just wrote.", .proof = .nothing, .want = theme.err },
+    };
+    for (cases) |c| {
+        m.pushProof(c.text, c.proof);
+        const s = try drawTest(&m, arena_state.allocator(), 100, 24);
+        const row = findRow(s, c.text) orelse return error.TestExpectedEqual;
+        var styled = false;
+        var col: u16 = 0;
+        while (col < 100) : (col += 1) {
+            if (s.readCell(col, row).style.fg.eql(c.want.fg)) styled = true;
+        }
+        try std.testing.expect(styled);
+    }
+}
+
+test "permissions: PgDn reveals the rest of a long command without deciding for the user" {
+    // A long bash command was capped at 4-6 wrapped rows with no way to see the
+    // rest, so you could be asked to approve text you had never read. Scrolling
+    // is presentation-only: the answer still comes from answerPermission.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    @memcpy(m.perm_tool[0..4], "bash");
+    m.perm_tool_len = 4;
+    const detail = "echo " ++ repeat.rep("argument ", 38) ++ "TAIL_MARKER";
+    const n = @min(detail.len, m.perm_detail.len);
+    @memcpy(m.perm_detail[0..n], detail[0..n]);
+    m.perm_detail_len = n;
+    m.perm_active = true;
+
+    const before = allText(try drawTest(&m, arena_state.allocator(), 56, 18));
+    try std.testing.expect(std.mem.indexOf(u8, before, "more line(s)") != null);
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx = keyTestCtx(arena_state.allocator(), &threaded);
+    for (0..4) |_| {
+        try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.page_down } });
+    }
+
+    const after = allText(try drawTest(&m, arena_state.allocator(), 56, 18));
+    try std.testing.expect(std.mem.indexOf(u8, after, "TAIL_MARKER") != null);
+    try std.testing.expect(m.perm_active);
+    try std.testing.expect(m.perm_answer == .none);
+    m.perm_active = false;
+}
+
+test "input: Ctrl+S stashes and restores text and staged images" {
+    // Without a stash, switching to a quick follow-up meant either losing the
+    // draft or sending the staged image with the wrong message.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(arena);
+    defer m.deinit();
+
+    m.draft_images.images[0] = .{
+        .mime = "image/png",
+        .data_b64 = "AAAA",
+        .path = arena.dupe(u8, "clipboard.png") catch unreachable,
+    };
+    m.draft_images.len = 1;
+    m.draft_images.total_bytes = 4;
+    try m.ed.insert("important draft");
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx = keyTestCtx(arena, &threaded);
+    const save = vaxis.Key{ .codepoint = 's', .mods = .{ .ctrl = true } };
+
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = save });
+    try std.testing.expect(m.ed.isEmpty());
+    try std.testing.expect(m.draft_images.isEmpty());
+    try std.testing.expectEqualStrings("important draft", m.stashed_text.?);
+    try std.testing.expectEqual(@as(u8, 1), m.stashed_images.len);
+
+    // A different message can be typed while the old one is parked. Once the
+    // composer is empty again, the same key brings the old one back.
+    try m.ed.insert("temporary");
+    m.ed.clear();
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = save });
+    try std.testing.expectEqualStrings("important draft", m.ed.text());
+    try std.testing.expect(m.stashed_text == null);
+    try std.testing.expectEqual(@as(u8, 1), m.draft_images.len);
+    try std.testing.expectEqualStrings("clipboard.png", m.draft_images.images[0].path);
+}
+
+test "ask: number keys answer a choice directly while the panel is open" {
+    // With options open, digits are consumed by the panel instead of falling
+    // through into the composer, where they would become a new prompt while the
+    // worker stayed parked waiting for the answer.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(arena);
+    defer m.deinit();
+    try openAskForTest(&m, "which one?", "", &[_][]const u8{ "alpha", "beta", "gamma" });
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx = keyTestCtx(arena, &threaded);
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = '2' } });
+
+    m.askLock();
+    defer m.askUnlock();
+    try std.testing.expectEqualStrings("beta", m.ask_answer.?);
 }

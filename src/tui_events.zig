@@ -478,6 +478,22 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             // Permission dialog active: y/s/a/n decide, rest ignored.
             if (self.permActive()) {
                 const cp = key.codepoint;
+                // A long command is wrapped and capped in the dialog. Let the
+                // user read ALL of it before deciding — approving unseen text
+                // is not informed consent. These keys only move a presentation
+                // offset; the decision still goes through answerPermission.
+                if (key.matches(vaxis.Key.page_up, .{})) {
+                    self.perm_detail_scroll -|= 2;
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+                if (key.matches(vaxis.Key.page_down, .{})) {
+                    self.perm_detail_scroll = @min(self.perm_detail_scroll + 2, 64);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
                 if (cp == 'y' or cp == 'Y') {
                     self.answerPermission(.allow);
                 } else if (cp == 's' or cp == 'S') {

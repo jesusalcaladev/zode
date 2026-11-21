@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - rewind, claude commands, acp fork, append prompt, durable bg, stats (50) (ecosystem) [`361f91be`](https://github.com/jesusalcaladev/zode/commit/361f91be)
 - hook types, MCP resources/prompts + HTTP/SSE transport (50.2, 50.3) (ecosystem) [`31662b21`](https://github.com/jesusalcaladev/zode/commit/31662b21)
 - close remaining backlog - ACP images and facade tests (50.7, 51.3, 51.9) [`29a4c686`](https://github.com/jesusalcaladev/zode/commit/29a4c686)
-- make search, headings and the context gauge readable (tui) [`03752a08`](https://github.com/jesusalcaladev/zode/commit/03752a08)
+- make search, headings and the context gauge readable (tui) [`a57b4ef9`](https://github.com/jesusalcaladev/zode/commit/a57b4ef9)
+- live reasoning, honest proof line and readable permission dialog (tui) [`a8575200`](https://github.com/jesusalcaladev/zode/commit/a8575200)
 
 ### Bug Fixes
 
