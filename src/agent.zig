@@ -7087,20 +7087,20 @@ fn sendUserMessageCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Cal
 
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch {
         const msg = "send_user_message needs a JSON object with a `message`.";
-        m.pushToolDone("send_user_message", "malformed arguments", 0, msg);
+        m.pushToolDone("send_user_message", "malformed arguments", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "send_user_message", msg, arena, budget);
         return 1;
     };
     if (parsed != .object) {
         const msg = "send_user_message needs a JSON object with a `message`.";
-        m.pushToolDone("send_user_message", "malformed arguments", 0, msg);
+        m.pushToolDone("send_user_message", "malformed arguments", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "send_user_message", msg, arena, budget);
         return 1;
     }
 
     const msg = usermessage_mod.parse(arena, parsed.object) catch |err| {
         const text = tools_mod.describeError(arena, err, "send_user_message", call.args_json);
-        m.pushToolDone("send_user_message", "invalid message", 0, text);
+        m.pushToolDone("send_user_message", "invalid message", 0, text, false);
         capStoreAppendToolResult(m, s, call.id, "send_user_message", text, arena, budget);
         return 1;
     };
@@ -7108,7 +7108,7 @@ fn sendUserMessageCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Cal
     // Every attachment path must exist BEFORE anything is rendered.
     if (usermessage_mod.missingAttachment(io_global, msg)) |bad| {
         const text = usermessage_mod.missingAttachmentText(arena, bad) catch "an attachment path does not exist.";
-        m.pushToolDone("send_user_message", "attachment not found", 0, text);
+        m.pushToolDone("send_user_message", "attachment not found", 0, text, false);
         capStoreAppendToolResult(m, s, call.id, "send_user_message", text, arena, budget);
         return 1;
     }
@@ -7141,7 +7141,7 @@ fn sendUserMessageCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Cal
     }
 
     const ack = std.fmt.allocPrint(arena, "message delivered to the user ({s})", .{msg.status.name()}) catch "message delivered";
-    m.pushToolDone("send_user_message", "delivered", 0, ack);
+    m.pushToolDone("send_user_message", "delivered", 0, ack, true);
     capStoreAppendToolResult(m, s, call.id, "send_user_message", ack, arena, budget);
     return 1;
 }
@@ -7206,7 +7206,7 @@ fn scheduleCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _are
 }
 
 fn schedReply(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: std.mem.Allocator, budget: *ResultBudget, text: []const u8, summary: []const u8) usize {
-    m.pushToolDone("schedule", summary, 0, text);
+    m.pushToolDone("schedule", summary, 0, text, null);
     capStoreAppendToolResult(m, s, call.id, "schedule", text, arena, budget);
     return 1;
 }
@@ -7421,7 +7421,7 @@ fn worktreeCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _are
 }
 
 fn wtReply(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: std.mem.Allocator, budget: *ResultBudget, text: []const u8, summary: []const u8) usize {
-    m.pushToolDone("worktree", summary, 0, text);
+    m.pushToolDone("worktree", summary, 0, text, null);
     capStoreAppendToolResult(m, s, call.id, "worktree", text, arena, budget);
     return 1;
 }
@@ -7440,45 +7440,45 @@ fn configCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
 
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch {
         const msg = "config needs operation=get|set and a key. Example: {\"operation\":\"get\",\"key\":\"model\"}.";
-        m.pushToolDone("config", "malformed arguments", 0, msg);
+        m.pushToolDone("config", "malformed arguments", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     };
     if (parsed != .object) {
         const msg = "config needs a JSON object with operation and key.";
-        m.pushToolDone("config", "malformed arguments", 0, msg);
+        m.pushToolDone("config", "malformed arguments", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     }
     const obj = parsed.object;
     const op_v = obj.get("operation") orelse {
         const msg = "config needs operation=get|set.";
-        m.pushToolDone("config", "missing operation", 0, msg);
+        m.pushToolDone("config", "missing operation", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     };
     if (op_v != .string) {
         const msg = "operation must be the string \"get\" or \"set\".";
-        m.pushToolDone("config", "bad operation", 0, msg);
+        m.pushToolDone("config", "bad operation", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     }
     const is_set = std.ascii.eqlIgnoreCase(op_v.string, "set");
     if (!is_set and !std.ascii.eqlIgnoreCase(op_v.string, "get")) {
         const msg = "operation must be get or set.";
-        m.pushToolDone("config", "bad operation", 0, msg);
+        m.pushToolDone("config", "bad operation", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     }
     const key_v = obj.get("key") orelse {
         const msg = "config needs a key.";
-        m.pushToolDone("config", "missing key", 0, msg);
+        m.pushToolDone("config", "missing key", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     };
     if (key_v != .string) {
         const msg = "key must be a string.";
-        m.pushToolDone("config", "bad key", 0, msg);
+        m.pushToolDone("config", "bad key", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     }
@@ -7486,7 +7486,7 @@ fn configCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
     // Whitelist first: an unknown key is refused WITH the list of known ones.
     const key = configkeys_mod.fromName(key_v.string) orelse {
         const msg = configkeys_mod.unknownKeyText(arena, key_v.string) catch "unknown config key";
-        m.pushToolDone("config", "unknown key", 0, msg);
+        m.pushToolDone("config", "unknown key", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     };
@@ -7495,7 +7495,7 @@ fn configCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
     // whitelist today; this keeps the invariant explicit if one is added.)
     if (key.isSecret()) {
         const msg = configkeys_mod.secretPresenceText(arena, key.name(), false) catch "value never shown";
-        m.pushToolDone("config", "value masked", 0, msg);
+        m.pushToolDone("config", "value masked", 0, msg, true);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     }
@@ -7505,7 +7505,7 @@ fn configCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
         const value = commands_mod.settingsValue(m, cs);
         defer m.allocator.free(value);
         const msg = std.fmt.allocPrint(arena, "{s}: {s}", .{ key.name(), value }) catch key.name();
-        m.pushToolDone("config", "get", 0, msg);
+        m.pushToolDone("config", "get", 0, msg, true);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     }
@@ -7513,7 +7513,7 @@ fn configCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
     // set: validate the value first (cheap, before any dialog or write).
     const value_v = obj.get("value") orelse {
         const msg = "config set needs a `value`.";
-        m.pushToolDone("config", "missing value", 0, msg);
+        m.pushToolDone("config", "missing value", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     };
@@ -7522,7 +7522,7 @@ fn configCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
             key.name(),
             if (key.values()) |vs| std.fmt.allocPrint(arena, "Accepted: {s}", .{std.mem.join(arena, ", ", vs) catch ""}) catch "" else "any non-empty value",
         }) catch "invalid value";
-        m.pushToolDone("config", "invalid value", 0, msg);
+        m.pushToolDone("config", "invalid value", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     }
@@ -7532,7 +7532,7 @@ fn configCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
     const subject = configkeys_mod.permitSubject(key, &subj_buf) orelse "Config";
     if (read_only) {
         const msg = "PLAN MODE is on: config set is a write and did not run. End the plan for approval first.";
-        m.pushToolDone("config", "refused (plan mode)", 0, msg);
+        m.pushToolDone("config", "refused (plan mode)", 0, msg, false);
         capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
         return 1;
     }
@@ -7546,7 +7546,7 @@ fn configCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
             .allow => {},
             else => {
                 const msg = "denied: permission required to change this setting.";
-                m.pushToolDone("config", "denied", 0, msg);
+                m.pushToolDone("config", "denied", 0, msg, false);
                 capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
                 return 1;
             },
@@ -7558,7 +7558,7 @@ fn configCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
     commands_mod.applySettingValue(m, configmenuToSetting(key), value_v.string);
     commands_mod.persistSettings(m);
     const msg = std.fmt.allocPrint(arena, "{s} set to '{s}' (saved to config.json)", .{ key.name(), value_v.string }) catch "setting changed";
-    m.pushToolDone("config", "set", 0, msg);
+    m.pushToolDone("config", "set", 0, msg, true);
     capStoreAppendToolResult(m, s, call.id, "config", msg, arena, budget);
     return 1;
 }
@@ -7625,7 +7625,7 @@ fn advisorCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _aren
     };
     var rep = subagent_mod.Report{};
     const text = runSubagent(m, task, &rep);
-    m.pushToolDone("advisor", "advice", 0, text);
+    m.pushToolDone("advisor", "advice", 0, text, true);
     capStoreAppendToolResult(m, s, call.id, "advisor", text, arena, budget);
     return 1;
 }
@@ -7644,7 +7644,7 @@ fn reviewCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
         const none =
             "Nothing to review: you have not changed a file this turn, so there is no " ++
             "diff of yours to read.";
-        m.pushToolDone("review", "nothing to review", 0, none);
+        m.pushToolDone("review", "nothing to review", 0, none, true);
         capStoreAppendToolResult(m, s, call.id, "review", none, arena, budget);
         return 1;
     }
@@ -7665,7 +7665,7 @@ fn reviewCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
             "could not read the diff ({t}). If this is not a git repository there is nothing to review with, and the harness cannot require it.",
             .{err},
         ) catch "could not read the diff";
-        m.pushToolDone("review", "no diff", 0, msg);
+        m.pushToolDone("review", "no diff", 0, msg, true);
         capStoreAppendToolResult(m, s, call.id, "review", msg, arena, budget);
         return 1;
     };
@@ -7676,7 +7676,7 @@ fn reviewCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
         // be produced, and the model is told why in one sentence.
         m.auto_check.gate.reviewable = false;
         const msg = review_mod.notARepoText;
-        m.pushToolDone("review", "not a git repository", 0, msg);
+        m.pushToolDone("review", "not a git repository", 0, msg, true);
         capStoreAppendToolResult(m, s, call.id, "review", msg, arena, budget);
         return 1;
     }
@@ -7709,7 +7709,7 @@ fn reviewCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
     m.pushToolDone("review", std.fmt.allocPrint(arena, "{d} file(s), ~{d} KB", .{
         turn_stats.files.items.len,
         r.stdout.len / 1024,
-    }) catch "your own diff", 0, text);
+    }) catch "your own diff", 0, text, null);
     capStoreAppendToolResult(m, s, call.id, "review", text, arena, budget);
     return 1;
 }
@@ -7724,7 +7724,7 @@ fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
     const gpa = m.allocator;
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch {
         const bad = "The `memory` call needs {\"operation\": \"search|list|get|pending|approve|propose\", ...}.";
-        m.pushToolDone("memory", "malformed arguments", 0, bad);
+        m.pushToolDone("memory", "malformed arguments", 0, bad, false);
         capStoreAppendToolResult(m, s, call.id, "memory", bad, arena, budget);
         return 1;
     };
@@ -7875,7 +7875,7 @@ fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
         } else {
             var s2 = memory_store.Store.resolveForProject(gpa, io_global, cwd, repo_root, true) catch {
                 out = @constCast("Could not resolve the project memory store for this repository.");
-                m.pushToolDone("memory", "store unavailable", 0, out);
+                m.pushToolDone("memory", "store unavailable", 0, out, true);
                 capStoreAppendToolResult(m, s, call.id, "memory", out, arena, budget);
                 return 1;
             };
@@ -7888,7 +7888,7 @@ fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
             };
             s2.savePending(use_id, use_title, tags, "proposed by agent; user approval required", body) catch {
                 out = @constCast("Could not save the memory proposal.");
-                m.pushToolDone("memory", "save failed", 0, out);
+                m.pushToolDone("memory", "save failed", 0, out, false);
                 capStoreAppendToolResult(m, s, call.id, "memory", out, arena, budget);
                 return 1;
             };
@@ -7914,7 +7914,7 @@ fn memoryCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena
     }
 
     const summary = std.fmt.allocPrint(arena, "memory({s})", .{op}) catch "memory";
-    m.pushToolDone("memory", summary, 0, out);
+    m.pushToolDone("memory", summary, 0, out, null);
     capStoreAppendToolResult(m, s, call.id, "memory", out, arena, budget);
     return 1;
 }
@@ -7933,14 +7933,14 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: s
             \\Do not retry the same call. Either ask again properly with one question, or,
             \\if you already know enough, just continue.
         ;
-        m.pushToolDone("ask", "malformed question", 0, bad);
+        m.pushToolDone("ask", "malformed question", 0, bad, false);
         capStoreAppendToolResult(m, s, call.id, "ask", bad, arena, budget);
         return 1;
     };
 
     if (m.asks_this_turn >= max_asks_per_turn) {
         m.pushInfoFmt("the model wanted to ask a 4th question this turn: not showing it (the cap is {d}). It will decide on its own.", .{max_asks_per_turn});
-        m.pushToolDone("ask", "refused (too many questions this turn)", 0, ask.declined_text);
+        m.pushToolDone("ask", "refused (too many questions this turn)", 0, ask.declined_text, false);
         capStoreAppendToolResult(m, s, call.id, "ask", ask.declined_text, arena, budget);
         return 1;
     }
@@ -7990,7 +7990,7 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: s
             },
             .ask => unreachable,
         };
-        m.pushToolDone("ask", sum, 0, res);
+        m.pushToolDone("ask", sum, 0, res, null);
         capStoreAppendToolResult(m, s, call.id, "ask", res, arena, budget);
         return 1;
     }
@@ -8025,7 +8025,7 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: s
     }
     if (answer) |a| m.allocator.free(a);
 
-    m.pushToolDone("ask", sum, 0, res);
+    m.pushToolDone("ask", sum, 0, res, null);
     capStoreAppendToolResult(m, s, call.id, "ask", res, arena, budget);
     return 1;
 }
@@ -8117,7 +8117,7 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena:
 
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, call.args_json, .{}) catch {
         const bad = "The `skill` call needs {\"name\": \"...\"}. No such skill was loaded; continue without it.";
-        m.pushToolDone("skill", "malformed arguments", 0, bad);
+        m.pushToolDone("skill", "malformed arguments", 0, bad, false);
         capStoreAppendToolResult(m, s, call.id, "skill", bad, arena, budget);
         return 1;
     };
@@ -8135,7 +8135,7 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena:
     const entries = discoverSkills(m.allocator, m.environ);
     if (entries.len == 0) {
         const none = "This zode has no skills installed (look in .zode/skills/ or ~/.config/zode/skills/). Continue without one.";
-        m.pushToolDone("skill", "no skills installed", 0, none);
+        m.pushToolDone("skill", "no skills installed", 0, none, true);
         capStoreAppendToolResult(m, s, call.id, "skill", none, arena, budget);
         return 1;
     }
@@ -8158,7 +8158,7 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena:
         }
         w.writeAll(". Call one of those, or continue without a skill.") catch {};
         const unknown = w.buffered();
-        m.pushToolDone("skill", "unknown skill", 0, unknown);
+        m.pushToolDone("skill", "unknown skill", 0, unknown, false);
         capStoreAppendToolResult(m, s, call.id, "skill", unknown, arena, budget);
         return 1;
     };
@@ -8167,7 +8167,7 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena:
     var body: [skills.max_inline + 1024]u8 = undefined;
     const text = loader.loadWithArgs(entry, args, &body) orelse {
         const bad = std.fmt.allocPrint(arena, "the skill \"{s}\" could not be read ({s}). Continue without it.", .{ entry.name, entry.path }) catch "the skill could not be read";
-        m.pushToolDone("skill", "unreadable", 0, bad);
+        m.pushToolDone("skill", "unreadable", 0, bad, true);
         capStoreAppendToolResult(m, s, call.id, "skill", bad, arena, budget);
         return 1;
     };
@@ -8188,7 +8188,7 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena:
             .effort = entry.effort,
         };
         const report = runSubagent(m, task, &rep);
-        m.pushToolDone("skill", entry.name, 0, report);
+        m.pushToolDone("skill", entry.name, 0, report, null);
         capStoreAppendToolResult(m, s, call.id, "skill", report, arena, budget);
         return 1;
     }
@@ -8197,7 +8197,7 @@ fn skillCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena:
     // permissions) and substitute its output inline. On any failure fall back to
     // the unexpanded body so a `!cmd` never breaks a skill that otherwise loads.
     const final_text = expandSkillCommands(text, io_global, arena) catch text;
-    m.pushToolDone("skill", entry.name, 0, final_text);
+    m.pushToolDone("skill", entry.name, 0, final_text, null);
     capStoreAppendToolResult(m, s, call.id, "skill", final_text, arena, budget);
     return 1;
 }
@@ -8604,13 +8604,13 @@ fn runTaskBatch(
             // The malformed-args message: it is the ONE case where the model has
             // to be told what to do differently, and the serial path has always
             // said it.
-            m.pushToolDone(call.name, "malformed arguments", 0, subagentBadArgsText);
+            m.pushToolDone(call.name, "malformed arguments", 0, subagentBadArgsText, null);
             capStoreAppendToolResult(m, s, call.id, call.name, subagentBadArgsText, arena, budget);
             continue;
         }
         ok += 1;
         turn_stats.noteTool();
-        m.pushToolDone(call.name, "report", 0, r.text);
+        m.pushToolDone(call.name, "report", 0, r.text, null);
         capStoreAppendToolResult(m, s, call.id, call.name, r.text, arena, budget);
         if (r.text.len > 0) m.allocator.free(r.text);
     }
@@ -8735,7 +8735,7 @@ fn startBackgroundSubagentTask(m: *tui.Model, task: subagent_mod.Task, msg_arena
 
 fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: std.mem.Allocator, budget: *ResultBudget) usize {
     var task = subagent_mod.parseTask(arena, call.args_json) catch {
-        m.pushToolDone("task", "malformed arguments", 0, subagentBadArgsText);
+        m.pushToolDone("task", "malformed arguments", 0, subagentBadArgsText, false);
         capStoreAppendToolResult(m, s, call.id, "task", subagentBadArgsText, arena, budget);
         return 1;
     };
@@ -8758,7 +8758,7 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
         const defs = ensureAgentDefs(m.allocator, io_global, m.environ);
         if (agentdefs.find(defs, task.definition)) |def| {
             if (!agentdefs.toolsAreReadOnly(def.tools)) {
-                m.pushToolDone("task", "definition not accepted", 0, "agent definition names tools outside the read-only set");
+                m.pushToolDone("task", "definition not accepted", 0, "agent definition names tools outside the read-only set", true);
                 capStoreAppendToolResult(m, s, call.id, "task", "agent definition names tools outside the read-only set", arena, budget);
                 return 1;
             }
@@ -8788,14 +8788,14 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
     if (task.name.len > 0) {
         if (!m.team.active()) {
             const msg = "this task names a teammate but there is no team. Call team_create first.";
-            m.pushToolDone("task", "no team", 0, msg);
+            m.pushToolDone("task", "no team", 0, msg, true);
             capStoreAppendToolResult(m, s, call.id, "task", msg, arena, budget);
             return 1;
         }
         if (!m.team.has(task.name)) {
             m.team.add(task.name, false) catch {
                 const msg = "cannot register teammate (team full or invalid name).";
-                m.pushToolDone("task", "teammate not added", 0, msg);
+                m.pushToolDone("task", "teammate not added", 0, msg, true);
                 capStoreAppendToolResult(m, s, call.id, "task", msg, arena, budget);
                 return 1;
             };
@@ -8817,7 +8817,7 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
     // immediately; the report is delivered as a harness notification when done.
     if (task.run_in_background) {
         if (startBackgroundSubagentTask(m, task, arena)) |msg| {
-            m.pushToolDone("task", "started in background", 0, msg);
+            m.pushToolDone("task", "started in background", 0, msg, true);
             capStoreAppendToolResult(m, s, call.id, "task", msg, arena, budget);
             return 1;
         }
@@ -8829,7 +8829,7 @@ fn taskCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, arena: s
     // Phase 32.1: a verify-role report feeds the three-way count pill. The
     // protocol lines are parsed by the TUI; no icons, refuted hidden at zero.
     if (std.mem.eql(u8, task.role, "verify")) m.setVerifyReport(text);
-    m.pushToolDone("task", "report", 0, text);
+    m.pushToolDone("task", "report", 0, text, true);
     capStoreAppendToolResult(m, s, call.id, "task", text, arena, budget);
     return 1;
 }
@@ -9675,9 +9675,9 @@ fn execOneCall(
             _ = p;
             m_.pushToolStart(name, label);
         }
-        fn pushToolDoneFn(p: *anyopaque, m_: *tui.Model, name: []const u8, summary: []const u8, ms: u64, text: []const u8) void {
+        fn pushToolDoneFn(p: *anyopaque, m_: *tui.Model, name: []const u8, summary: []const u8, ms: u64, text: []const u8, ok: ?bool) void {
             _ = p;
-            m_.pushToolDone(name, summary, ms, text);
+            m_.pushToolDone(name, summary, ms, text, ok);
         }
         fn permAutoAllowedFn(p: *anyopaque, name: []const u8, arg: []const u8, args_json: []const u8, a: std.mem.Allocator) bool {
             _ = p;

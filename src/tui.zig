@@ -6252,6 +6252,7 @@ pub const Model = struct {
         summary: []const u8,
         ms: u64,
         result: []const u8,
+        ok: ?bool,
     ) void {
         var line_buf: [256]u8 = undefined;
         var head_buf: [180]u8 = undefined;
@@ -6281,28 +6282,35 @@ pub const Model = struct {
             }
             break :blk head_buf[0..n];
         };
-        // Clear failure marker for tool outputs (presentation only). Never hide
-        // errors: collapsed summaries still show this text and ^R expands details.
+        // The ✗ marker is presentation only; the verdict comes from the tool
+        // result (`ok`), never from sniffing the rendered summary. `null` is
+        // the legacy fallback for callers that have no structured verdict.
         var fail_head_buf: [184]u8 = undefined;
         const display_head: []const u8 = blk: {
             const s = std.mem.trimStart(u8, head, " \t");
             if (s.len == 0) break :blk head;
             // UTF-8 ✗ is 3 bytes; also accept ASCII markers.
             if (std.mem.startsWith(u8, s, "\xe2\x9c\x97") or std.mem.startsWith(u8, s, "!")) break :blk head;
-            const prefixes = [_][]const u8{ "error", "denied", "refused", "failed", "panic", "aborted", "killed" };
-            for (prefixes) |pfx| {
-                if (s.len >= pfx.len and std.ascii.eqlIgnoreCase(s[0..pfx.len], pfx)) {
-                    const boundary = if (s.len == pfx.len)
-                        true
-                    else blk_b: {
-                        const c = s[pfx.len];
-                        break :blk_b (c == ':' or c == ' ' or c == ',' or c == '!' or c == '.');
-                    };
-                    if (boundary) {
-                        break :blk std.mem.print(&fail_head_buf, "\xe2\x9c\x97 {s}", .{head}) catch head;
+            if (ok == true) break :blk head;
+            var failed = ok == false;
+            if (!failed) {
+                const prefixes = [_][]const u8{ "error", "denied", "refused", "failed", "panic", "aborted", "killed" };
+                for (prefixes) |pfx| {
+                    if (s.len >= pfx.len and std.ascii.eqlIgnoreCase(s[0..pfx.len], pfx)) {
+                        const boundary = if (s.len == pfx.len)
+                            true
+                        else blk_b: {
+                            const c = s[pfx.len];
+                            break :blk_b (c == ':' or c == ' ' or c == ',' or c == '!' or c == '.');
+                        };
+                        if (boundary) {
+                            failed = true;
+                            break;
+                        }
                     }
                 }
             }
+            if (failed) break :blk std.mem.print(&fail_head_buf, "\xe2\x9c\x97 {s}", .{head}) catch head;
             break :blk head;
         };
         // Marked summary and dim time: you read "what happened" and then "how

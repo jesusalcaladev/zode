@@ -274,7 +274,7 @@ test "render: tool blocks use ●/│ and the result expands" {
     defer m.deinit();
 
     m.pushToolStart("read", "src/tui.zig");
-    m.pushToolDone("read", "Read 1006 lines", 3, "1|const std\n2|fn main()");
+    m.pushToolDone("read", "Read 1006 lines", 3, "1|const std\n2|fn main()", null);
 
     // Collapsed state: two paragraphs, header and summary.
     //
@@ -877,7 +877,7 @@ test "scroll: toggling a tool result while scrolled up does not jump to the bott
     m.pushToolStart("read", "big.txt");
     var big: [4096]u8 = undefined;
     @memset(&big, 'x');
-    m.pushToolDone("read", "Read 200 lines", 3, big[0..]);
+    m.pushToolDone("read", "Read 200 lines", 3, big[0..], null);
 
     _ = try drawTest(&m, arena_state.allocator(), 60, 18);
     m.scrollBy(12);
@@ -907,7 +907,7 @@ test "scroll: collapsing an expanded tool result keeps the viewport stable" {
     for (&big, 0..) |*c, j| {
         if (j % 40 == 39) c.* = '\n';
     }
-    m.pushToolDone("read", "Read many lines", 3, big[0..]);
+    m.pushToolDone("read", "Read many lines", 3, big[0..], null);
     // Trailing content keeps the expanded tool result away from the bottom so
     // we can anchor inside it without computeVisible snapping to follow mode.
     var k: usize = 0;
@@ -945,7 +945,7 @@ test "tool events: start/result timeline lines are normalized for presentation" 
     defer m.deinit();
 
     m.pushToolStart("bash", "echo one\necho two\tthree");
-    m.pushToolDone("bash", "ok\nline2", 12, "ok\nline2");
+    m.pushToolDone("bash", "ok\nline2", 12, "ok\nline2", null);
 
     const s = try drawTest(&m, arena_state.allocator(), 100, 20);
     const all = allText(s);
@@ -996,7 +996,7 @@ test "input: large tool result + running tool + draw does not crash" {
     }
 
     m.pushToolStart("read", "AGENTS.md");
-    m.pushToolDone("read", "Read 2002 lines", 3, big_result.items);
+    m.pushToolDone("read", "Read 2002 lines", 3, big_result.items, null);
 
     // 2) Start a running tool with a long argument (like the bash that followed)
     m.pushToolStart("bash", "zig build test --summary all && ls -la src/lib && cat build.zig");
@@ -1011,7 +1011,7 @@ test "input: large tool result + running tool + draw does not crash" {
 
     // 4) End the tool and draw again
     m.toolRunEnd();
-    m.pushToolDone("bash", "Bash", 1200, "Compiling...\nTests passed\n");
+    m.pushToolDone("bash", "Bash", 1200, "Compiling...\nTests passed\n", null);
 
     // 5) Final draw after tool completes
     const s = try drawTest(&m, arena_state.allocator(), 80, 30);
@@ -1300,7 +1300,7 @@ test "diff: pushDiff paints -/+ lines after the tool result" {
     defer m.deinit();
 
     m.pushToolStart("edit", "src/demo.txt");
-    m.pushToolDone("edit", "Edited 3 lines", 2, "ok");
+    m.pushToolDone("edit", "Edited 3 lines", 2, "ok", null);
     const counts = m.pushDiff("uno\ndos\ntres\n", "uno\nDOS\ntres\ncuatro\n");
     // What was already counted before and thrown away: now it is shown (`+2 −1`).
     try std.testing.expectEqual(@as(usize, 2), counts.added);
@@ -1748,8 +1748,8 @@ test "per-call collapse: a non-last tool result expands independently" {
     agent.setAnswering("");
     defer m.deinit();
 
-    m.pushToolDone("Read", "Read a file", 3, "FULL RESULT OF THE FIRST TOOL");
-    m.pushToolDone("Write", "Write a file", 4, "FULL RESULT OF THE SECOND TOOL");
+    m.pushToolDone("Read", "Read a file", 3, "FULL RESULT OF THE FIRST TOOL", null);
+    m.pushToolDone("Write", "Write a file", 4, "FULL RESULT OF THE SECOND TOOL", null);
     _ = try drawTest(&m, arena_state.allocator(), 100, 24);
     try std.testing.expect(m.tool_memos.items.len >= 2);
 
@@ -2022,7 +2022,7 @@ test "the tool clock takes the lock, so a fast tool cannot free it under the rea
     try std.testing.expectEqual(@as(u64, 0), m.toolRunMillis());
 
     // Ended: nothing to time, and reading it must not touch freed memory.
-    m.pushToolDone("bash", "done", 1, "x");
+    m.pushToolDone("bash", "done", 1, "x", null);
     try std.testing.expectEqual(@as(u64, 0), m.toolRunMillis());
     // And again, after the tool is long gone: the function has to be callable.
     try std.testing.expectEqual(@as(u64, 0), m.toolRunMillis());
@@ -2051,7 +2051,7 @@ test "with an Io attached, the tool clock advances while it runs" {
     // Clamped: never negative, and never earlier than the start.
     try std.testing.expect(ms < 10_000);
 
-    m.pushToolDone("bash", "done", ms, "x");
+    m.pushToolDone("bash", "done", ms, "x", null);
     try std.testing.expectEqual(@as(u64, 0), m.toolRunMillis());
 }
 
@@ -3890,7 +3890,7 @@ test "streamEnd empties pending BEFORE setting the paragraph (else the text land
     defer m.deinit();
 
     m.pushToolStart("bash", "sleep 3");
-    m.pushToolDone("bash", "exit=0", 3001, "");
+    m.pushToolDone("bash", "exit=0", 3001, "", null);
 
     m.streamStart();
     m.streamDelta("antes");
@@ -3976,7 +3976,7 @@ test "a running tool clock appears only in the activity strip" {
     }
 
     // When it finishes: the line goes away and leaves its spot to the result.
-    m.pushToolDone("bash", "ok", 30_000, "");
+    m.pushToolDone("bash", "ok", 30_000, "", null);
     try std.testing.expect(!m.isBusy());
     const s2 = try drawTest(&m, arena_state.allocator(), 92, 26);
     const all2 = allText(s2);
@@ -4211,7 +4211,7 @@ test "a long diff collapses into a preview, and Ctrl+R swaps it for the whole th
     }
 
     m.pushToolStart("write", "src/demo.txt");
-    m.pushToolDone("write", "wrote 60 lines", 7, "wrote 60 lines");
+    m.pushToolDone("write", "wrote 60 lines", 7, "wrote 60 lines", null);
     const counts = m.pushDiff(before[0..nb], after[0..na]);
     try std.testing.expect(counts.added == 60 and counts.removed == 60);
     m.drainPending();
@@ -4261,7 +4261,7 @@ test "a short diff is shown WHOLE, and Ctrl+R then opens the tool result" {
     defer m.deinit();
 
     m.pushToolStart("edit", "src/demo.txt");
-    m.pushToolDone("edit", "Edited 1 line", 2, "the full result of the edit");
+    m.pushToolDone("edit", "Edited 1 line", 2, "the full result of the edit", null);
     _ = m.pushDiff("uno\ndos\n", "uno\nDOS\n");
     m.drainPending();
 
@@ -4313,7 +4313,7 @@ test "Ctrl+R on a paragraph that went COLD rehydrates it instead of corrupting i
     }
 
     m.pushToolStart("write", "src/demo.txt");
-    m.pushToolDone("write", "wrote 80 lines", 5, "wrote 80 lines");
+    m.pushToolDone("write", "wrote 80 lines", 5, "wrote 80 lines", null);
     _ = m.pushDiff(before[0..nb], after[0..na]);
     m.drainPending();
 
@@ -6250,7 +6250,7 @@ test "no painted cell carries a grapheme with an absurd length" {
     const many = &repeat.rep("    if x_ == 42 { return \"y\"; } else { print z_ + 1; }\n", 480);
     _ = m.pushDiff(&repeat.rep("old\n", 480), many);
     m.pushToolStart("write", "minilang.py");
-    m.pushToolDone("write", "minilang.py", 120, many);
+    m.pushToolDone("write", "minilang.py", 120, many, null);
     m.pushKind(.assistant, many);
     m.pushKind(.tool_res, many);
     m.streaming = true;
@@ -7673,4 +7673,23 @@ test "input: Ctrl+/ opens a searchable history picker and loads the chosen promp
 
     try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter } });
     try std.testing.expectEqualStrings("first remembered prompt", m.ed.text());
+}
+
+test "tool summary: the failure marker comes from the structured verdict" {
+    // The old renderer sniffed "error"/"failed" out of the summary text, so a
+    // file named error.log was marked failed and a custom failure wording was
+    // marked successful. The verdict is now passed explicitly.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.pushToolDone("Read", "error.log contents", 3, "body", true);
+    const ok_text = allText(try drawTest(&m, arena_state.allocator(), 100, 20));
+    try std.testing.expect(std.mem.indexOf(u8, ok_text, "error.log contents") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ok_text, "✗") == null);
+
+    m.pushToolDone("Bash", "custom wording", 5, "body", false);
+    const bad_text = allText(try drawTest(&m, arena_state.allocator(), 100, 20));
+    try std.testing.expect(std.mem.indexOf(u8, bad_text, "✗ custom wording") != null);
 }

@@ -136,14 +136,14 @@ pub fn runParallelBatch(
     for (results, 0..) |r, k| {
         const call = t.calls.items[from + k];
         if (r.text.len == 0 and r.err) {
-            m.pushToolDone(call.name, "failed", r.ms, "the parallel search failed");
+            m.pushToolDone(call.name, "failed", r.ms, "the parallel search failed", false);
             s.appendToolResult(call.id, call.name, "the parallel search failed") catch {};
             continue;
         }
         ok += 1;
         ops.noteTool(ops.ctx);
         const summary = ops.toolResultSummary(ops.ctx, call.name, r.text, arena);
-        m.pushToolDone(call.name, summary, r.ms, r.text);
+        m.pushToolDone(call.name, summary, r.ms, r.text, !r.err);
         ops.capStoreAppendToolResult(ops.ctx, call.id, call.name, r.text, arena, budget);
         if (!r.err) m.allocator.free(r.text);
     }
@@ -394,7 +394,7 @@ pub const ExecOneOps = struct {
     toolResultSummary: *const fn (*anyopaque, []const u8, []const u8, std.mem.Allocator) []const u8,
     setStatusTooling: *const fn (*anyopaque, *tui.Model, []const u8) void,
     pushToolStart: *const fn (*anyopaque, *tui.Model, []const u8, []const u8) void,
-    pushToolDone: *const fn (*anyopaque, *tui.Model, []const u8, []const u8, u64, []const u8) void,
+    pushToolDone: *const fn (*anyopaque, *tui.Model, []const u8, []const u8, u64, []const u8, ?bool) void,
     permAutoAllowed: *const fn (*anyopaque, []const u8, []const u8, []const u8, std.mem.Allocator) bool,
     permNeedsDialog: *const fn (*anyopaque, []const []const u8) bool,
     rememberAlwaysAllow: *const fn (*anyopaque, *tui.Model, []const u8, []const u8, []const u8, []const []const u8, std.mem.Allocator) void,
@@ -458,7 +458,7 @@ pub fn execOneCall(
         switch (tool_exec_policy.checkBashForbidden(call.args_json, arena)) {
             .ok => {},
             .forbidden => |msg| {
-                ops.pushToolDone(ops.ctx, m, call.name, "refused: interactive command", 0, msg);
+                ops.pushToolDone(ops.ctx, m, call.name, "refused: interactive command", 0, msg, false);
                 capStoreAppendToolResult(s, state.io, call.id, call.name, msg, arena, budget);
                 return 0;
             },
@@ -468,7 +468,7 @@ pub fn execOneCall(
     const reads_only = tool_exec_policy.callReadsOnly(call.name, call.args_json, arena);
     if (tool_exec_policy.shouldBlockReadOnly(state.read_only, call.name, call.args_json, arena)) {
         m.plan_write_blocked_this_turn = true;
-        ops.pushToolDone(ops.ctx, m, call.name, "blocked by plan mode", 0, tool_exec_policy.read_only_text);
+        ops.pushToolDone(ops.ctx, m, call.name, "blocked by plan mode", 0, tool_exec_policy.read_only_text, false);
         capStoreAppendToolResult(s, state.io, call.id, call.name, tool_exec_policy.read_only_text, arena, budget);
         return 0;
     }
@@ -477,7 +477,7 @@ pub fn execOneCall(
     const rule_decision = permDecisionWithPolicy(state.perm_rules, call.name, subjects);
     const rp = tool_exec_preflight.rulePreflight(rule_decision, arena);
     if (rp.denied_msg) |msg| {
-        ops.pushToolDone(ops.ctx, m, call.name, "refused by a rule", 0, msg);
+        ops.pushToolDone(ops.ctx, m, call.name, "refused by a rule", 0, msg, false);
         capStoreAppendToolResult(s, state.io, call.id, call.name, msg, arena, budget);
         return 0;
     }
@@ -505,7 +505,7 @@ pub fn execOneCall(
                     denied.* += 1;
                     ops.noteDenied(ops.ctx);
                     const msg = pathsafe.refusalText(arena, v);
-                    ops.pushToolDone(ops.ctx, m, call.name, "refused: sensitive path", 0, msg);
+                    ops.pushToolDone(ops.ctx, m, call.name, "refused: sensitive path", 0, msg, false);
                     capStoreAppendToolResult(s, state.io, call.id, call.name, msg, arena, budget);
                     return 0;
                 },
@@ -554,7 +554,7 @@ pub fn execOneCall(
             .deny, .none => {
                 denied.* += 1;
                 ops.noteDenied(ops.ctx);
-                ops.pushToolDone(ops.ctx, m, call.name, "denied: permission required", 0, "denied");
+                ops.pushToolDone(ops.ctx, m, call.name, "denied: permission required", 0, "denied", false);
                 capStoreAppendToolResult(s, state.io, call.id, call.name, "denied: permission required", arena, budget);
                 return 0;
             },
@@ -594,7 +594,7 @@ pub fn execOneCall(
         if (hooks_mod.blockedReason(m.allocator, hook_res, .PreToolUse) catch null) |reason| {
             defer m.allocator.free(reason);
             const ms = elapsedMs(state.io, call_t0);
-            ops.pushToolDone(ops.ctx, m, call.name, "blocked by hook", ms, reason);
+            ops.pushToolDone(ops.ctx, m, call.name, "blocked by hook", ms, reason, false);
             capStoreAppendToolResult(s, state.io, call.id, call.name, reason, arena, budget);
             return 0;
         }
@@ -604,7 +604,7 @@ pub fn execOneCall(
     var res = tools_mod.executeTeam(state.io, call.name, exec_args, arena, &m.bg, &m.reads, &m.tasks, state.perm_rules, &m.team) catch |err| {
         const ms = elapsedMs(state.io, call_t0);
         const emsg = tools_mod.describeError(arena, err, call.name, call.args_json);
-        ops.pushToolDone(ops.ctx, m, call.name, "failed", ms, emsg);
+        ops.pushToolDone(ops.ctx, m, call.name, "failed", ms, emsg, false);
         s.appendToolResult(call.id, call.name, emsg) catch {};
         return 0;
     };
@@ -625,7 +625,7 @@ pub fn execOneCall(
     if (TurnStats_isReadOnlyTool(call.name)) ops.noteRead(ops.ctx);
     if (std.mem.eql(u8, call.name, "bash") and startedBackground(res)) m.bench.bg_jobs += 1;
     const summary = ops.toolResultSummary(ops.ctx, call.name, res, arena);
-    ops.pushToolDone(ops.ctx, m, call.name, summary, ms, res);
+    ops.pushToolDone(ops.ctx, m, call.name, summary, ms, res, true);
     // 50.2: PostToolUseFailure is a separate event from PostToolUse so an
     // observer can react to failures without parsing the result text itself.
     // The classification is presentation-level (the tool's own summary),

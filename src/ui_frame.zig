@@ -273,7 +273,7 @@ fn sceneTurn(m: *tui.Model) void {
     m.pushKind(.user, "reescribe el theme y dime qué contrasta mal");
     m.pushToolStart("Read", "src/lib/theme.zig");
     m.toolRunEnd();
-    m.pushToolDone("Read", "Read 60 lines", 3, "src/lib/theme.zig\n  60 lines\n");
+    m.pushToolDone("Read", "Read 60 lines", 3, "src/lib/theme.zig\n  60 lines\n", null);
     m.streamStart();
     m.streamDelta("El problema real: `brand_faint` esta en 1.9:1 y lo usas ");
     m.streamDelta("para texto, no solo para hairlines.\n\n");
@@ -320,10 +320,10 @@ fn sceneTools(m: *tui.Model) void {
     m.pushKind(.user, "lee los tres ficheros y mira los tests");
     m.pushToolStart("Grep", "brand_faint");
     m.toolRunEnd();
-    m.pushToolDone("Grep", "Grep  14 matches", 9, "x");
+    m.pushToolDone("Grep", "Grep  14 matches", 9, "x", null);
     m.pushToolStart("Read", "src/tui.zig");
     m.toolRunEnd();
-    m.pushToolDone("Read", "Read 10407 lines", 12, "x");
+    m.pushToolDone("Read", "Read 10407 lines", 12, "x", null);
     m.pushError("grep: brand_faint: matched 14 lines in 3 files");
 }
 
@@ -339,6 +339,7 @@ fn sceneBash(m: *tui.Model) void {
         "Compiling 62 files...\n" ++
             "build.zig:1:19: warning: unused variable\n" ++
             "run test 854 pass, 1 skip, 4 fail (859 total)\n",
+        null,
     );
 }
 
@@ -361,7 +362,7 @@ fn sceneDiff(m: *tui.Model) void {
     m.pushToolStart("Edit", "src/lib/theme.zig");
     m.toolRunEnd();
     _ = m.pushDiffLang(before, after, "zig", "");
-    m.pushToolDone("Edit", "Edit  src/lib/theme.zig", 7, "x");
+    m.pushToolDone("Edit", "Edit  src/lib/theme.zig", 7, "x", null);
     m.pushInfoFmt("{d} tool results elided", .{3});
 }
 
@@ -408,7 +409,7 @@ fn sceneBigWrite(m: *tui.Model) void {
         after.appendSlice(std.heap.page_allocator, line) catch break;
     }
     _ = m.pushDiffLang(before.items, after.items, "zig", "");
-    m.pushToolDone("Write", "Write  src/lib/taskstore.zig (600 lines)", 31, "x");
+    m.pushToolDone("Write", "Write  src/lib/taskstore.zig (600 lines)", 31, "x", null);
 }
 
 fn sceneAsk(m: *tui.Model) void {
@@ -594,6 +595,7 @@ fn sceneLong(m: *tui.Model) void {
         "Task  a code agent in 3 sentences",
         8200,
         "src/tools/ holds one file per tool.",
+        null,
     );
     m.streamStart();
     m.streamDelta("The files in `src/tools/` are one per tool.\n\n");
