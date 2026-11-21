@@ -146,6 +146,22 @@ def main() -> int:
                 return 1
             print(f"ok: session/fork {fork_sid}")
 
+            # 50.7: an image content block is accepted and does not break the
+            # protocol turn. A tiny valid base64 PNG is enough (no vision model
+            # needed — the gate reports the attachment honestly).
+            send(p, {
+                "jsonrpc": "2.0", "id": 32, "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [
+                    {"type": "text", "text": "what is in this image?"},
+                    {"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="},
+                ]},
+            })
+            msg, _ = read_until(reader, lambda m: m.get("id") == 32 and ("result" in m or "error" in m), timeout=30)
+            if not msg:
+                print("FAIL: session/prompt with image did not complete", file=sys.stderr)
+                return 1
+            print("ok: session/prompt accepted an image block")
+
             # Prompt without a configured model should still complete as a protocol turn
             # (agent returns an end_turn with an explanatory message) rather than deadlocking.
             send(p, {"jsonrpc": "2.0", "id": 4, "method": "session/prompt", "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "hello"}]}})

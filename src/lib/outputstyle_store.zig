@@ -1,6 +1,8 @@
 //! Output styles: discovery and loading (facade).
 //! Implementation lives in `outputstyle/store.zig`; this path is kept stable for importers.
 
+const std = @import("std");
+
 const store = @import("outputstyle/store.zig");
 
 pub const Loader = store.Loader;
@@ -13,4 +15,8 @@ pub const deinitEntries = store.deinitEntries;
 
 test {
     _ = store;
+}
+
+test "facade: style scanning is bounded" {
+    try std.testing.expect(max_scan > 0);
 }

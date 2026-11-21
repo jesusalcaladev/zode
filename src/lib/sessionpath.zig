@@ -1,6 +1,8 @@
 //! Session path resolution and project scoping (facade).
 //! Implementation lives in `session/path.zig`; this path is kept stable for importers.
 
+const std = @import("std");
+
 const impl = @import("session/path.zig");
 
 pub const legacy_sessions_dir = impl.legacy_sessions_dir;
@@ -19,4 +21,9 @@ pub const sessionDisplayId = impl.sessionDisplayId;
 
 test {
     _ = impl;
+}
+
+test "facade: session files are private by default" {
+    try std.testing.expect(@backingInt(session_mode) & 0o077 == 0);
+    try std.testing.expect(@backingInt(sessions_dir_mode) & 0o077 == 0);
 }

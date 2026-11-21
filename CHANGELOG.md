@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - hook events + user scope, MCP resources/prompts (50.2, 50.3) (ecosystem) [`ad547763`](https://github.com/jesusalcaladev/zode/commit/ad547763)
 - per-call tool collapse, side-by-side diff, subagent tree (49.8) (tui) [`c23de466`](https://github.com/jesusalcaladev/zode/commit/c23de466)
 - rewind, claude commands, acp fork, append prompt, durable bg, stats (50) (ecosystem) [`361f91be`](https://github.com/jesusalcaladev/zode/commit/361f91be)
-- hook types, MCP resources/prompts + HTTP/SSE transport (50.2, 50.3) (ecosystem) [`1cc4aa56`](https://github.com/jesusalcaladev/zode/commit/1cc4aa56)
+- hook types, MCP resources/prompts + HTTP/SSE transport (50.2, 50.3) (ecosystem) [`31662b21`](https://github.com/jesusalcaladev/zode/commit/31662b21)
+- close remaining backlog - ACP images and facade tests (50.7, 51.3, 51.9) [`7b6bf096`](https://github.com/jesusalcaladev/zode/commit/7b6bf096)
 
 ### Bug Fixes
 

@@ -1,6 +1,8 @@
 //! Output styles: core types and parsing (facade).
 //! Implementation lives in `outputstyle/core.zig`; this path is kept stable for importers.
 
+const std = @import("std");
+
 const core = @import("outputstyle/core.zig");
 
 pub const filename = core.filename;
@@ -22,4 +24,8 @@ pub const joinNames = core.joinNames;
 
 test {
     _ = core;
+}
+
+test "facade: an output style file has a markdown extension" {
+    try std.testing.expectEqualStrings(".md", extension);
 }

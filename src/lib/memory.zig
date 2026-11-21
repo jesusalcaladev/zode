@@ -1,6 +1,8 @@
 //! Project memory: core parsing/types (facade).
 //! Implementation lives in `memory/core.zig`; this path is kept stable for importers.
 
+const std = @import("std");
+
 const core = @import("memory/core.zig");
 
 pub const max_title = core.max_title;
@@ -20,4 +22,9 @@ pub const renderList = core.renderList;
 
 test {
     _ = core;
+}
+
+test "facade: max memory body is bounded" {
+    try std.testing.expect(max_body_bytes > 0);
+    try std.testing.expect(max_title > 0);
 }

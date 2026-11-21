@@ -122,6 +122,8 @@ const PromptJob = struct {
     request_id_storage: [64]u8 = undefined,
     request_id_len: u8 = 0,
     prompt_text: []u8, // owned
+    /// 50.7: ACP `image` content blocks, already base64 as the wire expects.
+    images: []chat.Image = &.{},
 };
 
 const Server = struct {
@@ -339,7 +341,7 @@ const Server = struct {
             .protocolVersion = protocol.protocol_version,
             .agentCapabilities = .{
                 .loadSession = true,
-                .promptCapabilities = .{ .image = false, .audio = false, .embeddedContext = true },
+                .promptCapabilities = .{ .image = true, .audio = false, .embeddedContext = true },
                 .mcpCapabilities = .{ .http = false, .sse = false },
                 .sessionCapabilities = .{
                     .@"resume" = .{},
@@ -682,6 +684,31 @@ const Server = struct {
         return out.items;
     }
 
+    /// 50.7: ACP sends images as `{type:"image", data:"<base64>", mimeType:"…"}`
+    /// content blocks. The bytes stay base64 all the way to the wire — no
+    /// decode/encode round trip and no temp file needed.
+    fn extractPromptImages(arena: std.mem.Allocator, params: ?std.json.Value) ![]chat.Image {
+        const p = params orelse return &.{};
+        if (p != .object) return &.{};
+        const prompt_v = p.object.get("prompt") orelse return &.{};
+        if (prompt_v != .array) return &.{};
+        var out: std.ArrayList(chat.Image) = .empty;
+        for (prompt_v.array.items) |block| {
+            if (block != .object) continue;
+            const tv = block.object.get("type") orelse continue;
+            if (tv != .string or !std.mem.eql(u8, tv.string, "image")) continue;
+            const dv = block.object.get("data") orelse continue;
+            if (dv != .string or dv.string.len == 0) continue;
+            const mv = block.object.get("mimeType") orelse block.object.get("mime_type");
+            const mime: []const u8 = if (mv) |m| (if (m == .string and m.string.len > 0) m.string else "image/png") else "image/png";
+            try out.append(arena, .{
+                .mime = try arena.dupe(u8, mime),
+                .data_b64 = try arena.dupe(u8, dv.string),
+            });
+        }
+        return out.items;
+    }
+
     fn handleSessionPrompt(self: *Server, arena: std.mem.Allocator, id: protocol.RequestId, params: ?std.json.Value) void {
         const session_id = protocol.paramStr(params, "sessionId") orelse {
             return self.sendError(arena, id, protocol.ErrorCode.invalid_params, "sessionId is required");
@@ -694,6 +721,17 @@ const Server = struct {
             return self.sendError(arena, id, protocol.ErrorCode.internal_error, "Out of memory");
         };
         errdefer self.gpa.free(prompt_text);
+        // 50.7: copy the image blocks out of the request arena before the
+        // handler returns — the prompt thread outlives this arena.
+        const src_images = extractPromptImages(arena, params) catch &.{};
+        var owned_images: std.ArrayList(chat.Image) = .empty;
+        defer owned_images.deinit(self.gpa);
+        for (src_images) |img| {
+            owned_images.append(self.gpa, .{
+                .mime = self.gpa.dupe(u8, img.mime) catch continue,
+                .data_b64 = self.gpa.dupe(u8, img.data_b64) catch continue,
+            }) catch {};
+        }
 
         // Find session and mark busy atomically enough for single-session prompt serialization.
         while (!self.sessions_mu.tryLock()) {
@@ -720,7 +758,13 @@ const Server = struct {
             self.gpa.free(prompt_text);
             return self.sendError(arena, id, protocol.ErrorCode.internal_error, "Out of memory");
         };
-        job.* = .{ .server = self, .session = ss, .request_id = id, .prompt_text = prompt_text };
+        job.* = .{
+            .server = self,
+            .session = ss,
+            .request_id = id,
+            .prompt_text = prompt_text,
+            .images = owned_images.toOwnedSlice(self.gpa) catch &.{},
+        };
         // Preserve string request ids across thread boundary.
         switch (id) {
             .string => |s| {
@@ -751,7 +795,7 @@ const Server = struct {
             self.gpa.destroy(job);
         }
 
-        const stop_reason = self.runPromptTurn(ss, job.prompt_text);
+        const stop_reason = self.runPromptTurn(ss, job.prompt_text, job.images);
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         self.sendResponse(arena_state.allocator(), job.request_id, .{ .stopReason = stop_reason });
@@ -799,7 +843,7 @@ const Server = struct {
         }
     }
 
-    fn runPromptTurn(self: *Server, ss: *SessionState, prompt_text: []const u8) []const u8 {
+    fn runPromptTurn(self: *Server, ss: *SessionState, prompt_text: []const u8, images: []const chat.Image) []const u8 {
         var http = http_client.Http.init(self.gpa, self.io);
         defer http.deinit();
         const turn_arena = ss.arena_state.allocator();
@@ -837,8 +881,17 @@ const Server = struct {
         const extra_headers = extra_hdrs_buf[0..extra_len];
 
         const expanded = mentions_mod.expand(turn_arena, self.io, prompt_text) catch mentions_mod.Expansion{ .text = prompt_text, .files = 0, .missing = 0 };
-        ss.msgs.append(turn_arena, .{ .role = "user", .content = expanded.text }) catch {};
-        if (ss.zode_session) |zs| zs.append(.user, expanded.text) catch {};
+        // 50.7: a vision gate is honest: a model without vision gets a NOTE, not
+        // silently dropped bytes and not a failed turn.
+        const attached = if (images.len > 0 and models_mod.isVision(model_name)) images else &.{};
+        const user_text = if (images.len > 0 and attached.len == 0)
+            std.fmt.allocPrint(turn_arena, "{s}\n\n{d} image(s) were NOT attached: this model has no vision.", .{ expanded.text, images.len }) catch expanded.text
+        else if (attached.len > 0)
+            std.fmt.allocPrint(turn_arena, "{s}\n\n{d} image(s) attached by the USER.", .{ expanded.text, attached.len }) catch expanded.text
+        else
+            expanded.text;
+        ss.msgs.append(turn_arena, .{ .role = "user", .content = user_text, .images = attached }) catch {};
+        if (ss.zode_session) |zs| zs.append(.user, user_text) catch {};
 
         var policy = taskloop.Policy.init(agent.iterationLimit(), agent.loopBudgetFor(self.env).hard);
         var iteration: usize = 0;

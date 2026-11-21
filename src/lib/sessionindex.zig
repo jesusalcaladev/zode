@@ -1,6 +1,8 @@
 //! Session index/metadata scanning (facade).
 //! Implementation lives in `session/index.zig`; this path is kept stable for importers.
 
+const std = @import("std");
+
 const impl = @import("session/index.zig");
 
 pub const Meta = impl.Meta;
@@ -18,4 +20,9 @@ pub const ageLabel = impl.ageLabel;
 
 test {
     _ = impl;
+}
+
+test "facade: a real prompt is usable as a session title" {
+    try std.testing.expect(usablePrompt("review the diff") != null);
+    try std.testing.expect(usablePrompt("<tICK>internal") == null);
 }
