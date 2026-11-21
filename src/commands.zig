@@ -2871,6 +2871,7 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
     .{ .key = "?", .desc = "show this shortcut list (on an empty input)" },
     .{ .key = "ctrl+g", .desc = "edit the prompt in $VISUAL/$EDITOR" },
     .{ .key = "ctrl+f", .desc = "search the transcript" },
+    .{ .key = "ctrl+/", .desc = "search and reuse a past prompt" },
     .{ .key = "ctrl+o", .desc = "open the transcript screen" },
     .{ .key = "alt+] / alt+[", .desc = "next / previous diff hunk" },
     .{ .key = "f2 / f3 / f4 / f5", .desc = "custom bindings: help / context / sessions / tasks" },
@@ -2881,6 +2882,7 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
 pub const commands = [_]Cmd{
     .{ .key = "/help", .desc = "show commands", .key_hint = "ctrl+p" },
     .{ .key = "/memory", .desc = "list | pending | approve <id> — durable project memory" },
+    .{ .key = "/history", .desc = "search and reuse a past prompt" },
     .{ .key = "/model", .desc = "pick a model in a modal", .key_hint = "ctrl+p" },
     .{ .key = "/provider", .desc = "pick a provider in a modal" },
     .{ .key = "/providers", .desc = "list providers" },

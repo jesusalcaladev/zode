@@ -2913,6 +2913,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdHelp(m);
     } else if (std.mem.eql(u8, cmd, "memory")) {
         commands_mod.cmdMemory(m, arg);
+    } else if (std.mem.eql(u8, cmd, "history")) {
+        m.openHistoryPicker();
     } else if (std.mem.eql(u8, cmd, "quit")) {
         // the TUI handles it
     } else if (std.mem.eql(u8, cmd, "exit")) {

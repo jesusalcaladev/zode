@@ -208,6 +208,15 @@ pub const Editor = struct {
         return self.nextGraphemeEnd(from);
     }
 
+    /// Loads a saved prompt into the buffer without going through the ↑/↓
+    /// cursor (used by the history picker). The entry stays owned by history.
+    pub fn loadHistoryEntry(self: *Editor, index: usize) bool {
+        if (index >= self.history.items.len) return false;
+        self.setText(self.history.items[index]);
+        self.hist_idx = -1;
+        return true;
+    }
+
     pub fn setCursor(self: *Editor, pos: usize) void {
         self.cursor = @min(pos, self.buf.items.len);
     }

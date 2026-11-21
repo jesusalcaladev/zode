@@ -7651,3 +7651,26 @@ test "chrome: /config report opens a read-only picker instead of ten paragraphs"
     try std.testing.expect(m.picker_items.items.len > 0);
     try std.testing.expectEqual(@as(usize, 0), m.pending.items.len);
 }
+
+test "input: Ctrl+/ opens a searchable history picker and loads the chosen prompt" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(arena);
+    defer m.deinit();
+
+    try m.ed.insert("first remembered prompt");
+    m.ed.commit();
+    try m.ed.insert("second remembered prompt");
+    m.ed.commit();
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var ctx = keyTestCtx(arena, &threaded);
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = '/', .mods = .{ .ctrl = true } } });
+    try std.testing.expect(m.pickerActive());
+    try std.testing.expectEqual(@as(usize, 2), m.picker_items.items.len);
+
+    try typeErasedEventHandler(&m, &ctx, .{ .key_press = .{ .codepoint = vaxis.Key.enter } });
+    try std.testing.expectEqualStrings("first remembered prompt", m.ed.text());
+}

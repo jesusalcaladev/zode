@@ -245,6 +245,15 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 try self.armTick(ctx);
                 return;
             }
+            // Ctrl+/: search past prompts. Ctrl+R is already "expand last tool
+            // result", so history search uses the slash chord instead. The
+            // picker's own filter box does the incremental search.
+            if (key.matches('/', .{ .ctrl = true })) {
+                self.openHistoryPicker();
+                ctx.redraw = true;
+                try self.armTick(ctx);
+                return;
+            }
             // Ctrl+O: transcript screen (33.4).
             if (key.matches('o', .{ .ctrl = true })) {
                 self.toggleTranscriptView();

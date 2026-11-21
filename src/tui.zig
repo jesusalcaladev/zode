@@ -241,6 +241,8 @@ pub const PickerItem = struct {
 
 /// Tag for read-only notice pickers ("NOTE").
 pub const notice_tag: u32 = 0x4e4f5445;
+/// Tag for the prompt-history picker ("HIST").
+pub const history_tag: u32 = 0x48495354;
 
 pub const PickerCb = *const fn (*Model, tag: u32, label: []const u8) void;
 
@@ -2481,6 +2483,27 @@ pub const Model = struct {
         self.ed.history.deinit(self.allocator);
         self.ed.history = loaded;
         self.ed.hist_idx = -1;
+    }
+
+    /// Opens the history picker. Its own filter box gives Ctrl+F-style search
+    /// over past prompts; Enter loads the chosen one into the composer.
+    pub fn openHistoryPicker(self: *Model) void {
+        const n = self.ed.history.items.len;
+        if (n == 0) {
+            self.pushFeedback("History: no prompts recorded yet");
+            return;
+        }
+        const items = self.allocator.alloc(PickerItem, n) catch return;
+        for (self.ed.history.items, 0..) |text, i| {
+            items[i] = .{ .label = self.allocator.dupe(u8, text) catch "" };
+        }
+        self.openPickerIdx(history_tag, "Prompt history", items, historyChosen, null);
+    }
+
+    fn historyChosen(m: *Model, _: u32, index: usize) void {
+        _ = m.ed.loadHistoryEntry(index);
+        resetAutocomplete(m);
+        m.requestRedraw();
     }
 
     pub fn beginChromeCapture(self: *Model) void {

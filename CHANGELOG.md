@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fold long diff hunks in the transcript (tui) [`54c25227`](https://github.com/jesusalcaladev/zode/commit/54c25227)
 - keep command chrome out of the transcript (tui) [`931d686c`](https://github.com/jesusalcaladev/zode/commit/931d686c)
 - route harness reports to one picker, keep model output visible (tui) [`72108606`](https://github.com/jesusalcaladev/zode/commit/72108606)
-- make approved memories available to every model (memory) [`6b1380a4`](https://github.com/jesusalcaladev/zode/commit/6b1380a4)
+- make approved memories available to every model (memory) [`fac44dbd`](https://github.com/jesusalcaladev/zode/commit/fac44dbd)
+- search and reuse past prompts with Ctrl+/ (tui) [`31b73e4a`](https://github.com/jesusalcaladev/zode/commit/31b73e4a)
 
 ### Bug Fixes
 
