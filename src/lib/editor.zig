@@ -342,13 +342,11 @@ pub const Editor = struct {
     pub fn deleteToStart(self: *Editor) void {
         if (self.cursor == 0) return;
         self.recordUndo(false, 0);
-        const rest = self.buf.items[self.cursor..];
-        self.buf.shrinkRetainingCapacity(self.cursor);
-        const copy = self.gpa.alloc(u8, rest.len) catch return;
-        @memcpy(copy, rest);
-        self.buf.clearRetainingCapacity();
-        self.buf.appendSlice(self.gpa, copy) catch {};
-        self.gpa.free(copy);
+        // The old version took `rest` AFTER shrinking the buffer to `cursor`,
+        // so it was always empty; then `clearRetainingCapacity` memset the
+        // whole buffer to undefined and the line became garbage bytes. Use the
+        // same in-place shift as the other deletions.
+        self.buf.replaceRange(self.gpa, 0, self.cursor, &.{}) catch return;
         self.cursor = 0;
         self.recountLines();
     }

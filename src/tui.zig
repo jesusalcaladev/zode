@@ -1865,6 +1865,10 @@ pub const Model = struct {
     /// Ctrl+C'd draft: a staged image belongs to the text it was pasted next
     /// to, and the two must never disagree about what is being sent.
     draft_images: images_mod.Pending = .{},
+    /// Ctrl+S stash. The image struct is MOVED in and out (no deep copy): both
+    /// sides hold gpa-owned paths, so exactly one side frees them.
+    stashed_text: ?[]u8 = null,
+    stashed_images: images_mod.Pending = .{},
     /// The automatic typecheck the harness starts after a write tool touches code.
     ///
     /// It is a struct and not three fields because the headless runner keeps one on
@@ -2423,6 +2427,48 @@ pub const Model = struct {
         return !self.ed.isEmpty();
     }
 
+    /// Text OR a staged image is work in progress. Ctrl+C clears the draft
+    /// first and exits only on the second press: with a staged image and an
+    /// empty box the old `hasInput()` said "nothing to lose" and quit the app.
+    /// Kept separate from `hasInput()` so history arrows and message targeting
+    /// still treat an empty text box as empty even when an image is staged.
+    pub fn hasDraft(self: *const Model) bool {
+        return !self.ed.isEmpty() or !self.draft_images.isEmpty();
+    }
+
+    /// Ctrl+S with a draft: park the text and the staged images and empty the
+    /// composer, so you can start a different message and come back.
+    pub fn stashDraft(self: *Model) bool {
+        if (!self.hasDraft()) return false;
+        // Replacing an older stash has to release it first.
+        if (self.stashed_text) |old| self.allocator.free(old);
+        self.stashed_images.clear(self.allocator);
+        self.stashed_text = self.allocator.dupe(u8, self.ed.text()) catch null;
+        if (self.stashed_text == null and !self.ed.isEmpty()) return false;
+        self.stashed_images = self.draft_images;
+        self.draft_images = .{};
+        self.ed.clear();
+        resetAutocomplete(self);
+        self.pushNotification("draft stashed · Ctrl+S to restore");
+        return true;
+    }
+
+    /// Ctrl+S with an empty composer: put the parked draft back, images included.
+    pub fn restoreDraft(self: *Model) bool {
+        if (self.stashed_text == null and self.stashed_images.isEmpty()) return false;
+        self.ed.clear();
+        if (self.stashed_text) |t| {
+            self.ed.insert(t) catch {};
+            self.allocator.free(t);
+            self.stashed_text = null;
+        }
+        self.draft_images = self.stashed_images;
+        self.stashed_images = .{};
+        resetAutocomplete(self);
+        self.pushNotification("draft restored");
+        return true;
+    }
+
     // ── lifecycle ────────────────────────────────────
     pub fn init(allocator: std.mem.Allocator) Model {
         var m = Model{
@@ -2502,6 +2548,8 @@ pub const Model = struct {
         self.destroyPalette();
         if (self.pending_items) |items| palette.freeItems(self.allocator, items);
         self.ed.deinit();
+        if (self.stashed_text) |t| self.allocator.free(t);
+        self.stashed_images.clear(self.allocator);
         for (self.extra_dirs.items) |d| self.allocator.free(d);
         self.extra_dirs.deinit(self.allocator);
         for (self.paras.items) |p| freePara(self.allocator, p);
@@ -5154,6 +5202,21 @@ pub const Model = struct {
         else
             @min(cur + step, rows - 1);
         self.dirty = true;
+    }
+
+    /// Answers option `index` directly (the `1..5` keys). The panel owns those
+    /// keys while a choice is open, so a numbered shortcut cannot leak into the
+    /// composer. Returns false for an index that is not on the table.
+    pub fn askAnswerIndex(self: *Model, index: usize) bool {
+        if (!self.askNeedsChoice()) return false;
+        self.askLock();
+        if (index >= self.ask_options.items.len) {
+            self.askUnlock();
+            return false;
+        }
+        self.ask_sel = index;
+        self.askUnlock();
+        return self.askAnswerSelected();
     }
 
     /// The submitted text answers the open question instead of starting a turn.
@@ -8063,11 +8126,12 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
 
     // `ask` in free-text mode: Enter ANSWERS, it does not start a new turn.
     //
-    // It has to be checked BEFORE anything else, including the empty check: an
-    // empty answer is a legitimate answer ("you decide") and the user pressing
-    // Enter on an empty box is saying exactly that. Sending it as a prompt would
-    // start a turn with an empty user message, which is the one thing that would
-    // make this feel broken.
+    // It has to be checked BEFORE the `!cmd` shortcut and the empty check: an
+    // empty answer is a legitimate answer ("you decide"), and a free-text
+    // answer may legitimately start with `!` ("!what does this do?"). Running
+    // the shell shortcut first meant answering a question with such text
+    // started a background command instead, while the worker stayed parked
+    // waiting for the answer.
     //
     // `askActive()` and not just `askTyping()`: with a FREE-TEXT question open
     // there are no options, so nothing ever set `ask_typing`, and the panel said
@@ -8075,9 +8139,17 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
     // Typing there started a NEW TURN instead of answering, and the turn got
     // queued behind the worker that was parked waiting for the answer. From
     // outside: the panel asks a question, you answer it, and it ignores you.
+    if (self.askAnswerFromInput(trimmed)) {
+        self.ed.clear();
+        resetAutocomplete(self);
+        ctx.redraw = true;
+        try self.armTick(ctx);
+        return;
+    }
+
     // `!cmd` runs a shell command and puts its output in the context. It is
-    // checked here, before the prompt path, because it is NOT a prompt: there is
-    // no turn, no model and no worker for the model. The command itself runs on
+    // checked before the prompt path because it is NOT a prompt: there is no
+    // turn, no model and no worker for the model. The command itself runs on
     // its own thread (see `Model.shell_out`).
     if (trimmed.len > 1 and trimmed[0] == '!') {
         const cmd = std.mem.trim(u8, trimmed[1..], " \t");
@@ -8088,14 +8160,6 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
         } else {
             agent.startShell(self, cmd);
         }
-        ctx.redraw = true;
-        try self.armTick(ctx);
-        return;
-    }
-
-    if (self.askAnswerFromInput(trimmed)) {
-        self.ed.clear();
-        resetAutocomplete(self);
         ctx.redraw = true;
         try self.armTick(ctx);
         return;
@@ -8385,7 +8449,16 @@ pub fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
         return true;
     }
     if (k.matches(vaxis.Key.up, .{})) {
-        // Up = prompt history.
+        // A multiline draft owns its arrows: move between logical lines while
+        // there is one above the caret, and browse prompt history only at the
+        // top. Before this, a five-line draft could not be navigated without
+        // discarding it into the history browser.
+        const before = self.ed.cursor;
+        self.ed.moveUp();
+        if (self.ed.cursor != before) {
+            ctx.redraw = true;
+            return true;
+        }
         if (self.ed.historyPrev()) {
             syncAutocomplete(self);
             ctx.redraw = true;
@@ -8393,6 +8466,12 @@ pub fn editorKey(self: *Model, ctx: *vxfw.EventContext, key: vaxis.Key) !bool {
         return true;
     }
     if (k.matches(vaxis.Key.down, .{})) {
+        const before = self.ed.cursor;
+        self.ed.moveDown();
+        if (self.ed.cursor != before) {
+            ctx.redraw = true;
+            return true;
+        }
         if (self.ed.historyNext()) {
             syncAutocomplete(self);
             ctx.redraw = true;
@@ -9236,11 +9315,17 @@ pub fn capturePasteKey(self: *Model, k: vaxis.Key) void {
         self.paste_buf.append(self.allocator, '\n') catch {};
         return;
     }
+    // A raw 0x09 arrives from vaxis as Ctrl+I with no `text`, so the printable
+    // branch below dropped it: pasting indented code silently removed every
+    // leading tab. Inside a paste Ctrl+I is a TAB, never a keybinding.
+    if (k.codepoint == 'i' and k.mods.ctrl) {
+        self.paste_buf.append(self.allocator, '\t') catch {};
+        return;
+    }
     if (k.text) |txt| {
         // Same rule as the composer and the palette: a terminal reply that
         // arrives as key text carries control bytes, and a paste is not the
-        // place to let them in either. Tabs never reach here — a raw 0x09 is
-        // Ctrl+I with no text.
+        // place to let them in either. Tabs are handled above.
         if (txt.len > 0 and !k.mods.ctrl and palette.isPrintableText(txt)) {
             self.paste_buf.appendSlice(self.allocator, txt) catch {};
         }

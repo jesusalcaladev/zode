@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - per-call tool collapse, side-by-side diff, subagent tree (49.8) (tui) [`c23de466`](https://github.com/jesusalcaladev/zode/commit/c23de466)
 - rewind, claude commands, acp fork, append prompt, durable bg, stats (50) (ecosystem) [`361f91be`](https://github.com/jesusalcaladev/zode/commit/361f91be)
 - hook types, MCP resources/prompts + HTTP/SSE transport (50.2, 50.3) (ecosystem) [`31662b21`](https://github.com/jesusalcaladev/zode/commit/31662b21)
-- close remaining backlog - ACP images and facade tests (50.7, 51.3, 51.9) [`7b6bf096`](https://github.com/jesusalcaladev/zode/commit/7b6bf096)
+- close remaining backlog - ACP images and facade tests (50.7, 51.3, 51.9) [`29a4c686`](https://github.com/jesusalcaladev/zode/commit/29a4c686)
 
 ### Bug Fixes
 
@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - apply env timeout before the headless client is built (47) (http) [`577d6143`](https://github.com/jesusalcaladev/zode/commit/577d6143)
 - atomic agent writes, transport retries, durable sessions (48) (reliability) [`9aeada3e`](https://github.com/jesusalcaladev/zode/commit/9aeada3e)
 - Phase 51 quick wins — language gate, real timeouts, honest audits (51) (verification) [`ad3ac96f`](https://github.com/jesusalcaladev/zode/commit/ad3ac96f)
+- harden input handling and protect in-progress drafts (tui) [`9b0511d1`](https://github.com/jesusalcaladev/zode/commit/9b0511d1)
 
 ### Chores
 

@@ -42,8 +42,8 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             // user presses another key it is stale.
             self.input_too_long = false;
             self.input_err = "";
-            // Ctrl+C: first clears the input, the second press exits (so
-            // half-typed text is never lost in one go).
+            // Ctrl+C: first clears the draft, the second press exits (so
+            // half-typed text or a staged image is never lost in one go).
             if (key.matches('c', .{ .ctrl = true })) {
                 // A modal owns Ctrl+C too: closing it is the expected action.
                 // With empty input this branch used to QUIT the app from inside
@@ -51,7 +51,7 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 if (self.anyModalActive()) {
                     if (try self.closeTopModal(ctx)) return;
                 }
-                if (self.hasInput()) {
+                if (self.hasDraft()) {
                     self.ed.clear();
                     tui.resetAutocomplete(self);
                     // The draft dies whole: an image staged for a discarded
@@ -169,9 +169,11 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                     return;
                 }
             }
-            // Ctrl+A: connect a provider. The palette footer announced it and
-            // did nothing, which is worse than not announcing it.
-            if (key.matches('a', .{ .ctrl = true })) {
+            // Ctrl+A: connect a provider only with an empty composer. With text
+            // in the buffer Ctrl+A is `moveHome` (see editorKey): stealing it
+            // here made the caret jump to the start of a typed prompt and opened
+            // a palette on top of work in progress.
+            if (key.matches('a', .{ .ctrl = true }) and self.ed.isEmpty()) {
                 agent.openConnectPalette(self);
                 ctx.redraw = true;
                 try self.armTick(ctx);
@@ -209,6 +211,18 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             }
             if (key.matches('[', .{ .alt = true })) {
                 if (self.navigateLastDiffHunk(-1)) ctx.redraw = true;
+                return;
+            }
+            // Ctrl+S: stash the current draft (text + staged images) and free
+            // the composer; press it again on an empty box to get it back.
+            if (key.matches('s', .{ .ctrl = true })) {
+                if (self.hasDraft()) {
+                    _ = self.stashDraft();
+                } else {
+                    _ = self.restoreDraft();
+                }
+                ctx.redraw = true;
+                try self.armTick(ctx);
                 return;
             }
             // Ctrl+V: stage the clipboard's IMAGE for the next message.
@@ -261,6 +275,13 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                     ctx.redraw = true;
                     try self.armTick(ctx);
                     return;
+                }
+                if (key.codepoint >= '1' and key.codepoint <= '5') {
+                    if (self.askAnswerIndex(key.codepoint - '1')) {
+                        ctx.redraw = true;
+                        try self.armTick(ctx);
+                        return;
+                    }
                 }
                 if (key.matches(vaxis.Key.enter, .{})) {
                     _ = self.askAnswerSelected();
@@ -497,13 +518,18 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             // you can see what came before and what comes after). Before they
             // moved 5 fixed rows, which in a 40-row terminal did not feel like
             // scrolling.
-            // Ctrl+U / Ctrl+D do half a page, like in less.
+            // Ctrl+U / Ctrl+D do half a page, like in less, but ONLY when the
+            // composer is empty. While typing they are Emacs line-kill keys
+            // (`deleteToStart` / `deleteAfter` in editorKey): the global scroll
+            // branch used to swallow them, so both advertised editor commands
+            // were unreachable. PageUp/PageDown and Shift+K/J always scroll.
             const k = key;
             const page: usize = @max(3, self.hist_rows -| 1);
             const half: usize = @max(2, self.hist_rows / 2);
+            const editing = !self.ed.isEmpty();
             if (k.matches(vaxis.Key.page_up, .{}) or
                 (k.codepoint == 'k' and k.mods.shift) or
-                (k.matches('u', .{ .ctrl = true })))
+                (k.matches('u', .{ .ctrl = true }) and !editing))
             {
                 const step = if (k.matches('u', .{ .ctrl = true })) half else page;
                 self.scrollBy(@intCast(step));
@@ -513,7 +539,7 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             }
             if (k.matches(vaxis.Key.page_down, .{}) or k.codepoint == 6 or
                 (k.codepoint == 'j' and k.mods.shift) or
-                (k.matches('d', .{ .ctrl = true })))
+                (k.matches('d', .{ .ctrl = true }) and !editing))
             {
                 const step = if (k.matches('d', .{ .ctrl = true })) half else page;
                 self.scrollBy(-@as(isize, @intCast(step)));
