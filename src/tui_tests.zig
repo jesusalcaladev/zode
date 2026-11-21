@@ -7693,3 +7693,19 @@ test "tool summary: the failure marker comes from the structured verdict" {
     const bad_text = allText(try drawTest(&m, arena_state.allocator(), 100, 20));
     try std.testing.expect(std.mem.indexOf(u8, bad_text, "✗ custom wording") != null);
 }
+
+test "input: Ctrl+V with no image and no clipboard tool fails with a toast" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.attachIo(std.testing.io);
+
+    // An empty PATH guarantees no wl-paste/xclip/wl-copy exists, so the
+    // image gauntlet falls through to the text path and then to the notice.
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", "/nonexistent");
+    m.environ = &env;
+
+    agent.attachClipboardImage(&m);
+    try std.testing.expect(m.notification_len > 0);
+}

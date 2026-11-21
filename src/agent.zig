@@ -10200,7 +10200,25 @@ pub fn attachClipboardImage(m: *tui.Model) void {
             if (bytes.len > 0) return stageClipboardImage(m, f.mime, f.ext, bytes);
         }
     }
-    m.pushFeedback("· no image on the clipboard: copy one (a screenshot tool's copy, e.g.) and press Ctrl+V again");
+    // No image on the clipboard: paste TEXT instead. The same native tools
+    // that `/copy` uses are the first choice; OSC-52 replies arrive as vaxis
+    // `.paste` events and are inserted by the event handler. Without this,
+    // Ctrl+V on a copied command did nothing at all.
+    if (clipboardBytes(gpa, io, &.{ "wl-paste", "--no-wait", "-selection", "clipboard" })) |bytes| {
+        defer gpa.free(bytes);
+        if (bytes.len > 0) {
+            tui.insertIntoInput(m, bytes);
+            return;
+        }
+    }
+    if (clipboardBytes(gpa, io, &.{ "xclip", "-selection", "clipboard", "-o" })) |bytes| {
+        defer gpa.free(bytes);
+        if (bytes.len > 0) {
+            tui.insertIntoInput(m, bytes);
+            return;
+        }
+    }
+    m.pushFeedback("· clipboard is empty (no image or text to paste)");
 }
 
 /// Runs one clipboard reader. `null` = the tool is missing, failed or the

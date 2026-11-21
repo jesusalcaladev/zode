@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - route harness reports to one picker, keep model output visible (tui) [`72108606`](https://github.com/jesusalcaladev/zode/commit/72108606)
 - make approved memories available to every model (memory) [`fac44dbd`](https://github.com/jesusalcaladev/zode/commit/fac44dbd)
 - search and reuse past prompts with Ctrl+/ (tui) [`136f93c1`](https://github.com/jesusalcaladev/zode/commit/136f93c1)
+- Ctrl+V also pastes text from the native clipboard (tui) [`21713fdd`](https://github.com/jesusalcaladev/zode/commit/21713fdd)
 
 ### Bug Fixes
 
@@ -42,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Phase 51 quick wins — language gate, real timeouts, honest audits (51) (verification) [`ad3ac96f`](https://github.com/jesusalcaladev/zode/commit/ad3ac96f)
 - harden input handling and protect in-progress drafts (tui) [`e992ec6a`](https://github.com/jesusalcaladev/zode/commit/e992ec6a)
 - stop ending turns at 12 iterations and explain gate refusals (agent) [`76e1f0bc`](https://github.com/jesusalcaladev/zode/commit/76e1f0bc)
-- stop inferring tool failures from the summary text (tui) [`4fbf6dd7`](https://github.com/jesusalcaladev/zode/commit/4fbf6dd7)
+- stop inferring tool failures from the summary text (tui) [`b2e5c400`](https://github.com/jesusalcaladev/zode/commit/b2e5c400)
 
 ### Chores
 
