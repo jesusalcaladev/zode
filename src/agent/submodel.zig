@@ -194,11 +194,11 @@ pub fn setSubmodel(provider: []const u8, model: []const u8) void {
 
 pub fn submodelReport(m: *tui.Model, user_config: config_mod.Config, ctx: ResolveCtx) void {
     if (sub_session == .off) {
-        m.pushInfoFmt("subagents: the same model as the main turn (/submodel off). Set: /submodel <model> | /submodel <provider> <model>", .{});
+        m.pushInfoFmt("Subagents: the same model as the main turn (/submodel off). Set: /submodel <model> | /submodel <provider> <model>", .{});
         return;
     }
     const pick = submodelPick(m, user_config) orelse {
-        m.pushInfoFmt("subagents: the same model as the main turn (no override). Set: /submodel <model> | /submodel <provider> <model>", .{});
+        m.pushInfoFmt("Subagents: the same model as the main turn (no override). Set: /submodel <model> | /submodel <provider> <model>", .{});
         return;
     };
     const prov: []const u8 = if (pick.provider.len > 0)
@@ -209,14 +209,14 @@ pub fn submodelReport(m: *tui.Model, user_config: config_mod.Config, ctx: Resolv
     switch (submodelTarget(pick, &reason_buf, ctx)) {
         .ok => |t| {
             if (sub_fail_len > 0) {
-                m.pushInfoFmt("subagents: {s}/{s} ({s}) — NOT in use: {s}. Change it with /submodel, or /submodel off", .{
+                m.pushInfoFmt("Subagents: {s}/{s} ({s}) — NOT in use: {s}. Change it with /submodel, or /submodel off", .{
                     t.def.id, t.model, pick.source, sub_fail_buf[0..sub_fail_len],
                 });
             } else {
-                m.pushInfoFmt("subagents: {s}/{s} ({s}). Off with /submodel off.", .{ t.def.id, t.model, pick.source });
+                m.pushInfoFmt("Subagents: {s}/{s} ({s}). Off with /submodel off.", .{ t.def.id, t.model, pick.source });
             }
         },
-        .why => |why_not| m.pushInfoFmt("subagents: {s}/{s} ({s}) — CANNOT be used: {s}", .{
+        .why => |why_not| m.pushInfoFmt("Subagents: {s}/{s} ({s}) — CANNOT be used: {s}", .{
             prov, pick.model, pick.source, why_not,
         }),
     }

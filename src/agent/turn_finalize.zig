@@ -67,7 +67,7 @@ pub fn run(
 
     const finish = if (tstate.finish_len > 0) tstate.finish[0..tstate.finish_len] else "";
     const partial = isTruncatedFinish(finish);
-    if (partial) ops.setStatusWithZo(m, .warn, "interrupted");
+    if (partial) ops.setStatusWithZo(m, .warn, "Interrupted");
 
     if (tstate.calls.items.len == 0) {
         // A truncated reply used to fall through the nudges (they all require

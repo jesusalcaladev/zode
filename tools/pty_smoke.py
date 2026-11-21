@@ -243,7 +243,7 @@ def main() -> int:
     # that stops watching the thing it watched, which is the reason it has to
     # name the CURRENT design and not a remembered one.
     ok &= check("footer: the mascot is there", "( o o )" in t, t)
-    ok &= check("footer: the legend is there", "ready" in t, t)
+    ok &= check("footer: the legend is there", "Ready" in t, t)
     ok &= check("the user prompt echoes", "hola mundo" in t, t)
     ok &= check("no panic", "panic" not in t.lower(), t)
     ok &= check("no 'Invalid free'", "invalid free" not in t.lower(), t)
@@ -260,7 +260,7 @@ def main() -> int:
     #    this one is a key: the unit test opens the picker directly, which
     #    proves nothing about the key that is supposed to open it.
     out2b, t2b = drive([b"?", b"\x1b"])
-    ok &= check("? opens the shortcut list", "keyboard shortcuts" in t2b, t2b)
+    ok &= check("? opens the shortcut list", "Keyboard shortcuts" in t2b, t2b)
     # And the legend of the permission glyphs travels with it: a glyph with
     # no legend is a glyph nobody can read.
     ok &= check("the shortcut list carries the mode legend", "accept-edits" in t2b, t2b)

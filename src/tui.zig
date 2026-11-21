@@ -1340,7 +1340,7 @@ pub const AskSnapshot = struct {
 /// other option, so there is nothing to match and no way for a model to write an
 /// option starting with the same words and get sent to a text box instead of
 /// being answered.
-pub const ask_other_label = "type your own answer…";
+pub const ask_other_label = "Type your own answer…";
 
 /// After this with nobody answering, the worker stops waiting and the model is
 /// told to decide. See `ask.timed_out_text`.
@@ -1792,14 +1792,14 @@ pub const Model = struct {
     /// a blind "may I run this?".
     perm_rule: [128]u8 = undefined,
     perm_rule_len: usize = 0,
-    /// The rule the "always allow" option would remember.
+    /// The rule the "Always allow" option would remember.
     ///
     /// It is shown IN the dialog, because the user is answering "allow this
     /// command from now on?" and the answer has to name what it is: "always
     /// allow" alone says nothing about what is being remembered.
     perm_suggestion: [96]u8 = undefined,
     perm_suggestion_len: usize = 0,
-    /// Whether the open dialog offers "always allow".
+    /// Whether the open dialog offers "Always allow".
     ///
     /// It is false for the questions that must not become a standing
     /// permission (a write into `.git/`), and the "A" key does not answer
@@ -2515,7 +2515,7 @@ pub const Model = struct {
         self.draft_images = .{};
         self.ed.clear();
         resetAutocomplete(self);
-        self.pushNotification("draft stashed · Ctrl+S to restore");
+        self.pushNotification("Draft stashed · Ctrl+S to restore");
         return true;
     }
 
@@ -2531,7 +2531,7 @@ pub const Model = struct {
         self.draft_images = self.stashed_images;
         self.stashed_images = .{};
         resetAutocomplete(self);
-        self.pushNotification("draft restored");
+        self.pushNotification("Draft restored");
         return true;
     }
 
@@ -2986,7 +2986,7 @@ pub const Model = struct {
         if (n == 0) {
             // A toast, not a transcript paragraph: search feedback used to be
             // appended to the session and re-sent to the model on later turns.
-            if (self.search_has_query) self.pushNotification("search: no matches");
+            if (self.search_has_query) self.pushNotification("Search: no matches");
             return false;
         }
         if (forward) {
@@ -3011,10 +3011,10 @@ pub const Model = struct {
             self.runTranscriptSearch();
             self.closeTranscriptSearch();
             if (self.search_matches.items.len == 0 and self.search_query_len > 0) {
-                self.pushNotification("search: no matches");
+                self.pushNotification("Search: no matches");
             } else if (self.search_matches.items.len > 0) {
                 var note_buf: [64]u8 = undefined;
-                const note = std.mem.print(&note_buf, "search: {d}/{d}", .{ self.search_current + 1, self.search_matches.items.len }) catch "search";
+                const note = std.mem.print(&note_buf, "Search: {d}/{d}", .{ self.search_current + 1, self.search_matches.items.len }) catch "Search";
                 self.pushNotification(note);
             }
             return true;
@@ -4159,7 +4159,7 @@ pub const Model = struct {
         self.perm_detail_scroll = 0;
         self.perm_answer = .none;
         // `perm_sandbox_available` is set by the caller before this blocks:
-        // clearing it here would discard a "run sandboxed" offer (Phase 25).
+        // clearing it here would discard a "Run sandboxed" offer (Phase 25).
         self.perm_active = true;
         // The tick must keep running while the user decides: without this the
         // dialog appears but is not repainted (the clock, the face...).
@@ -4189,7 +4189,7 @@ pub const Model = struct {
     /// it would put that whole place on the list of places the agent writes
     /// without asking — which is the opposite of what the question is for.
     ///
-    /// The answer is "allow once" or "deny", and nothing else.
+    /// The answer is "Allow once" or "Deny", and nothing else.
     pub fn requestPermissionOnce(self: *Model, tool: []const u8, detail: []const u8) PermAnswer {
         self.permLock();
         const was = self.perm_allow_always;
@@ -4203,7 +4203,7 @@ pub const Model = struct {
         return self.requestPermission(tool, detail);
     }
 
-    /// The rule the "always allow" option would remember.
+    /// The rule the "Always allow" option would remember.
     pub fn setPermSuggestion(self: *Model, text: []const u8) void {
         self.permLock();
         defer self.permUnlock();
@@ -4235,7 +4235,7 @@ pub const Model = struct {
         return self.perm_rule[0..self.perm_rule_len];
     }
 
-    /// Whether the open dialog offers "always allow".
+    /// Whether the open dialog offers "Always allow".
     pub fn permAllowAlways(self: *Model) bool {
         self.permLock();
         defer self.permUnlock();
@@ -5457,7 +5457,7 @@ pub const Model = struct {
         if (text.len == 0) return;
         const shown: usize = @min(text.len, 800);
         var buf: [960]u8 = undefined;
-        const block = std.mem.print(&buf, "◇ thinking · {d} chars\n{s}{s}", .{
+        const block = std.mem.print(&buf, "◇ Thinking · {d} chars\n{s}{s}", .{
             text.len,
             text[0..shown],
             if (text.len > shown) "…" else "",
@@ -6516,11 +6516,11 @@ pub const Model = struct {
     pub fn pushFileIntelList(self: *Model) bool {
         const n = self.file_intel_len;
         if (n == 0) {
-            self.pushInfo("file: no changed files in this session");
+            self.pushInfo("File: no changed files in this session");
             return false;
         }
         const focus = @min(self.file_focus orelse (n - 1), n - 1);
-        self.pushInfoFmt("file changes  ({d})", .{n});
+        self.pushInfoFmt("File changes  ({d})", .{n});
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const e = &self.file_intel[i];
@@ -6551,7 +6551,7 @@ pub const Model = struct {
     /// updates the focused file path for actions, and reports position/stats.
     pub fn navigateFileIntel(self: *Model, delta: i8) bool {
         if (self.file_intel_len == 0) {
-            self.pushInfo("file: no changed files in this session");
+            self.pushInfo("File: no changed files in this session");
             return false;
         }
         const cur = self.file_focus orelse (self.file_intel_len - 1);
@@ -7594,7 +7594,7 @@ pub const Model = struct {
             std.debug.print("zode: tick registration failed: {}\n", .{err});
             // The alt screen hides stderr. A dead tick timer looks like a
             // frozen app, so say it where the user is looking.
-            self.pushNotification("redraw clock failed - press a key to refresh");
+            self.pushNotification("Redraw clock failed - press a key to refresh");
         };
     }
 
@@ -8388,7 +8388,7 @@ pub fn openShortcutsPicker(self: *Model) void {
             .desc = gpa.dupe(u8, s.desc) catch return,
         };
     }
-    self.openPicker(9, "keyboard shortcuts", items, onShortcutPick);
+    self.openPicker(9, "Keyboard shortcuts", items, onShortcutPick);
 }
 
 /// Picking a shortcut does nothing: the list is a REFERENCE, not a menu.
@@ -8993,7 +8993,7 @@ fn vimNormalKey(self: *Model, ctx: *vxfw.EventContext, k: vaxis.Key) !bool {
                 if (self.targetedMessageText()) |text| {
                     commands.copyTargetedText(self, text);
                 } else {
-                    self.pushInfo("nothing to copy");
+                    self.pushInfo("Nothing to copy");
                 }
                 self.clearMessageTarget();
                 ctx.redraw = true;
@@ -10413,7 +10413,7 @@ pub fn drawPermissionModal(
     // without overflowing; cap lines to keep the modal compact.
     var rbuf: [160]u8 = undefined;
     const rtext: []const u8 = if (rule.len > 0)
-        (std.mem.print(&rbuf, "asked by rule: {s}", .{rule}) catch rule)
+        (std.mem.print(&rbuf, "Asked by rule: {s}", .{rule}) catch rule)
     else
         "";
     const rule_rows_all: []const []const u8 = if (rtext.len > 0 and inner_w > 0)
@@ -10491,14 +10491,14 @@ pub fn drawPermissionModal(
 
     // Sandbox note (Phase 25)
     if (sandbox_note and dy < bottom_limit) {
-        const note = "sandbox: S runs isolated (project writable, rest read-only)";
+        const note = "Sandbox: S runs isolated (project writable, rest read-only)";
         _ = p.putClipped(x + inner_x_pad, dy, note, inner_w, theme.ok);
         dy += 1;
     }
 
     // Dangerous broad-allow warning
     if (dangerous_suggestion and dy < bottom_limit) {
-        const warn = "warning: broad allow can run arbitrary commands";
+        const warn = "Warning: broad allow can run arbitrary commands";
         _ = p.putClipped(x + inner_x_pad, dy, warn, inner_w, theme.err);
         dy += 1;
     }
@@ -10507,11 +10507,11 @@ pub fn drawPermissionModal(
     const opts_y: u16 = y + h -| 2;
     const Opt = struct { key: []const u8, label: []const u8, is_always: bool, is_sandbox: bool };
     const opts_all = [_]Opt{
-        .{ .key = "Y", .label = "allow once", .is_always = false, .is_sandbox = false },
-        .{ .key = "S", .label = "run sandboxed", .is_always = false, .is_sandbox = true },
-        .{ .key = "A", .label = "always allow", .is_always = true, .is_sandbox = false },
-        .{ .key = "N", .label = "deny", .is_always = false, .is_sandbox = false },
-        .{ .key = "ESC", .label = "cancel", .is_always = false, .is_sandbox = false },
+        .{ .key = "Y", .label = "Allow once", .is_always = false, .is_sandbox = false },
+        .{ .key = "S", .label = "Run sandboxed", .is_always = false, .is_sandbox = true },
+        .{ .key = "A", .label = "Always allow", .is_always = true, .is_sandbox = false },
+        .{ .key = "N", .label = "Deny", .is_always = false, .is_sandbox = false },
+        .{ .key = "ESC", .label = "Cancel", .is_always = false, .is_sandbox = false },
     };
     var opts_buf: [5]Opt = undefined;
     var opts_n: usize = 0;
@@ -10537,7 +10537,7 @@ pub fn drawPermissionModal(
         // Keep the suggestion label from blowing past the border on narrow/zoomed terminals.
         if (o.is_always and suggestion_label_text.len > 0) {
             const room: usize = @intCast(right_edge -| ox);
-            if (room < 18) label = "always allow";
+            if (room < 18) label = "Always allow";
         }
         const label_style = if (i == 0)
             theme.brand
@@ -10555,14 +10555,14 @@ pub fn drawPermissionModal(
     }
 }
 
-/// The label of the "always allow" option: the rule it would remember.
+/// The label of the "Always allow" option: the rule it would remember.
 ///
-/// It is the SUGGESTION and not the word "always allow", because the user is
+/// It is the SUGGESTION and not the word "Always allow", because the user is
 /// answering a question about the future ("from now on?") and the answer has
 /// to name what "from now on" means.
 fn suggestion_label(suggestion: []const u8, buf: []u8) []const u8 {
     if (suggestion.len == 0) return "";
-    return std.mem.print(buf, "always allow {s}", .{suggestion}) catch "";
+    return std.mem.print(buf, "Always allow {s}", .{suggestion}) catch "";
 }
 
 /// The permission question in TWO ROWS, for a terminal that has no room for the
@@ -10612,10 +10612,10 @@ fn drawPermissionModalCompact(
         // Critical context (clipped). Full modal explains why/effects; compact
         // preserves the most important cue when there is room.
         if (allow_sandbox and std.ascii.eqlIgnoreCase(tool, "bash")) {
-            _ = p.putClipped(1, y + 1, "sandbox available (S): OS restrictions if kernel allows", width -| 2, theme.hint);
+            _ = p.putClipped(1, y + 1, "Sandbox available (S): OS restrictions if kernel allows", width -| 2, theme.hint);
         } else if (rule) |rname| {
             var rb: [160]u8 = undefined;
-            const why = std.mem.print(&rb, "asked by rule: {s}", .{rname}) catch "asked by permission rule";
+            const why = std.mem.print(&rb, "Asked by rule: {s}", .{rname}) catch "Asked by permission rule";
             _ = p.putClipped(1, y + 1, why, width -| 2, theme.hint);
         } else {
             // Detail summary (first line/chunk), clipped.
@@ -10626,17 +10626,17 @@ fn drawPermissionModalCompact(
 
     if (rows >= 2) {
         // Show only the actions the runtime actually accepts; the normal modal
-        // already filters "always allow", and the compact fallback must not
+        // already filters "Always allow", and the compact fallback must not
         // advertise a key that will be ignored.
         const opts = if (allow_sandbox and std.ascii.eqlIgnoreCase(tool, "bash"))
             (if (allow_always)
-                "Y allow · S sandbox · A always · N deny · ESC cancel"
+                "Y Allow · S Sandbox · A Always · N Deny · ESC Cancel"
             else
-                "Y allow · S sandbox · N deny · ESC cancel")
+                "Y Allow · S Sandbox · N Deny · ESC Cancel")
         else if (allow_always)
-            "Y allow · A always · N deny · ESC cancel"
+            "Y Allow · A Always · N Deny · ESC Cancel"
         else
-            "Y allow · N deny · ESC cancel";
+            "Y Allow · N Deny · ESC Cancel";
         _ = p.putClipped(1, opts_y, opts, width -| 2, theme.brand_soft);
     }
 }
@@ -10663,7 +10663,7 @@ pub fn drawPlanBlock(p: *Painter, top: u16, width: u16, pl: plan_mod.Plan) void 
     _ = p.putStable(0, top, frame, 2, theme.rule);
     if (pl.allDone()) {
         var buf: [64]u8 = undefined;
-        const txt = std.mem.print(&buf, "☑ plan {d}/{d} · complete", .{ pl.len, pl.len }) catch "☑ plan complete";
+        const txt = std.mem.print(&buf, "☑ Plan {d}/{d} · Complete", .{ pl.len, pl.len }) catch "☑ Plan complete";
         _ = p.putClipped(1, top, txt, width -| 1, theme.ok);
         return;
     }
@@ -10671,7 +10671,7 @@ pub fn drawPlanBlock(p: *Painter, top: u16, width: u16, pl: plan_mod.Plan) void 
     const i = pl.currentIndex() orelse return;
     const item = pl.items[i];
     var buf: [64]u8 = undefined;
-    const prefix = std.mem.print(&buf, "{s} plan {d}/{d} · {d} open · ", .{
+    const prefix = std.mem.print(&buf, "{s} Plan {d}/{d} · {d} open · ", .{
         item.status.glyph(),
         pl.doneCount(),
         pl.len,
@@ -10909,11 +10909,11 @@ pub fn drawAskPanel(
     // drawn in the one tone of the palette that cannot be read.
     var hb: [96]u8 = undefined;
     const hint_txt: []const u8 = if (snap.typing)
-        "Enter sends · Esc: you decide"
+        "Enter sends · Esc: You decide"
     else if (choice_rows > 0)
-        "↑↓ choose · Enter answers · Esc: you decide"
+        "↑↓ choose · Enter answers · Esc: You decide"
     else
-        "Type your answer below · Enter sends · Esc: you decide";
+        "Type your answer below · Enter sends · Esc: You decide";
     const ht = std.mem.print(&hb, "{s}", .{hint_txt}) catch hint_txt;
     if (ht.len > 0 and row < last_row) {
         _ = p.putClipped(inner_col, row, ht, inner_w, theme.hint);
@@ -10922,7 +10922,7 @@ pub fn drawAskPanel(
 
     if (row < last_row) {
         var wb: [32]u8 = undefined;
-        const w = std.mem.print(&wb, "waiting {d}s", .{waited_ms / 1000}) catch "";
+        const w = std.mem.print(&wb, "Waiting {d}s", .{waited_ms / 1000}) catch "";
         if (w.len > 0) {
             _ = p.putClipped(inner_col, row, w, inner_w, theme.hint_faint);
         }
@@ -11221,18 +11221,18 @@ pub fn drawStateFooter(
         legend = stage_en;
         // No detail for pipeline stages: the stage name IS the message.
     } else if (act.ask) {
-        legend = "waiting for your answer";
+        legend = "Waiting for your answer";
         const ms = self.askMillis();
         detail = std.mem.print(&detail_buf, "· {d}s to answer", .{ms / 1000}) catch "";
     } else if (act.perm) {
-        legend = "waiting for your permission";
+        legend = "Waiting for your permission";
     } else if (act.subagent_total > 0) {
-        legend = std.mem.print(&detail_buf, "subagents {d}/{d}", .{
+        legend = std.mem.print(&detail_buf, "Subagents {d}/{d}", .{
             act.subagent_completed,
             act.subagent_total,
-        }) catch "subagents";
+        }) catch "Subagents";
     } else if (running_tool) {
-        legend = "running";
+        legend = "Running";
         const ms = self.toolRunMillis();
         detail = std.mem.print(&detail_buf, "{s} · {d}.{d}s", .{
             running_tool_name.?,
@@ -11240,11 +11240,11 @@ pub fn drawStateFooter(
             (ms % 1000) / 100,
         }) catch "";
     } else if (act.streaming) {
-        legend = "streaming";
+        legend = "Streaming";
         const ms = self.busyMillis();
         detail = std.mem.print(&detail_buf, "{d}.{d}s", .{ ms / 1000, (ms % 1000) / 100 }) catch "";
     } else if (act.busy) {
-        legend = "thinking";
+        legend = "Thinking";
         const ms = self.busyMillis();
         // A reasoning model used to be indistinguishable from a hung one: only
         // the clock moved. The atomic char count grows as deltas arrive, which
@@ -11257,11 +11257,11 @@ pub fn drawStateFooter(
     } else {
         // Idle: the agent's own last word, if it said one ("done", "ready").
         legend = self.status();
-        if (legend.len == 0) legend = "ready";
+        if (legend.len == 0) legend = "Ready";
         // Phase 5 Review mode (presentation-only): subtle review affordance when
         // idle and there is file/diff context. Never shown during critical states.
         if (self.view_mode == .review and detail.len == 0 and self.lastChangedFile() != null) {
-            detail = "review: /diff /hunk /file";
+            detail = "Review: /diff /hunk /file";
         }
     }
     if (queued > 0) {
@@ -11904,7 +11904,7 @@ pub fn sessionInfo(m: *Model, arena: std.mem.Allocator) ?[]const InfoSeg {
             if (out.items.len > 0) {
                 out.append(arena, .{ .text = " · ", .style = theme.line }) catch return null;
             }
-            out.append(arena, .{ .text = "free-auto: building pool…", .style = theme.warn }) catch return null;
+            out.append(arena, .{ .text = "Free-auto: building pool…", .style = theme.warn }) catch return null;
         }
     }
 
@@ -12194,7 +12194,7 @@ pub fn drawPicker(p: *Painter, width: u16, height: u16, ps: PickerSnapshot) void
     var fbuf: [160]u8 = undefined;
     var f1_text: []const u8 = "";
     if (ps.semantic_searching) {
-        f1_text = "Searching…  ·  esc cancel";
+        f1_text = "Searching…  ·  esc Cancel";
     } else if (is_sessions and ps.query.len > 0) {
         f1_text = std.mem.print(
             &fbuf,

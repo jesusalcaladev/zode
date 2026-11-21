@@ -36,7 +36,7 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
         const tiny_size: vxfw.Size = .{ .width = width, .height = height };
         var tiny = try vxfw.Surface.init(ctx.arena, self.widget(), tiny_size);
         var tp = tui.Painter{ .surface = &tiny, .arena = ctx.arena, .ctx = ctx, .width = width, .height = height };
-        _ = tp.putText(0, 0, "zode: terminal too small (min 12x6)", theme.warn);
+        _ = tp.putText(0, 0, "Zode: terminal too small (min 12x6)", theme.warn);
         return tiny;
     }
 

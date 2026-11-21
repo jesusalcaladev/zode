@@ -610,7 +610,7 @@ fn planApprovalNudge(m: *tui.Model) ?[]u8 {
         .{ pl.len, brief_note },
     ) catch "Plan ready. Approve it so zode can start implementing?";
     const opts = [_][]const u8{ approve_option, revise_option };
-    setStatusWithZo(m, .warn, "the plan needs your approval");
+    setStatusWithZo(m, .warn, "The plan needs your approval");
     const answer = m.requestAsk(q, "plan", &opts);
     defer if (answer) |a| m.allocator.free(a);
 
@@ -3051,13 +3051,13 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
             m.pushInfo("usage: /pipeline <task> — the staged pipeline: evidence → implement → tester → verify → review");
         } else {
             startPipeline(m, task) catch |err| {
-                m.pushInfoFmt("pipeline: {t}", .{err});
+                m.pushInfoFmt("Pipeline: {t}", .{err});
             };
         }
     } else if (std.mem.eql(u8, cmd, "code-review")) {
         const paths = std.mem.trim(u8, rest, " \t\r\n");
         startCodeReview(m, paths) catch |err| {
-            m.pushInfoFmt("code-review: {t}", .{err});
+            m.pushInfoFmt("Code-review: {t}", .{err});
         };
     } else if (std.mem.eql(u8, cmd, "ask")) {
         commands_mod.cmdAskMode(m, arg);
@@ -3864,7 +3864,7 @@ pub fn startTurn(
 }
 
 fn setThinkingStatus(m: *tui.Model) void {
-    setStatusWithZo(m, .thinking, "thinking");
+    setStatusWithZo(m, .thinking, "Thinking");
 }
 
 fn startChatImplEx(
@@ -4506,7 +4506,7 @@ fn bashCommandAllowedForCmdSubst(command: []const u8) bool {
 fn reportCmdSubstFailure(m: *tui.Model, msg: []const u8) void {
     m.streamEnd();
     m.pushError(msg);
-    setStatusWithZo(m, .warn, "command substitution failed");
+    setStatusWithZo(m, .warn, "Command substitution failed");
 }
 
 /// Expands prompt command substitutions for a worker turn. On failure it reports
@@ -4820,7 +4820,7 @@ fn ensureTurnModelReady(m: *tui.Model, http: *http_client.Http, pick: *Target) b
     if (pick.model.len == 0) {
         m.streamEnd();
         m.pushInfo("no model to talk to: pick one with /model (ctrl+t). Nothing was sent.");
-        setStatusWithZo(m, .warn, "no model");
+        setStatusWithZo(m, .warn, "No model");
         return false;
     }
     routerWarnOnce(m, pick.model);
@@ -5637,7 +5637,7 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
         return null;
     }
 
-    setStatusWithZo(m, .thinking, "no model chosen · asking the provider");
+    setStatusWithZo(m, .thinking, "No model chosen · asking the provider");
 
     var list = models_mod.listModels(gpa, http, def.models_url, providers.authWithKey(def.key_style, providers.keyFor(def, m.environ) orelse curKey(m))) catch |err| {
         m.pushInfoFmt(
@@ -6675,10 +6675,10 @@ fn executeTurnRequest(
             gpa,
             "thinking · iteration {d}/{d}",
             .{ iteration + 1, limit },
-        ) catch "thinking";
+        ) catch "Thinking";
         setStatusWithZo(m, .thinking, it);
     } else {
-        setStatusWithZo(m, .thinking, "thinking");
+        setStatusWithZo(m, .thinking, "Thinking");
     }
 
     var attempt: usize = 0;
@@ -6978,14 +6978,14 @@ pub fn applyGoalCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Alloca
     switch (v.status) {
         .met => {
             m.pushInfoFmt("goal met: {s}", .{v.summary});
-            setStatusWithZo(m, .done, "goal met");
+            setStatusWithZo(m, .done, "Goal met");
         },
         .blocked => {
             // Said the way the user needs it: what is wrong, and what would change it.
             // A blocker without the second half is a shrug and reads as one.
             m.pushInfoFmt("goal blocked: {s}", .{v.summary});
             if (ub.len > 0) m.pushInfoFmt("  would unblock it: {s}", .{ub});
-            setStatusWithZo(m, .warn, "goal blocked");
+            setStatusWithZo(m, .warn, "Goal blocked");
         },
         .none => {},
     }
@@ -7015,7 +7015,7 @@ fn applyPlanCall(m: *tui.Model, args_json: []const u8, arena: std.mem.Allocator)
         m.pushInfoFmt("{s}\n{s}", .{ line, snapshot.details(arena) });
     }
     if (snapshot.allDone()) {
-        setStatusWithZo(m, .done, "all plan steps done");
+        setStatusWithZo(m, .done, "All plan steps done");
         // The plan is finished: the block above the input goes away NOW, not
         // at turn end. A ticked-off checklist that never leaves is noise, and
         // the completed lines are already in the transcript.
@@ -7995,7 +7995,7 @@ fn askCall(m: *tui.Model, s: *session_mod.Session, call: TurnCtx.Call, _arena: s
     // to `ask(...)`. A history that says `ask(Which database?)` is the difference
     // between being able to scroll back and understanding what happened.
     m.pushToolStart("ask", question.question);
-    setStatusWithZo(m, .warn, "the model has a question");
+    setStatusWithZo(m, .warn, "The model has a question");
 
     // The answer comes back as a gpa copy that this function OWNS. It is freed
     // exactly once, right after the two things that read it (the result text and
@@ -11556,7 +11556,7 @@ fn reportErr(m: *tui.Model, err: anyerror) void {
     const gpa = m.allocator;
     switch (err) {
         error.Cancelled => {
-            setStatusWithZo(m, .warn, "interrupted");
+            setStatusWithZo(m, .warn, "Interrupted");
             return;
         },
         // 401. It USUALLY is the key, but not always: openrouter answers
@@ -14189,12 +14189,12 @@ test "/help lists the shortcuts, not just the commands" {
     const all = help;
 
     // The command block, with their shortcut when they have one.
-    try std.testing.expect(std.mem.indexOf(u8, all, "commands") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Commands") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "/allowlist") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "(ctrl+p)") != null);
 
     // The shortcut block, with the ones that are NOT commands.
-    try std.testing.expect(std.mem.indexOf(u8, all, "shortcuts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Shortcuts") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "ctrl+l") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "ctrl+r") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "esc") != null);
@@ -18849,7 +18849,7 @@ fn pipelineStop(m: *tui.Model, cancelled: bool) void {
     m.setPipelineStage(null);
     if (cancelled) {
         m.pushInfo("· pipeline: cancelled — the tree may be partially changed; review the diff and artifacts before continuing");
-        setStatusWithZo(m, .warn, "pipeline cancelled");
+        setStatusWithZo(m, .warn, "Pipeline cancelled");
     }
     m.streamEnd();
     endTurn(m, turn_stats.iterations, cancelled);
@@ -18878,10 +18878,10 @@ fn runPipelineExplorerStage(
     run_dir: []const u8,
 ) ?[]const u8 {
     m.setPipelineStage("explorer");
-    setStatusWithZo(m, .thinking, "pipeline · explorer");
+    setStatusWithZo(m, .thinking, "Pipeline · explorer");
     var rep: subagent_mod.Report = undefined;
     const prompt = std.fmt.allocPrint(arena, explorer_prompt, .{task_text}) catch {
-        m.pushError("pipeline: could not compose the explorer prompt");
+        m.pushError("Pipeline: could not compose the explorer prompt");
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
         return null;
@@ -18906,7 +18906,7 @@ fn runPipelineInvestigatorStage(
         return null;
     }
     m.setPipelineStage("investigator");
-    setStatusWithZo(m, .thinking, "pipeline · investigator");
+    setStatusWithZo(m, .thinking, "Pipeline · investigator");
     var rep: subagent_mod.Report = undefined;
     const prompt = std.fmt.allocPrint(arena, investigator_prompt, .{ task_text, evidence }) catch return null;
     const out = runPipelineSubagent(m, &rep, "investigator", prompt, run_dir, "notes.md");
@@ -18924,13 +18924,13 @@ fn runPipelineImplementerStage(
     notes: ?[]const u8,
 ) bool {
     m.setPipelineStage("implementer");
-    setStatusWithZo(m, .thinking, "pipeline · implementer");
+    setStatusWithZo(m, .thinking, "Pipeline · implementer");
     const seed = std.fmt.allocPrint(arena, implementer_seed, .{
         task_text,
         evidence,
         if (notes) |n| n else "No investigation was needed for this task.",
     }) catch {
-        m.pushError("pipeline: could not compose the implementer seed");
+        m.pushError("Pipeline: could not compose the implementer seed");
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
         return false;
@@ -18954,7 +18954,7 @@ fn enforceImplementerTestGuard(
     if (violations.len == 0) return true;
 
     const detail = pipeline_support.formatViolations(arena, violations) catch "existing tests were modified";
-    m.pushErrorFmt("pipeline: existing tests were modified — this is not allowed:\n{s}\nRestoring them is required.", .{detail});
+    m.pushErrorFmt("Pipeline: existing tests were modified — this is not allowed:\n{s}\nRestoring them is required.", .{detail});
     const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The existing tests changed during your work:\n{s}\nRestore them exactly as they were. Do not re-add your version of them by hand in any other file — the point is the ORIGINAL tests, byte for byte.", .{detail}) catch {
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
@@ -18967,7 +18967,7 @@ fn enforceImplementerTestGuard(
     }
     const left = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
     if (left.len > 0) {
-        m.pushError("pipeline: existing tests are still modified — stopping. The tree is left as it is; review the diff before deciding.");
+        m.pushError("Pipeline: existing tests are still modified — stopping. The tree is left as it is; review the diff before deciding.");
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
         return false;
@@ -18992,7 +18992,7 @@ fn runPipelineTesterStage(
     }
 
     m.setPipelineStage("tester");
-    setStatusWithZo(m, .thinking, "pipeline · tester");
+    setStatusWithZo(m, .thinking, "Pipeline · tester");
     var rep: subagent_mod.Report = undefined;
     const prompt = std.fmt.allocPrint(arena, tester_prompt, .{ task_text, evidence }) catch {
         m.streamEnd();
@@ -19008,7 +19008,7 @@ fn runPipelineTesterStage(
     const violations2 = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
     if (violations2.len > 0) {
         const detail = pipeline_support.formatViolations(arena, violations2) catch "existing tests were modified";
-        m.pushErrorFmt("pipeline: the tester modified existing tests — refusing to trust its report:\n{s}", .{detail});
+        m.pushErrorFmt("Pipeline: the tester modified existing tests — refusing to trust its report:\n{s}", .{detail});
     }
     return true;
 }
@@ -19029,7 +19029,7 @@ fn runPipelineVerifyStage(
     var tests_passed = omit_tests;
     if (!omit_tests) {
         m.setPipelineStage("verify");
-        setStatusWithZo(m, .tooling, "pipeline · running the test suite");
+        setStatusWithZo(m, .tooling, "Pipeline · running the test suite");
         if (testplan_mod.planAt(io, ".")) |plan| {
             var cycle: usize = 0;
             while (cycle <= pipeline_mod.max_repair_cycles) {
@@ -19052,17 +19052,17 @@ fn runPipelineVerifyStage(
                 const repair = std.fmt.allocPrint(arena, verify_repair_prompt, .{ plan.label, suite.tail }) catch break;
                 appendPipelineHarnessPrompt(m, repair);
                 m.setPipelineStage("implementer");
-                setStatusWithZo(m, .thinking, "pipeline · implementer (repair)");
+                setStatusWithZo(m, .thinking, "Pipeline · implementer (repair)");
                 if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) {
                     pipelineStop(m, true);
                     return .{ .stopped = true, .tests_passed = tests_passed };
                 }
                 m.setPipelineStage("verify");
-                setStatusWithZo(m, .tooling, "pipeline · running the test suite");
+                setStatusWithZo(m, .tooling, "Pipeline · running the test suite");
                 const touch = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
                 if (touch.len > 0) {
                     const detail = pipeline_support.formatViolations(arena, touch) catch "existing tests were modified";
-                    m.pushErrorFmt("pipeline: a repair modified existing tests:\n{s}\nRestoring them is required.", .{detail});
+                    m.pushErrorFmt("Pipeline: a repair modified existing tests:\n{s}\nRestoring them is required.", .{detail});
                     const reprimand = std.fmt.allocPrint(arena, "[Pipeline] The repair pass changed existing tests:\n{s}\nRestore them exactly as they were.", .{detail}) catch break;
                     appendPipelineHarnessPrompt(m, reprimand);
                     m.setPipelineStage("implementer");
@@ -19073,7 +19073,7 @@ fn runPipelineVerifyStage(
                     m.setPipelineStage("verify");
                     const left = pipeline_support.verifyZigTests(arena, io, snaps) catch &.{};
                     if (left.len > 0) {
-                        m.pushError("pipeline: existing tests are still modified after repair — stopping. Review the diff before deciding.");
+                        m.pushError("Pipeline: existing tests are still modified after repair — stopping. Review the diff before deciding.");
                         m.streamEnd();
                         endTurn(m, turn_stats.iterations, false);
                         return .{ .stopped = true, .tests_passed = tests_passed };
@@ -19084,7 +19084,7 @@ fn runPipelineVerifyStage(
             m.pushInfo("· pipeline: no test command known for this project — tests not run");
             tests_passed = true;
         }
-        if (!tests_passed) setStatusWithZo(m, .warn, "pipeline · tests failing");
+        if (!tests_passed) setStatusWithZo(m, .warn, "Pipeline · tests failing");
     }
     return .{ .stopped = false, .tests_passed = tests_passed };
 }
@@ -19107,7 +19107,7 @@ fn runPipelineReviewStage(
     }
 
     m.setPipelineStage("reviewer");
-    setStatusWithZo(m, .thinking, "pipeline · reviewer");
+    setStatusWithZo(m, .thinking, "Pipeline · reviewer");
     var rep: subagent_mod.Report = undefined;
     const diff = pipeline_support.gitDiffHEAD(arena, io);
     const status = pipeline_support.gitStatusShort(arena, io);
@@ -19123,7 +19123,7 @@ fn runPipelineReviewStage(
         const repair = std.fmt.allocPrint(arena, review_repair_prompt, .{report}) catch "";
         if (repair.len > 0) appendPipelineHarnessPrompt(m, repair);
         m.setPipelineStage("implementer");
-        setStatusWithZo(m, .thinking, "pipeline · implementer (review fix)");
+        setStatusWithZo(m, .thinking, "Pipeline · implementer (review fix)");
         if (runAgentLoop(m, task_text).reason == .cancelled or pipelineCancelled()) {
             pipelineStop(m, true);
             return .{ .stopped = true, .tests_passed = tests_passed };
@@ -19131,7 +19131,7 @@ fn runPipelineReviewStage(
         if (!omit_tests) {
             if (testplan_mod.planAt(io, ".")) |plan| {
                 m.setPipelineStage("verify");
-                setStatusWithZo(m, .tooling, "pipeline · running the test suite");
+                setStatusWithZo(m, .tooling, "Pipeline · running the test suite");
                 const suite = pipeline_support.runTestSuite(arena, io, plan);
                 m.pushInfo(if (suite.passed) "· pipeline: tests still pass after the repair" else "· pipeline: tests are RED after the repair");
                 if (!suite.passed) tests_passed = false;
@@ -19210,7 +19210,7 @@ fn runPipeline(m: *tui.Model, task_text: []const u8) void {
 
     var dir_buf: [512]u8 = undefined;
     const run_dir = pipeline_support.pipelineRunDir(&dir_buf, io) orelse {
-        m.pushError("pipeline: could not create the artifacts directory");
+        m.pushError("Pipeline: could not create the artifacts directory");
         m.streamEnd();
         endTurn(m, turn_stats.iterations, false);
         return;
@@ -19281,7 +19281,7 @@ fn finishPipelineRun(
         pipeline_mod.verifyWord(.not_detectable);
     m.pushInfoFmt("· pipeline: done — {s} — artifacts in {s}", .{ verify_label, run_dir });
     m.streamEnd();
-    setStatusWithZo(m, if (tests_passed or verdict.omit_tests) .done else .warn, "pipeline done");
+    setStatusWithZo(m, if (tests_passed or verdict.omit_tests) .done else .warn, "Pipeline done");
     endTurn(m, turn_stats.iterations, false);
 }
 
@@ -19300,12 +19300,12 @@ fn resolveCodeReviewPrompt(m: *tui.Model, arena: std.mem.Allocator, io: std.Io, 
             .nothing_to_review => {
                 m.pushInfo("· code-review: nothing to review — the working tree is clean");
                 m.streamEnd();
-                setStatusWithZo(m, .done, "code-review done");
+                setStatusWithZo(m, .done, "Code-review done");
                 endTurn(m, turn_stats.iterations, false);
                 return null;
             },
             .compose_failed => {
-                m.pushError("code-review: could not compose the review prompt");
+                m.pushError("Code-review: could not compose the review prompt");
                 m.streamEnd();
                 endTurn(m, turn_stats.iterations, false);
                 return null;
@@ -19316,7 +19316,7 @@ fn resolveCodeReviewPrompt(m: *tui.Model, arena: std.mem.Allocator, io: std.Io, 
         .prompt => |p| return p,
         .nothing_to_review => unreachable,
         .compose_failed => {
-            m.pushError("code-review: could not compose the review prompt");
+            m.pushError("Code-review: could not compose the review prompt");
             m.streamEnd();
             endTurn(m, turn_stats.iterations, false);
             return null;
@@ -19357,7 +19357,7 @@ fn finishCodeReviewRun(m: *tui.Model, prompt: []const u8, run_dir: []const u8) v
     const report = runPipelineSubagent(m, &rep, "reviewer", prompt, run_dir, "review.md");
     const counts = pipeline_mod.parseReviewReport(report);
     m.streamEnd();
-    setStatusWithZo(m, .done, "code-review done");
+    setStatusWithZo(m, .done, "Code-review done");
     m.pushInfoFmt("· code-review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
     m.pushInfoFmt("· the report is in {s}/review.md", .{run_dir});
     if (counts.high > 0) {

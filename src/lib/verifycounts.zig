@@ -18,7 +18,7 @@ pub const Counts = struct {
     verified: usize = 0,
     refuted: usize = 0,
 
-    /// Every report starts here: NO DATA. "setting up" must never read as
+    /// Every report starts here: NO DATA. "Setting up" must never read as
     /// "0 findings" — that is `proofWord(.nothing) -> "not checked"` applied
     /// to a progress pill.
     pub fn hasData(self: Counts) bool {
@@ -36,7 +36,7 @@ pub const Counts = struct {
     /// Word labels, never ✓/✗: provenance icons tell the reader where a
     /// verdict came from and silently lose that information when pasted.
     pub fn format(self: Counts, gpa: std.mem.Allocator) ![]const u8 {
-        if (!self.hasData()) return gpa.dupe(u8, "setting up");
+        if (!self.hasData()) return gpa.dupe(u8, "Setting up");
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
         try out.print(gpa, "{d} found · {d} verified", .{ self.found, self.verified });
@@ -70,11 +70,11 @@ pub const Phase = enum {
 
     pub fn label(self: Phase) []const u8 {
         return switch (self) {
-            .setting_up => "setting up",
-            .finding => "finding",
-            .verifying => "verifying",
-            .deduping => "deduping",
-            .ready => "ultrareview ready",
+            .setting_up => "Setting up",
+            .finding => "Finding",
+            .verifying => "Verifying",
+            .deduping => "Deduping",
+            .ready => "Ultrareview ready",
         };
     }
 };
@@ -108,7 +108,7 @@ test "verifycounts: no data reads as setting up, not zero" {
     const c = Counts{};
     try std.testing.expect(!c.hasData());
     const s = try c.format(a);
-    try std.testing.expectEqualStrings("setting up", s);
+    try std.testing.expectEqualStrings("Setting up", s);
 }
 
 test "verifycounts: refuted hidden at zero, shown when positive" {

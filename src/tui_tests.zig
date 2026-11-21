@@ -214,7 +214,7 @@ test "render: the status and workspace rule anchor the compact prompt" {
     agent.setAnswering(""); // reset globals leaked by agent tests
     agent.cur_model = "";
     defer m.deinit();
-    m.setStatusText("ready");
+    m.setStatusText("Ready");
 
     const height: u16 = 12;
     const s = try drawTest(&m, arena, 40, height);
@@ -235,7 +235,7 @@ test "render: the status and workspace rule anchor the compact prompt" {
     // status
     var buf2: [128]u8 = undefined;
     const st = rowText(s, height - 1, &buf2);
-    try std.testing.expect(std.mem.indexOf(u8, st, "ready") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st, "Ready") != null);
 }
 
 test "the bottom furniture is exactly two rows and nothing else" {
@@ -1817,10 +1817,10 @@ test "reasoning: a thinking block is its own paragraph, not assistant text" {
     m.pushReasoning("checking the sidecar before rewriting the writer");
     _ = try drawTest(&m, arena_state.allocator(), 100, 20);
     const s = try drawTest(&m, arena_state.allocator(), 100, 20);
-    const row = findRow(s, "thinking") orelse return error.TestExpectedEqual;
+    const row = findRow(s, "Thinking") orelse return error.TestExpectedEqual;
     var buf: [512]u8 = undefined;
     const text = rowText(s, row, &buf);
-    try std.testing.expect(std.mem.indexOf(u8, text, "◇ thinking") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "◇ Thinking") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "chars") != null);
 }
 
@@ -2817,7 +2817,7 @@ test "the mascot is BELOW the input's well, not inside it" {
 
 test "the state is in ONE place: the footer's row" {
     // The phase used to be painted in TWO rows: the activity strip above the
-    // hairline said "thinking" / "streaming" / "running Bash", and the status
+    // hairline said "Thinking" / "Streaming" / "running Bash", and the status
     // row under the input held the mascot and the model's name. Two surfaces
     // for one state is what made the bottom of the app look like two
     // competing status indicators.
@@ -2847,16 +2847,16 @@ test "the state is in ONE place: the footer's row" {
     const s = try drawTest(&m, arena_state.allocator(), 90, 24);
     const all = allText(s);
 
-    // With an open stream the label is the PHASE ("streaming"), not the generic
+    // With an open stream the label is the PHASE ("Streaming"), not the generic
     // "working" from before: 40s of "working" does not distinguish thinking
     // from writing from a hung command.
-    try std.testing.expect(std.mem.indexOf(u8, all, "streaming") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Streaming") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "1 queued") != null);
 
     var status_buf: [256]u8 = undefined;
     const footer = rowText(s, s.size.height - 1, &status_buf);
     // The footer is the LAST row: it is the last row of the composer's well.
-    try std.testing.expect(std.mem.indexOf(u8, footer, "streaming") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Streaming") != null);
     try std.testing.expect(std.mem.indexOf(u8, footer, "1 queued") != null);
     // The mascot is the state indicator and it is in the same row.
     try std.testing.expect(std.mem.indexOf(u8, footer, "( o") != null);
@@ -2866,7 +2866,7 @@ test "the state is in ONE place: the footer's row" {
     while (r < s.size.height - 1) : (r += 1) {
         var rb: [256]u8 = undefined;
         const text = rowText(s, r, &rb);
-        try std.testing.expect(std.mem.indexOf(u8, text, "streaming") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Streaming") == null);
     }
 }
 
@@ -2881,9 +2881,9 @@ test "activity strip: the label is the phase" {
     {
         var m = Model.init(std.testing.allocator);
         defer m.deinit();
-        m.setStatusWithMood(.thinking, "thinking");
+        m.setStatusWithMood(.thinking, "Thinking");
         const s = try drawTest(&m, arena_state.allocator(), 90, 24);
-        try std.testing.expect(std.mem.indexOf(u8, allText(s), "thinking") != null);
+        try std.testing.expect(std.mem.indexOf(u8, allText(s), "Thinking") != null);
     }
 
     // 2) writing: stream open.
@@ -2892,16 +2892,16 @@ test "activity strip: the label is the phase" {
         defer m.deinit();
         m.streamStart();
         const s = try drawTest(&m, arena_state.allocator(), 90, 24);
-        try std.testing.expect(std.mem.indexOf(u8, allText(s), "streaming") != null);
+        try std.testing.expect(std.mem.indexOf(u8, allText(s), "Streaming") != null);
     }
-    // 3) running a tool: the tool's name, not "thinking".
+    // 3) running a tool: the tool's name, not "Thinking".
     {
         var m = Model.init(std.testing.allocator);
         defer m.deinit();
         m.pushToolStart("bash", "sleep 9");
         const s = try drawTest(&m, arena_state.allocator(), 90, 24);
         const all = allText(s);
-        try std.testing.expect(std.mem.indexOf(u8, all, "running") != null);
+        try std.testing.expect(std.mem.indexOf(u8, all, "Running") != null);
         try std.testing.expect(std.mem.indexOf(u8, all, "bash") != null);
     }
     // 4) waiting for permission: it wins over everything else.
@@ -2911,7 +2911,7 @@ test "activity strip: the label is the phase" {
         m.pushToolStart("write", "x.txt");
         m.perm_active = true;
         const s = try drawTest(&m, arena_state.allocator(), 90, 24);
-        try std.testing.expect(std.mem.indexOf(u8, allText(s), "waiting for your permission") != null);
+        try std.testing.expect(std.mem.indexOf(u8, allText(s), "Waiting for your permission") != null);
     }
 }
 
@@ -2927,7 +2927,7 @@ test "activity strip: parallel subagents show live completion and active counts"
     m.taskBatchFinished();
     const s = try drawTest(&m, arena_state.allocator(), 100, 24);
     const all = allText(s);
-    try std.testing.expect(std.mem.indexOf(u8, all, "subagents 1/7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Subagents 1/7") != null);
 
     m.endTaskBatch();
     try std.testing.expectEqual(@as(usize, 0), m.activity().subagent_total);
@@ -3094,10 +3094,10 @@ test "permissions: the modal is centered and shows the 4 options" {
     try std.testing.expect(std.mem.indexOf(u8, all, "write") != null);
     try std.testing.expect(std.mem.indexOf(u8, all, "hola.js") != null);
     // The four options, with their key.
-    try std.testing.expect(std.mem.indexOf(u8, all, "Y allow once") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "A always allow") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "N deny") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "ESC cancel") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Y Allow once") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "A Always allow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "N Deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "ESC Cancel") != null);
     m.perm_active = false;
 }
 
@@ -3156,13 +3156,13 @@ test "permissions: a long matched rule wraps inside the modal without hiding opt
     const s = try drawTest(&m, arena_state.allocator(), 60, 20);
     const all = allText(s);
     try std.testing.expect(std.mem.indexOf(u8, all, "Permission required") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "asked by rule") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Asked by rule") != null);
     // The rule text is present (possibly wrapped across rows).
     try std.testing.expect(std.mem.indexOf(u8, all, "long/rule/name") != null or
         std.mem.indexOf(u8, all, "Bash(project") != null);
     // The answer options must still be reachable.
     try std.testing.expect(std.mem.indexOf(u8, all, "Y") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Deny") != null);
     m.perm_active = false;
 }
 
@@ -3181,7 +3181,7 @@ test "permissions: narrow terminal with a long rule still shows a readable promp
     const s = try drawTest(&m, arena_state.allocator(), 24, 10);
     const all = allText(s);
     try std.testing.expect(std.mem.indexOf(u8, all, "Permission") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "Y allow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Y Allow") != null);
     m.perm_active = false;
 }
 
@@ -3208,9 +3208,9 @@ test "permissions: a very long bash detail wraps and remains answerable" {
     try std.testing.expect(std.mem.indexOf(u8, all, "very-long-command") != null or
         std.mem.indexOf(u8, all, "many arguments") != null);
     // Critical actions remain available.
-    try std.testing.expect(std.mem.indexOf(u8, all, "allow once") != null or
+    try std.testing.expect(std.mem.indexOf(u8, all, "Allow once") != null or
         std.mem.indexOf(u8, all, "Y") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "deny") != null or
+    try std.testing.expect(std.mem.indexOf(u8, all, "Deny") != null or
         std.mem.indexOf(u8, all, "N") != null);
     m.perm_active = false;
 }
@@ -3234,9 +3234,9 @@ test "permissions: a long always-allow suggestion stays within a narrow modal" {
     const all = allText(s);
     try std.testing.expect(std.mem.indexOf(u8, all, "Permission required") != null);
     // On tight widths the label falls back to the compact form.
-    try std.testing.expect(std.mem.indexOf(u8, all, "always allow") != null or
+    try std.testing.expect(std.mem.indexOf(u8, all, "Always allow") != null or
         std.mem.indexOf(u8, all, "A") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "deny") != null or
+    try std.testing.expect(std.mem.indexOf(u8, all, "Deny") != null or
         std.mem.indexOf(u8, all, "N") != null);
     m.perm_active = false;
 }
@@ -3258,16 +3258,16 @@ test "permissions: compact fallback hides always-allow when the runtime does not
     const s = try drawTest(&m, arena_state.allocator(), 24, 10);
     const all = allText(s);
     try std.testing.expect(std.mem.indexOf(u8, all, "Permission") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "Y allow") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "deny") != null);
-    try std.testing.expect(std.mem.indexOf(u8, all, "A always") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Y Allow") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Deny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "A Always") == null);
     m.perm_active = false;
 }
 
 test "the mascot IS the state indicator: the face sits next to the label" {
-    // This test asserted the OPPOSITE once: that the row saying "thinking" has
+    // This test asserted the OPPOSITE once: that the row saying "Thinking" has
     // NO face of any mood. It was written when the face had been taken out of
-    // the row that said "thinking", and what was left was a word on an empty
+    // the row that said "Thinking", and what was left was a word on an empty
     // row — which is what the user called ugly.
     //
     // The design now: the mascot IS the state, the word is its legend, and
@@ -3278,14 +3278,14 @@ test "the mascot IS the state indicator: the face sits next to the label" {
 
     var m = Model.init(std.testing.allocator);
     defer m.deinit();
-    m.setStatusWithMood(.thinking, "thinking");
+    m.setStatusWithMood(.thinking, "Thinking");
     m.lock();
     m.busy = true;
     m.busy_started_ns = std.math.maxInt(i128);
     m.unlock();
 
     const s = try drawTest(&m, arena, 92, 26);
-    const row = findRow(s, "thinking") orelse return error.TestUnexpectedResult;
+    const row = findRow(s, "Thinking") orelse return error.TestUnexpectedResult;
     var rb: [256]u8 = undefined;
     const text = rowText(s, row, &rb);
 
@@ -3299,8 +3299,8 @@ test "the mascot IS the state indicator: the face sits next to the label" {
     const cell = s.readCell(1, row);
     try std.testing.expectEqualStrings("(", cell.char.grapheme);
 
-    // Label is just "thinking" (no animated dots).
-    try std.testing.expect(std.mem.indexOf(u8, text, "thinking") != null);
+    // Label is just "Thinking" (no animated dots).
+    try std.testing.expect(std.mem.indexOf(u8, text, "Thinking") != null);
     // Clock should be present (e.g., "0.0s")
     try std.testing.expect(std.mem.indexOf(u8, text, "0.") != null or std.mem.indexOf(u8, text, "1.") != null);
 }
@@ -3337,7 +3337,7 @@ test "the waiting states show the mascot's warning face in the footer" {
     var rb: [256]u8 = undefined;
     const footer = rowText(s, s.size.height - 1, &rb);
     try std.testing.expect(std.mem.indexOf(u8, footer, "( ! ! )") != null);
-    try std.testing.expect(std.mem.indexOf(u8, footer, "waiting for your answer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, footer, "Waiting for your answer") != null);
 }
 
 /// A banner line's columns, without the `*…*` marks.
@@ -3970,7 +3970,7 @@ test "a running tool clock appears only in the activity strip" {
         const s = try drawTest(&m, arena_state.allocator(), 92, 26);
         const all = allText(s);
         try std.testing.expect(std.mem.indexOf(u8, all, "sleep 30") != null);
-        try std.testing.expect(std.mem.indexOf(u8, all, "running") != null);
+        try std.testing.expect(std.mem.indexOf(u8, all, "Running") != null);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, all, "0.0s"));
         try std.testing.expect(m.isBusy());
     }
@@ -3980,7 +3980,7 @@ test "a running tool clock appears only in the activity strip" {
     try std.testing.expect(!m.isBusy());
     const s2 = try drawTest(&m, arena_state.allocator(), 92, 26);
     const all2 = allText(s2);
-    try std.testing.expect(std.mem.indexOf(u8, all2, "running") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all2, "Running") == null);
     try std.testing.expect(std.mem.indexOf(u8, all2, "30000ms") != null);
 }
 
@@ -3999,8 +3999,8 @@ test "the strip names the phase: thinking, streaming or running a tool" {
         const all = allText(s);
         // Once the request is opened, the strip reports streaming while the
         // history stays clear until actual text arrives.
-        try std.testing.expect(std.mem.indexOf(u8, all, "streaming") != null);
-        try std.testing.expect(std.mem.indexOf(u8, all, "thinking ·") == null);
+        try std.testing.expect(std.mem.indexOf(u8, all, "Streaming") != null);
+        try std.testing.expect(std.mem.indexOf(u8, all, "Thinking ·") == null);
     }
     {
         var m = Model.init(std.testing.allocator);
@@ -4008,14 +4008,14 @@ test "the strip names the phase: thinking, streaming or running a tool" {
         m.streamStart();
         m.streamDelta("hola");
         const s = try drawTest(&m, arena, 90, 20);
-        try std.testing.expect(std.mem.indexOf(u8, allText(s), "streaming") != null);
+        try std.testing.expect(std.mem.indexOf(u8, allText(s), "Streaming") != null);
     }
     {
         var m = Model.init(std.testing.allocator);
         defer m.deinit();
         m.pushToolStart("bash", "sleep 30");
         const s = try drawTest(&m, arena, 90, 20);
-        try std.testing.expect(std.mem.indexOf(u8, allText(s), "running") != null);
+        try std.testing.expect(std.mem.indexOf(u8, allText(s), "Running") != null);
     }
 }
 
@@ -4043,9 +4043,9 @@ test "the activity strip is the only clock before the first token" {
     m.streamStart();
     const s = try drawTest(&m, arena_state.allocator(), 80, 20);
     const all = allText(s);
-    try std.testing.expect(std.mem.indexOf(u8, all, "streaming") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Streaming") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, all, "0.0s"));
-    try std.testing.expect(std.mem.indexOf(u8, all, "thinking ·") == null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "Thinking ·") == null);
 }
 
 test "at idle there is no activity clock" {
@@ -4055,7 +4055,7 @@ test "at idle there is no activity clock" {
     defer m.deinit();
 
     const s = try drawTest(&m, arena_state.allocator(), 80, 20);
-    try std.testing.expect(std.mem.indexOf(u8, allText(s), "thinking") == null);
+    try std.testing.expect(std.mem.indexOf(u8, allText(s), "Thinking") == null);
 }
 
 // ── ROADMAP Phase 0: the safety net that was missing ──────────
@@ -4960,7 +4960,7 @@ test "plan summary: progress and current step are visible without repeating the 
     try std.testing.expect(m.activity().dirty);
 
     const s = try drawTest(&m, arena, 100, 30);
-    const r_cur = findRow(s, "plan 1/3 · 2 open · implementar la tool") orelse return error.TestUnexpectedResult;
+    const r_cur = findRow(s, "Plan 1/3 · 2 open · implementar la tool") orelse return error.TestUnexpectedResult;
     try std.testing.expect(findRow(s, "leer el roadmap") == null);
     try std.testing.expect(findRow(s, "escribir los tests") == null);
 
@@ -5045,7 +5045,7 @@ test "a finished plan is drawn in ONE line" {
     _ = m.applyPlan(&items, 8);
 
     const s = try drawTest(&m, arena, 100, 30);
-    _ = findRow(s, "plan 8/8 · complete") orelse return error.TestUnexpectedResult;
+    _ = findRow(s, "Plan 8/8 · Complete") orelse return error.TestUnexpectedResult;
     // CAREFUL: the summary's check is "☑ all...", so searching for "☑ a" would
     // match the summary itself. What is searched for is each step's NUMBER,
     // which only shows up when the list is painted whole.
@@ -5078,7 +5078,7 @@ test "a long plan summary keeps the open count visible" {
     _ = m.applyPlan(&items, 20);
 
     const s = try drawTest(&m, arena, 120, 44);
-    const r = findRow(s, "plan 1/20 · 19 open") orelse return error.TestUnexpectedResult;
+    const r = findRow(s, "Plan 1/20 · 19 open") orelse return error.TestUnexpectedResult;
     var buf: [128]u8 = undefined;
     try std.testing.expect(std.mem.indexOf(u8, rowText(s, r, &buf), "· b") != null);
     try std.testing.expect(findRow(s, "1. a") == null);
@@ -5169,7 +5169,7 @@ test "streamEnd with no text also clears `streaming`, so nothing counts forever"
     // damage.
     //
     // `self.streaming = false` used to live INSIDE `if (has_text and ...)`, so a
-    // turn that ended with an empty buffer left the model "streaming" forever.
+    // turn that ended with an empty buffer left the model "Streaming" forever.
     // `workingLocked()` counts `streaming`, so from then on EVERY frame kept
     // showing an activity clock, spinner and busy status long after the turn
     // was over.
@@ -5190,7 +5190,7 @@ test "streamEnd with no text also clears `streaming`, so nothing counts forever"
     // And nothing invents a live line on the next frame.
     m.pushInfo("algo");
     const s = try drawTest(&m, arena_state.allocator(), 60, 20);
-    try std.testing.expect(std.mem.indexOf(u8, allText(s), "thinking") == null);
+    try std.testing.expect(std.mem.indexOf(u8, allText(s), "Thinking") == null);
 
     // Same with whitespace only, which is what a model that answers with a
     // single newline produces.
@@ -5249,7 +5249,7 @@ test "ask: the question is on screen AND in the strip with its clock" {
 
     try openAskForTest(&m, "Que base de datos usamos?", "backend", &.{});
 
-    // The strip says it is waiting for an ANSWER (not "thinking"), because the
+    // The strip says it is waiting for an ANSWER (not "Thinking"), because the
     // difference between "I am working" and "I am waiting for you" is exactly
     // what makes you look at the modal.
     try std.testing.expect(m.activity().ask);
@@ -5258,7 +5258,7 @@ test "ask: the question is on screen AND in the strip with its clock" {
     try std.testing.expect(findRow(s, "Que base de datos usamos?") != null);
     try std.testing.expect(findRow(s, "backend") != null);
     // And the strip's clock.
-    try std.testing.expect(findRow(s, "waiting for your answer") != null);
+    try std.testing.expect(findRow(s, "Waiting for your answer") != null);
 }
 
 test "ask: the strip warns of the wait WITH SECONDS, not just that it waits" {
@@ -6548,7 +6548,7 @@ test "queue: a queued prompt is taken when no turn is in flight, and only then" 
     try std.testing.expect(m.takeQueuedWhenIdle() == null);
 }
 
-/// Dots after "thinking": 0 to `ellipsis_max`.
+/// Dots after "Thinking": 0 to `ellipsis_max`.
 fn ellipsisOf(n: usize) []const u8 {
     return switch (n) {
         0 => "",
@@ -6740,7 +6740,7 @@ test "the permission question is painted even when the terminal has no room for 
     row = 0;
     while (row < s.size.height) : (row += 1) {
         const text = rowText(s, row, &buf);
-        if (std.mem.indexOf(u8, text, "Y allow") != null) saw_options = true;
+        if (std.mem.indexOf(u8, text, "Y Allow") != null) saw_options = true;
     }
     try std.testing.expect(saw_options);
 }

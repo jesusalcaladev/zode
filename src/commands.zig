@@ -102,9 +102,9 @@ pub fn cmdHelp(m: *tui.Model) void {
         if (!transferred) for (lines.items) |l| gpa.free(l);
         lines.deinit(gpa);
     }
-    lines.append(gpa, gpa.dupe(u8, "commands") catch return) catch return;
+    lines.append(gpa, gpa.dupe(u8, "Commands") catch return) catch return;
     collectCommandList(m, true, &lines);
-    lines.append(gpa, gpa.dupe(u8, "advanced · type these commands directly") catch return) catch {};
+    lines.append(gpa, gpa.dupe(u8, "Advanced · type these commands directly") catch return) catch {};
     collectCommandList(m, false, &lines);
 
     // The user's own commands, refreshed so a file written a minute ago shows
@@ -113,7 +113,7 @@ pub fn cmdHelp(m: *tui.Model) void {
     agent.refreshUserCommandsModel(m);
     const uc = agent.userCommands();
     if (uc.len > 0) {
-        lines.append(gpa, gpa.dupe(u8, "your commands (.zode/commands · ~/.config/zode/commands)") catch return) catch {};
+        lines.append(gpa, gpa.dupe(u8, "Your commands (.zode/commands · ~/.config/zode/commands)") catch return) catch {};
         var i: usize = 0;
         while (i < uc.len) : (i += 1) {
             if (agent.userCommandInfo(i)) |info| {
@@ -128,7 +128,7 @@ pub fn cmdHelp(m: *tui.Model) void {
         }
     }
 
-    lines.append(gpa, gpa.dupe(u8, "shortcuts") catch return) catch {};
+    lines.append(gpa, gpa.dupe(u8, "Shortcuts") catch return) catch {};
     for (shortcuts) |s| {
         const line = std.fmt.allocPrint(gpa, "{s: <18} {s}", .{ s.key, s.desc }) catch continue;
         lines.append(gpa, line) catch {};
@@ -220,11 +220,11 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
     }
     const set = agent.permRuleSet();
 
-    m.pushInfoFmt("permissions  ·  mode: {s}", .{agent.permModeName()});
+    m.pushInfoFmt("Permissions  ·  mode: {s}", .{agent.permModeName()});
     m.pushInfoOwned(gpa.dupe(u8, "  engine: Phase 6 Tool(pattern) rules + pathsafe dangerous-path protection (34.1)") catch return);
 
     m.pushInfoOwned(gpa.dupe(u8, "") catch return);
-    m.pushInfoOwned(gpa.dupe(u8, "rules  ·  Tool(pattern) action  ·  allow | deny | ask | dontAsk") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "Rules  ·  Tool(pattern) action  ·  allow | deny | ask | dontAsk") catch return);
     m.pushInfoOwned(gpa.dupe(u8, "  sources: local > project > user > policy  ·  deny beats any allow  ·  last rule in a file wins") catch return);
     if (set.rules.len == 0) {
         m.pushInfoOwned(gpa.dupe(u8, "  (no loaded rules; built-in pathsafe/policy checks and legacy allowlist still apply)") catch return);
@@ -244,7 +244,7 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
     }
 
     m.pushInfoOwned(gpa.dupe(u8, "") catch return);
-    m.pushInfoOwned(gpa.dupe(u8, "legacy allowlist  ·  persisted standing approvals (user permissions file)") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "Legacy allowlist  ·  persisted standing approvals (user permissions file)") catch return);
     var abuf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&abuf);
     aw.writeAll("  tools: ") catch {};
@@ -313,7 +313,7 @@ pub fn cmdHooks(m: *tui.Model, arg: ?[]const u8) void {
         }
     }
     const set = agent.hooks_set;
-    m.pushInfoOwned(gpa.dupe(u8, "hooks  ·  Phase 5 command hooks (PreToolUse, PostToolUse, UserPromptSubmit, Stop, PermissionRequest)") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "Hooks  ·  Phase 5 command hooks (PreToolUse, PostToolUse, UserPromptSubmit, Stop, PermissionRequest)") catch return);
     var hpbuf: [640]u8 = undefined;
     const hooks_path = agent.resolvedProjectHooksPath(&hpbuf);
     const file_exists = if (m.io_ready) blk: {
@@ -346,7 +346,7 @@ pub fn cmdHooks(m: *tui.Model, arg: ?[]const u8) void {
 /// `/agents`: subagent definitions/status (35.11 panel).
 pub fn cmdAgents(m: *tui.Model) void {
     const gpa = m.allocator;
-    m.pushInfoOwned(gpa.dupe(u8, "agents  ·  subagent/task configuration") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "Agents  ·  subagent/task configuration") catch return);
     m.pushInfoOwned(gpa.dupe(u8, "  current: task subagent (general-purpose), depth 1, effort low, 24k budget, restricted/read-oriented tool set, no conversation history") catch return);
     m.pushInfoOwned(gpa.dupe(u8, "  parallel cap: ZODE_TASK_PARALLEL (default 3; see env/config)") catch return);
     var defs: []const agentdefs.Entry = &.{};
@@ -372,7 +372,7 @@ pub fn cmdAgents(m: *tui.Model) void {
 /// Shows configured servers without forcing connections; tools are discovered on demand.
 pub fn cmdMcp(m: *tui.Model) void {
     const gpa = m.allocator;
-    m.pushInfoOwned(gpa.dupe(u8, "mcp  ·  MCP server configuration and status") catch return);
+    m.pushInfoOwned(gpa.dupe(u8, "MCP  ·  MCP server configuration and status") catch return);
     m.pushInfoFmt("  manager: {s}", .{if (mcp_manager.isReady()) "ready" else "not initialized"});
     const servers = mcp_manager.configuredServers();
     if (servers.len == 0) {
@@ -397,7 +397,7 @@ pub fn cmdMcp(m: *tui.Model) void {
 pub fn cmdSandbox(m: *tui.Model) void {
     const path = agent.envGet(m.environ, "PATH");
     const kind = sandbox_mod.detect(m.io, std.Io.Dir.cwd(), path);
-    m.pushInfoOwned(m.allocator.dupe(u8, "sandbox  ·  availability for flagged bash commands") catch return);
+    m.pushInfoOwned(m.allocator.dupe(u8, "Sandbox  ·  availability for flagged bash commands") catch return);
     switch (kind) {
         .none => {
             m.pushInfo("  detected: none (install bubblewrap `bwrap` or `firejail` to enable sandboxed runs)");
@@ -749,7 +749,7 @@ pub fn cmdCache(m: *tui.Model) void {
         // WRITES are in the line because they are the expensive half: a high
         // hit-rate with a write on EVERY request means the prefix is being
         // rebuilt each turn, and no hit-rate alone can reveal that.
-        "session cache · {d:.1}% hit-rate · {d} requests with hits · {d} input / {d} cached / {d} written · {d} output tokens",
+        "Session cache · {d:.1}% hit-rate · {d} requests with hits · {d} input / {d} cached / {d} written · {d} output tokens",
         .{ st.hitRatePct(), st.cache_hits, st.prompt_tokens, st.cached_tokens, st.cache_write_tokens, st.completion_tokens },
     );
 
@@ -1037,7 +1037,7 @@ test "usage command shows the usage panel with token info" {
     defer all.deinit(std.testing.allocator);
     for (m.pending.items) |item| try all.appendSlice(std.testing.allocator, item.text);
     // The usage panel: version header, request totals, token breakdown.
-    try std.testing.expect(std.mem.indexOf(u8, all.items, "usage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all.items, "Usage") != null);
     try std.testing.expect(std.mem.indexOf(u8, all.items, "12,345") != null); // input tokens
     try std.testing.expect(std.mem.indexOf(u8, all.items, "678") != null); // output tokens
     try std.testing.expect(std.mem.indexOf(u8, all.items, "10,000") != null); // cache reads
@@ -1193,7 +1193,7 @@ pub fn cmdStatus(m: *tui.Model) void {
     var gauge_buf: [64]u8 = undefined;
     const bar = renderProgressBar(@intFromFloat(@min(@as(f64, 100.0), @max(@as(f64, 0.0), pct_used))), &gauge_buf);
 
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "status  ·  zode {s}", .{build_options.version}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "Status  ·  zode {s}", .{build_options.version}) catch return);
     m.pushInfoOwned(std.fmt.allocPrint(gpa, "  model:    {s}  (ctx {d})", .{ cur_model, ctx }) catch return);
     m.pushInfoOwned(std.fmt.allocPrint(gpa, "  effort:   {s}  ·  style: {s}  ·  view: {s}", .{ effort_label, style, m.view_mode.name() }) catch return);
     m.pushInfoOwned(std.fmt.allocPrint(gpa, "  perms:    {s}  ·  api key: {s}", .{ perm, key_state }) catch return);
@@ -1240,7 +1240,7 @@ fn configReport(m: *tui.Model) void {
             list.append(a, line) catch a.free(line);
         }
     }.run;
-    add(gpa, &lines, "config  ·  zode {s}", .{build_options.version});
+    add(gpa, &lines, "Config  ·  zode {s}", .{build_options.version});
     add(gpa, &lines, "  limit source:  {s}", .{
         switch (src) {
             .model => "the model's own context window",
@@ -1500,7 +1500,7 @@ pub fn cmdUsage(m: *tui.Model) void {
     var output_buf: [32]u8 = undefined;
     var cached_buf: [32]u8 = undefined;
 
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "usage  ·  zode {s}", .{build_options.version}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "Usage  ·  zode {s}", .{build_options.version}) catch return);
     m.pushInfoOwned(std.fmt.allocPrint(gpa, "  requests:  {d}", .{requests}) catch return);
     m.pushInfoOwned(std.fmt.allocPrint(gpa, "  tokens:    {s} total  (input {s}, output {s})", .{
         formatTokenCount(&total_buf, total),
@@ -1547,7 +1547,7 @@ pub fn cmdDoctor(m: *tui.Model) void {
     const budget = compaction.budgetFor(m.environ, agent.curModelContext());
     const pct = compaction.targetPct(m.environ);
 
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "doctor  ·  zode {s}", .{build_options.version}) catch return);
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "Doctor  ·  zode {s}", .{build_options.version}) catch return);
     m.pushInfoOwned(std.fmt.allocPrint(gpa, "  mode:      {s}", .{agent.permModeName()}) catch return);
     m.pushInfoOwned(std.fmt.allocPrint(gpa, "  compact:   {s} at {d}% (budget {d} tokens)", .{
         @tagName(eff), pct, budget,
@@ -1592,7 +1592,7 @@ pub fn cmdDiag(m: *tui.Model) void {
     const line = diag_mod.formatLine(gpa, cur, growth) catch return;
     defer gpa.free(line);
 
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "diag  ·  zode {s}  ·  pid {d}", .{
+    m.pushInfoOwned(std.fmt.allocPrint(gpa, "Diag  ·  zode {s}  ·  pid {d}", .{
         build_options.version,
         if (m.io_ready) std.os.linux.getpid() else 0,
     }) catch return);
@@ -2355,9 +2355,9 @@ pub fn cmdTasks(m: *tui.Model) void {
     const st = &m.tasks;
     if (st.count() == 0) {
         if (st.fresh_after_corrupt) {
-            m.pushInfo("tasks · no tasks (saved task list could not be read and was started fresh)");
+            m.pushInfo("Tasks · no tasks (saved task list could not be read and was started fresh)");
         } else {
-            m.pushInfo("tasks · no tasks yet. Use task_create to add the first one.");
+            m.pushInfo("Tasks · no tasks yet. Use task_create to add the first one.");
         }
         return;
     }
@@ -2387,7 +2387,7 @@ pub fn cmdTasks(m: *tui.Model) void {
             if (st.hasOpenBlocker(t.id)) blocked += 1 else ready += 1;
         }
     }
-    w.print("tasks · {d} total · {d} in progress · {d} ready · {d} blocked · {d} pending · {d} completed\n", .{
+    w.print("Tasks · {d} total · {d} in progress · {d} ready · {d} blocked · {d} pending · {d} completed\n", .{
         st.items.items.len, in_progress, ready, blocked, pending, completed,
     }) catch {};
 
@@ -2730,7 +2730,7 @@ pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
 
     var header: std.ArrayList(u8) = .empty;
     defer header.deinit(m.allocator);
-    header.appendSlice(m.allocator, "diff · uncommitted changes") catch return;
+    header.appendSlice(m.allocator, "Diff · uncommitted changes") catch return;
     const st = std.mem.trim(u8, status, " \t\r\n");
     if (st.len > 0) {
         header.append(m.allocator, '\n') catch return;
@@ -3011,7 +3011,7 @@ test "cmdDoctor runs without crashing and names itself" {
 
     const text = try pendingText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "doctor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Doctor") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "mode:") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "yolo") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "compact:") != null);
@@ -3029,7 +3029,7 @@ test "/usage and /doctor are dispatched by submit, not just listed" {
         try agent.submit(&m, "/usage");
         const text = try noticeText(&m, std.testing.allocator);
         defer std.testing.allocator.free(text);
-        try std.testing.expect(std.mem.indexOf(u8, text, "usage") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Usage") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "requests") != null);
     }
     {
@@ -3038,7 +3038,7 @@ test "/usage and /doctor are dispatched by submit, not just listed" {
         try agent.submit(&m, "/doctor");
         const text = try noticeText(&m, std.testing.allocator);
         defer std.testing.allocator.free(text);
-        try std.testing.expect(std.mem.indexOf(u8, text, "doctor") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Doctor") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "yolo") != null);
     }
 }
@@ -3233,28 +3233,28 @@ pub fn cmdVersion(m: *tui.Model) void {
 pub fn cmdReleaseNotes(m: *tui.Model) void {
     const gpa = m.allocator;
     if (!m.io_ready) {
-        m.pushInfo("release notes: I/O not ready");
+        m.pushInfo("Release notes: I/O not ready");
         return;
     }
     const io = m.io;
     const version = selfupdate.current_version;
 
     const body = std.Io.Dir.cwd().readFileAlloc(io, "CHANGELOG.md", gpa, .limited(1024 * 1024)) catch {
-        m.pushInfo("release notes: CHANGELOG.md not found (run from the repo root, or see the project releases)");
+        m.pushInfo("Release notes: CHANGELOG.md not found (run from the repo root, or see the project releases)");
         return;
     };
     defer gpa.free(body);
 
     const section = extractReleaseSection(gpa, body, version) catch {
-        m.pushInfoFmt("release notes for {s}: section not found in CHANGELOG.md", .{version});
+        m.pushInfoFmt("Release notes for {s}: section not found in CHANGELOG.md", .{version});
         return;
     } orelse {
-        m.pushInfoFmt("release notes for {s}: section not found in CHANGELOG.md", .{version});
+        m.pushInfoFmt("Release notes for {s}: section not found in CHANGELOG.md", .{version});
         return;
     };
     defer gpa.free(section);
 
-    m.pushInfoFmt("release notes — zode {s}", .{version});
+    m.pushInfoFmt("Release notes — zode {s}", .{version});
     var it = std.mem.splitScalar(u8, section, '\n');
     while (it.next()) |line| {
         const l = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
@@ -3787,7 +3787,7 @@ pub fn cmdUndo(m: *tui.Model, arg: ?[]const u8) void {
             failed,
         });
     }
-    if (undone > 0) agent.setStatusWithZo(m, .done, "undone");
+    if (undone > 0) agent.setStatusWithZo(m, .done, "Undone");
 }
 
 /// Deletes a file ONLY if it exists and is a regular file.
@@ -4389,7 +4389,7 @@ pub fn cmdSubmodel(m: *tui.Model, arg: ?[]const u8) void {
     const a = arg orelse return agent.submodelReport(m);
     if (std.mem.eql(u8, a, "off") or std.mem.eql(u8, a, "none")) {
         agent.submodelSetOff();
-        m.pushInfoFmt("subagents: the same model as the main turn (`/submodel off`; config.json and the environment are ignored this session). Set: /submodel <model> | <provider> <model>", .{});
+        m.pushInfoFmt("Subagents: the same model as the main turn (`/submodel off`; config.json and the environment are ignored this session). Set: /submodel <model> | <provider> <model>", .{});
         return;
     }
     var it = std.mem.tokenizeScalar(u8, a, ' ');
@@ -4517,7 +4517,7 @@ pub fn cmdRewind(m: *tui.Model, arg: ?[]const u8) void {
     if (total_skipped > 0 or total_failed > 0) {
         m.pushInfoFmt("{d} skipped, {d} failed", .{ total_skipped, total_failed });
     }
-    if (total_undone > 0) agent.setStatusWithZo(m, .done, "rewound");
+    if (total_undone > 0) agent.setStatusWithZo(m, .done, "Rewound");
 }
 
 /// `/iter [n]`: set or show per-session iteration budget.
@@ -4580,7 +4580,7 @@ test "settings: verify pill reads setting up with no data" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const text = try m.verify_counts.format(arena_state.allocator());
-    try std.testing.expectEqualStrings("setting up", text);
+    try std.testing.expectEqualStrings("Setting up", text);
 }
 
 test "settings: a verify report feeds the three-way pill" {

@@ -87,7 +87,7 @@ pub const Palette = struct {
     active: bool = false,
     mode: Mode = .commands,
 
-    /// Search filter (the modal's "search" line).
+    /// Search filter (the modal's "Search" line).
     query: [max_query]u8 = undefined,
     query_len: usize = 0,
 
@@ -295,7 +295,7 @@ pub const Palette = struct {
         // In two-column mode filter ONLY the focused one. Filtering both left
         // the other blank when searching, which gave the impression that the
         // models list did not exist: you typed "sonnet" and did not see a single
-        // model, only "no matches" in both columns.
+        // model, only "No matches" in both columns.
         const focus = self.column();
         for (0..2) |c| {
             self.filtered[c].clearRetainingCapacity();
@@ -816,9 +816,9 @@ pub fn draw(
     _ = p.putText(box.x + 2, sy, "▌", theme.brand_bold);
     const q = pal.queryText();
     const placeholder: []const u8 = switch (pal.mode) {
-        .commands => "search commands",
-        .models => if (pal.column() == 0) "filter providers" else "filter models",
-        .connect => "filter providers",
+        .commands => "Search commands",
+        .models => if (pal.column() == 0) "Filter providers" else "Filter models",
+        .connect => "Filter providers",
         .key_prompt => "",
     };
     // The cursor goes at the END OF WHAT IS ON SCREEN: `q.len` is a byte count,
@@ -971,7 +971,7 @@ fn drawColumn(p: *Painter, pal: *Palette, box: Box, c: usize, x0: u16, w: u16, n
         else if (pal.mode == .models and c == 1 and notice.len > 0 and pal.queryText().len == 0)
             notice
         else
-            "no matches";
+            "No matches";
         _ = p.putClipped(x0 + 2, box.y + 3, msg, w -| 4, theme.hint);
         return 0;
     }
@@ -1876,7 +1876,7 @@ test "draw: the modal paints title, search and the highlighted item" {
     const s = try tui.drawTest(&m, arena_state.allocator(), 80, 24);
     const all = tui.allText(s);
     try t.expect(std.mem.indexOf(u8, all, "Commands") != null);
-    try t.expect(std.mem.indexOf(u8, all, "search") != null);
+    try t.expect(std.mem.indexOf(u8, all, "Search") != null);
     try t.expect(std.mem.indexOf(u8, all, "/help") != null);
     try t.expect(std.mem.indexOf(u8, all, "/model") != null);
 }

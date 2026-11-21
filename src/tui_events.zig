@@ -350,9 +350,9 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             // Per-message targeting (33.12): Shift+↑/↓ targets previous/next message.
             if (key.codepoint == vaxis.Key.up and key.mods.shift and !key.mods.ctrl and !key.mods.alt) {
                 if (self.targetPrevMessage()) {
-                    self.pushInfo("targeted message · Shift+↑/↓ move, y copy, Esc clear");
+                    self.pushInfo("Targeted message · Shift+↑/↓ move, y copy, Esc clear");
                 } else {
-                    self.pushInfo("no previous message to target");
+                    self.pushInfo("No previous message to target");
                 }
                 ctx.redraw = true;
                 try self.armTick(ctx);
@@ -360,9 +360,9 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             }
             if (key.codepoint == vaxis.Key.down and key.mods.shift and !key.mods.ctrl and !key.mods.alt) {
                 if (self.targetNextMessage()) {
-                    self.pushInfo("targeted message · Shift+↑/↓ move, y copy, Esc clear");
+                    self.pushInfo("Targeted message · Shift+↑/↓ move, y copy, Esc clear");
                 } else {
-                    self.pushInfo("no next message to target");
+                    self.pushInfo("No next message to target");
                 }
                 ctx.redraw = true;
                 try self.armTick(ctx);
@@ -374,7 +374,7 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                     if (self.targetedMessageText()) |text| {
                         commands.copyTargetedText(self, text);
                     } else {
-                        self.pushInfo("nothing to copy");
+                        self.pushInfo("Nothing to copy");
                     }
                     self.clearMessageTarget();
                     ctx.redraw = true;
@@ -432,7 +432,7 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 }
                 if (self.message_target_para != null) {
                     self.clearMessageTarget();
-                    self.pushInfo("message target cleared");
+                    self.pushInfo("Message target cleared");
                     ctx.redraw = true;
                     try self.armTick(ctx);
                     return;
@@ -440,7 +440,7 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 const killed = agent.killForeground();
                 if (self.permActive()) self.answerPermission(.deny);
                 if (killed > 0) {
-                    agent.setStatusWithZoFmt(self, .warn, "killed {d} running command{s}", .{
+                    agent.setStatusWithZoFmt(self, .warn, "Killed {d} running command{s}", .{
                         killed,
                         if (killed == 1) @as([]const u8, "") else @as([]const u8, "s"),
                     });
@@ -461,7 +461,7 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 // allowed to touch `Child.kill`.
                 const bg_killed = if (self.io_ready) self.bg.killNow(self.io) else self.bg.requestKillAll();
                 if (bg_killed > 0) {
-                    agent.setStatusWithZoFmt(self, .warn, "killed {d} background command{s}", .{
+                    agent.setStatusWithZoFmt(self, .warn, "Killed {d} background command{s}", .{
                         bg_killed,
                         if (bg_killed == 1) @as([]const u8, "") else @as([]const u8, "s"),
                     });
@@ -469,7 +469,7 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 // Nothing to kill but a turn in flight: the legend says the ESC
                 // landed, so the key never looks like it did nothing.
                 if (killed == 0 and bg_killed == 0 and self.isBusyFlag()) {
-                    agent.setStatusWithZo(self, .warn, "stopping\u{2026}");
+                    agent.setStatusWithZo(self, .warn, "Stopping\u{2026}");
                 }
                 ctx.redraw = true;
                 try self.armTick(ctx);
@@ -626,7 +626,7 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             // waking up anyway, and the turn has just ended by then.
             if (self.takeQueuedWhenIdle()) |turn| {
                 agent.startTurn(self, turn.text, turn.mode, turn.bash_allow_rules, turn.expand_cmdsubst) catch |err| {
-                    self.pushInfoFmt("error: {t}", .{err});
+                    self.pushInfoFmt("Error: {t}", .{err});
                 };
                 self.allocator.free(turn.text);
                 ctx.redraw = true;
