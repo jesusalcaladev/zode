@@ -112,6 +112,8 @@ const styles = struct {
     /// `theme` — a hardcoded RGB here silently ignored every theme change.
     const inline_code = theme.code_num;
     const sep = theme.gutter;
+    /// A keyboard hint written as `^{R}^` displays as `^R` in its own colour.
+    const key_hint = theme.key_hint;
 };
 
 /// Parses text (possibly markdown) into blocks. Memory: arena.
@@ -1032,6 +1034,21 @@ pub fn inlineSegmentsLang(
                 }
             }
         }
+        // ^key^ — a keyboard hint. The caret is part of the displayed text,
+        // so `^{R}^` paints as `^R` in the key-hint role instead of looking
+        // like another word in the tool's summary.
+        if (line[i] == '^') {
+            if (constClose(line, i + 1, "^")) |end| {
+                if (end > i + 1) {
+                    if (i > start) try segs.append(arena, .{ .text = line[start..i], .style = base });
+                    const shown = try std.mem.concat(arena, u8, &.{ "^", line[i + 1 .. end] });
+                    try segs.append(arena, .{ .text = shown, .style = styles.key_hint });
+                    i = end + 1;
+                    start = i;
+                    continue;
+                }
+            }
+        }
         // Task list markers: `- [x] done` / `- [ ] todo`. The marker text stays
         // (so copy/paste and width are unchanged) but it gets its own color:
         // a checklist is information, not punctuation.
@@ -1133,15 +1150,23 @@ fn markedSegments(
     var start: usize = 0;
 
     while (i < line.len) {
-        const m: ?struct { ch: u8, style: Style } = switch (line[i]) {
-            '*' => .{ .ch = '*', .style = hi },
-            '~' => .{ .ch = '~', .style = mood },
+        const m: ?struct { ch: u8, style: Style, keep_mark: bool } = switch (line[i]) {
+            '*' => .{ .ch = '*', .style = hi, .keep_mark = false },
+            '~' => .{ .ch = '~', .style = mood, .keep_mark = false },
+            '^' => .{ .ch = '^', .style = styles.key_hint, .keep_mark = true },
             else => null,
         };
         if (m) |mark| {
             if (constClose(line, i + 1, &.{mark.ch})) |end| {
                 if (i > start) try segs.append(arena, .{ .text = line[start..i], .style = base });
-                if (end > i + 1) try segs.append(arena, .{ .text = line[i + 1 .. end], .style = mark.style });
+                if (end > i + 1) {
+                    const content = line[i + 1 .. end];
+                    const shown = if (mark.keep_mark)
+                        try std.mem.concat(arena, u8, &.{ "^", content })
+                    else
+                        content;
+                    try segs.append(arena, .{ .text = shown, .style = mark.style });
+                }
                 i = end + 1;
                 start = i;
                 continue;
@@ -2825,4 +2850,23 @@ test "short diff hunks are left untouched" {
             }
         }
     }
+}
+
+test "key hints: ^R^ renders as ^R in its own style" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const blocks = try parse(arena, .tool_res, "*Read* 3ms · ^R^");
+    var found = false;
+    for (blocks) |b| {
+        for (b.lines) |line| {
+            for (line) |seg| {
+                if (std.mem.eql(u8, seg.text, "^R")) {
+                    found = true;
+                    try std.testing.expect(seg.style.fg.eql(theme.key_hint.fg));
+                }
+            }
+        }
+    }
+    try std.testing.expect(found);
 }

@@ -6311,7 +6311,7 @@ pub const Model = struct {
         // is condensed and can be expanded to the full transcript.
         const can_expand = result.len > 0 and !std.mem.eql(u8, result, summary);
         const line = if (can_expand)
-            std.mem.print(&line_buf, "*{s}* · {d}ms · ^R", .{ display_head, ms }) catch display_head
+            std.mem.print(&line_buf, "*{s}* · {d}ms · ^R^", .{ display_head, ms }) catch display_head
         else
             std.mem.print(&line_buf, "*{s}* · {d}ms", .{ display_head, ms }) catch display_head;
 
