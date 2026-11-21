@@ -7709,3 +7709,27 @@ test "input: Ctrl+V with no image and no clipboard tool fails with a toast" {
     agent.attachClipboardImage(&m);
     try std.testing.expect(m.notification_len > 0);
 }
+
+test "focus: tool and diff paragraphs fold away, the answer stays, and the layout restores" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.pushKind(.user, "fix it");
+    m.pushKind(.tool_res, "Read 100 lines · 3ms");
+    m.pushKind(.diff, "@@ -1 +1 @@\n-a\n+b");
+    m.pushKind(.assistant, "the answer is here");
+    _ = try drawTest(&m, arena, 100, 30);
+    const full_height = m.heightPrefix(m.paras.items.len);
+
+    commands_mod.cmdView(&m, "focus");
+    try std.testing.expect(m.heightPrefix(m.paras.items.len) < full_height);
+    const quiet = try drawTest(&m, arena, 100, 30);
+    try std.testing.expect(findRow(quiet, "Read 100 lines") == null);
+    try std.testing.expect(findRow(quiet, "the answer is here") != null);
+
+    commands_mod.cmdView(&m, "normal");
+    try std.testing.expectEqual(full_height, m.heightPrefix(m.paras.items.len));
+}

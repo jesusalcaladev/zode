@@ -2915,6 +2915,9 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
         commands_mod.cmdMemory(m, arg);
     } else if (std.mem.eql(u8, cmd, "history")) {
         m.openHistoryPicker();
+    } else if (std.mem.eql(u8, cmd, "focus")) {
+        const next: tui.ViewMode = if (m.view_mode == .focus) .normal else .focus;
+        commands_mod.cmdView(m, if (next == .focus) "focus" else "normal");
     } else if (std.mem.eql(u8, cmd, "quit")) {
         // the TUI handles it
     } else if (std.mem.eql(u8, cmd, "exit")) {

@@ -2644,8 +2644,11 @@ pub fn cmdView(m: *tui.Model, arg: ?[]const u8) void {
         return;
     };
     m.view_mode = mode;
-    m.redraw_requested.store(true, .seq_cst);
-    m.pushInfoFmt("View mode: {s}  ·  {s}", .{ mode.name(), mode.desc() });
+    // Fold/unfold tool and diff paragraphs in focus mode. Both the height
+    // tree and the paint loop consult paraVisible, so the scroll anchor stays
+    // consistent with what is actually drawn.
+    m.refreshViewHeights();
+    m.pushFeedbackFmt("View mode: {s}  ·  {s}", .{ mode.name(), mode.desc() });
 }
 
 /// `/github`: GitHub integration status and context (local, read-only).
@@ -2883,6 +2886,7 @@ pub const commands = [_]Cmd{
     .{ .key = "/help", .desc = "show commands", .key_hint = "ctrl+p" },
     .{ .key = "/memory", .desc = "list | pending | approve <id> — durable project memory" },
     .{ .key = "/history", .desc = "search and reuse a past prompt" },
+    .{ .key = "/focus", .desc = "quiet transcript: hide tool and diff details" },
     .{ .key = "/model", .desc = "pick a model in a modal", .key_hint = "ctrl+p" },
     .{ .key = "/provider", .desc = "pick a provider in a modal" },
     .{ .key = "/providers", .desc = "list providers" },

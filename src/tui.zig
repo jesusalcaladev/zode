@@ -1907,6 +1907,10 @@ pub const Model = struct {
     /// and shown in one read-only picker instead of N transcript paragraphs.
     chrome_capture: bool = false,
     chrome_lines: std.ArrayList([]const u8) = .empty,
+    /// Heights as they were before entering focus mode, so leaving it restores
+    /// the EXACT layout instead of re-estimating from `known_lines` (which the
+    /// first focus frame had already changed).
+    normal_heights: std.ArrayList(usize) = .empty,
     /// The automatic typecheck the harness starts after a write tool touches code.
     ///
     /// It is a struct and not three fields because the headless runner keeps one on
@@ -2632,6 +2636,7 @@ pub const Model = struct {
         self.shell_out.deinit(self.allocator);
         for (self.chrome_lines.items) |line| self.allocator.free(line);
         self.chrome_lines.deinit(self.allocator);
+        self.normal_heights.deinit(self.allocator);
         self.search_matches.deinit(self.allocator);
         self.folded_hunks.deinit(self.allocator);
         for (self.tool_memos.items) |*memo| memo.deinit(self.allocator);
@@ -4434,6 +4439,45 @@ pub const Model = struct {
 
     /// Sum of the first `end` paragraph heights. Falls back to a direct scan if
     /// allocating a larger tree failed.
+    /// In focus mode the tool/diff noise is folded away. This is checked in
+    /// BOTH the height tree and the paint loop, so the viewport positions
+    /// derived from `heightPrefix` stay consistent with what is on screen.
+    pub fn paraVisible(self: *const Model, idx: usize) bool {
+        if (self.view_mode != .focus) return true;
+        if (idx >= self.paras.items.len) return false;
+        return switch (self.paras.items[idx].kind) {
+            .tool_run, .tool_res, .diff => false,
+            else => true,
+        };
+    }
+
+    /// Recomputes all paragraph heights after the view mode changed. Hidden
+    /// paragraphs get height 0 so both the scroll bar and the anchor derive
+    /// from the same compact layout.
+    pub fn refreshViewHeights(self: *Model) void {
+        self.clearSegCache();
+        self.ensureParaHeights();
+        if (self.view_mode == .focus) {
+            if (self.normal_heights.items.len != self.para_heights.items.len) {
+                self.normal_heights.clearRetainingCapacity();
+                self.normal_heights.appendSlice(self.allocator, self.para_heights.items) catch return;
+            }
+            for (0..self.para_heights.items.len) |i| {
+                if (self.paraVisible(i)) continue;
+                self.para_heights.items[i] = 0;
+                self.setHeightTreeValue(i, 0);
+            }
+        } else if (self.normal_heights.items.len == self.para_heights.items.len) {
+            for (self.normal_heights.items, 0..) |h, i| {
+                self.para_heights.items[i] = h;
+                self.setHeightTreeValue(i, h);
+            }
+            self.normal_heights.clearRetainingCapacity();
+        }
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
     pub fn heightPrefix(self: *const Model, end: usize) usize {
         const stop = @min(end, self.para_heights.items.len);
         const cap = self.height_tree_capacity;

@@ -336,6 +336,7 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
     // cached paragraph. This correctly handles gaps in the cache (virtual
     // scroll means not every paragraph is parsed).
     for (self.seg_cache.items) |c| {
+        if (!self.paraVisible(c.para_idx)) continue;
         const para_abs_start = self.heightPrefix(c.para_idx);
         if (para_abs_start >= last_visible) break;
         if (para_abs_start + c.height <= first_visible) continue;
