@@ -17,6 +17,7 @@ const diffhunks = @import("lib/diffhunks.zig");
 const diffview = @import("lib/diff/view.zig");
 const ed = @import("lib/editor.zig");
 const textcap = @import("lib/textcap.zig");
+const prompthistory = @import("lib/prompthistory.zig");
 const typecheck_mod = @import("lib/typecheck.zig");
 const sleepz = @import("lib/sleep.zig");
 const taskstore = @import("lib/taskstore.zig");
@@ -2462,6 +2463,22 @@ pub const Model = struct {
     /// still treat an empty text box as empty even when an image is staged.
     pub fn hasDraft(self: *const Model) bool {
         return !self.ed.isEmpty() or !self.draft_images.isEmpty();
+    }
+
+    /// Replaces the editor's in-memory history with the persisted one. Called
+    /// once after `attachIo`, so ↑ works on a fresh process too.
+    pub fn loadPromptHistory(self: *Model) void {
+        if (!self.io_ready) return;
+        const loaded = prompthistory.load(self.allocator, self.io, self.environ) catch return;
+        for (self.ed.history.items) |h| self.allocator.free(h);
+        self.ed.history.deinit(self.allocator);
+        self.ed.history = loaded;
+        self.ed.hist_idx = -1;
+    }
+
+    pub fn savePromptHistory(self: *Model) void {
+        if (!self.io_ready) return;
+        prompthistory.save(self.allocator, self.io, self.environ, self.ed.history.items);
     }
 
     /// Ctrl+S with a draft: park the text and the staged images and empty the
@@ -8273,6 +8290,7 @@ fn submitInput(self: *Model, ctx: *vxfw.EventContext) !void {
     };
 
     self.ed.commit(); // saves to history and clears
+    self.savePromptHistory();
     resetAutocomplete(self);
     // `/copy` (and any other command) may have queued a clipboard write.
     self.flushCopyPending(ctx);

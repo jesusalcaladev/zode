@@ -21,6 +21,7 @@ pub const tui = @import("tui.zig");
 pub const theme = @import("lib/theme.zig");
 pub const config = @import("config.zig");
 pub const editor = @import("lib/editor.zig");
+pub const prompthistory = @import("lib/prompthistory.zig");
 pub const providers = @import("lib/providers.zig");
 pub const agent = @import("agent.zig");
 pub const summary_breaker = @import("lib/summary_breaker.zig");

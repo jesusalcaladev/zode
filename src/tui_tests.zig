@@ -10,6 +10,7 @@ const vxfw = vaxis.vxfw;
 
 const agent = @import("agent.zig");
 const ed = @import("lib/editor.zig");
+const prompthistory = @import("lib/prompthistory.zig");
 const keybinds = @import("lib/keybinds.zig");
 const mascot = @import("lib/mascot.zig");
 const md = @import("lib/markdown.zig");
@@ -7585,4 +7586,33 @@ test "input: a click in the composer places the caret at that row and column" {
         .type = .press,
     } });
     try std.testing.expectEqual(@as(usize, 14), m.ed.cursor);
+}
+
+test "input: prompt history is reloaded from disk and reachable with Up" {
+    // A fresh process had an empty ↑ history even when the session file held
+    // dozens of prompts. The persisted list is installed in the editor at
+    // startup, after the Io is attached.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    const home = "/tmp/opencode/zode-tui-history-test";
+    try env.put("HOME", home);
+
+    const old = [_][]const u8{ "first persisted prompt", "second persisted prompt" };
+    prompthistory.save(std.testing.allocator, threaded.io(), &env, &old);
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.environ = &env;
+    m.attachIo(threaded.io());
+    m.loadPromptHistory();
+
+    try std.testing.expectEqual(old.len, m.ed.history.items.len);
+    try std.testing.expectEqualStrings(old[0], m.ed.history.items[0]);
+    try std.testing.expect(m.ed.historyPrev());
+    try std.testing.expectEqualStrings(old[1], m.ed.text());
 }
