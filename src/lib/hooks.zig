@@ -23,6 +23,7 @@
 const std = @import("std");
 const permrules = @import("permrules.zig");
 const regex_mod = @import("regex.zig");
+const http_client = @import("http_client.zig");
 
 pub const Event = enum {
     PreToolUse,
@@ -88,8 +89,14 @@ pub const Event = enum {
     }
 };
 
+/// 50.2: what a hook DOES. `command` is the original shell execution.
+/// `prompt` and `agent` inject their text as context (no shell), and `http`
+/// POSTs the event as JSON to the URL in `command`.
+pub const Kind = enum { command, prompt, agent, http };
+
 pub const Hook = struct {
     event: Event,
+    kind: Kind = .command,
     matcher: []const u8 = "",
     @"if": []const u8 = "",
     command: []const u8,
@@ -212,7 +219,16 @@ pub fn fire(
         if (h.once and h.fired) continue;
         if (!matches(h.*, ctx)) continue;
         h.fired = true;
-        const rr = runCommand(gpa, h.*, ctx, io);
+        const rr = switch (h.kind) {
+            .command => runCommand(gpa, h.*, ctx, io),
+            // No shell: the text is DATA, not a command. This is what makes a
+            // `prompt` hook safe to keep in a repo — it can only add context.
+            .prompt, .agent => RunResult{
+                .ran = true,
+                .additional_context = gpa.dupe(u8, h.command) catch "",
+            },
+            .http => runHttp(gpa, h.*, ctx, io),
+        };
         try out.append(gpa, rr);
         // PreToolUse: first blocking hook stops further hooks? Spec says
         // "a non-zero exit on PreToolUse blocks the tool" - run all and let
@@ -299,6 +315,26 @@ pub fn updatedInput(results: []const RunResult) ?[]const u8 {
         if (r.updated_input.len > 0) found = r.updated_input;
     }
     return found;
+}
+
+/// POSTs the hook context as JSON to the URL in `hook.command`. A failed
+/// request is reported as a note, never as a tool block: an observability
+/// endpoint must not be able to stop the agent.
+fn runHttp(gpa: std.mem.Allocator, hook: Hook, ctx: MatchCtx, io: ?std.Io) RunResult {
+    const live = io orelse return .{ .ran = false, .system_message = "http hook needs an Io" };
+    const body = std.fmt.allocPrint(gpa,
+        "{{\"event\":\"{s}\",\"tool\":\"{s}\",\"subject\":\"{s}\"}}",
+        .{ ctx.event.name(), ctx.tool, ctx.subject },
+    ) catch return .{ .ran = false };
+    defer gpa.free(body);
+    var client = http_client.Http.init(gpa, live);
+    defer client.deinit();
+    const mutable = @constCast(body);
+    const res = client.postJson(hook.command, null, mutable) catch |err| {
+        return .{ .ran = true, .system_message = std.fmt.allocPrint(gpa, "http hook failed: {t}", .{err}) catch "" };
+    };
+    defer gpa.free(res.body);
+    return .{ .ran = true, .exit_code = if (res.status >= 200 and res.status < 300) 0 else 1 };
 }
 
 fn runCommand(gpa: std.mem.Allocator, hook: Hook, ctx: MatchCtx, io: ?std.Io) RunResult {
@@ -420,6 +456,11 @@ fn parseHook(arena: std.mem.Allocator, v: std.json.Value) ?Hook {
         .event = event,
         .command = dupeArena(arena, command) orelse return null,
     };
+    if (getStr(o, "type")) |kind_text| {
+        if (std.ascii.eqlIgnoreCase(kind_text, "prompt")) h.kind = .prompt else if
+            (std.ascii.eqlIgnoreCase(kind_text, "agent")) h.kind = .agent else if
+            (std.ascii.eqlIgnoreCase(kind_text, "http")) h.kind = .http;
+    }
     if (getStr(o, "matcher")) |s| h.matcher = dupeArena(arena, s) orelse "";
     if (getStr(o, "if")) |s| h.@"if" = dupeArena(arena, s) orelse "";
     if (o.get("timeout_ms")) |tv| {
@@ -512,6 +553,35 @@ test "hooks: once fires at most once" {
     try t.expect(set.hooks[0].once and set.hooks[0].fired);
     set.resetOnce();
     try t.expect(!set.hooks[0].fired);
+}
+
+test "50.2: hook types are parsed and prompt hooks inject text instead of running it" {
+    const cfg =
+        \\{"hooks":[
+        \\  {"event":"SessionStart","type":"prompt","command":"remember the house rules"},
+        \\  {"event":"Stop","type":"agent","command":"summarise this turn"},
+        \\  {"event":"PreToolUse","type":"http","command":"http://127.0.0.1:9/hook"},
+        \\  {"event":"PostToolUse","command":"echo hi"}
+        \\]}
+    ;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const set = parseConfig(a, cfg);
+    try t.expectEqual(@as(usize, 4), set.hooks.len);
+    try t.expectEqual(Kind.prompt, set.hooks[0].kind);
+    try t.expectEqual(Kind.agent, set.hooks[1].kind);
+    try t.expectEqual(Kind.http, set.hooks[2].kind);
+    try t.expectEqual(Kind.command, set.hooks[3].kind);
+
+    var one = Set{ .hooks = set.hooks[0..1] };
+    const results = try fire(a, &one, .{ .event = .SessionStart }, null);
+    defer freeResults(a, results);
+    try t.expectEqual(@as(usize, 1), results.len);
+    try t.expect(results[0].ran);
+    try t.expectEqualStrings("remember the house rules", results[0].additional_context);
+    // No shell ran: no exit code from a process, and no output bytes.
+    try t.expectEqual(@as(u8, 0), results[0].exit_code);
 }
 
 test "hooks: parse event names" {

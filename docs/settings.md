@@ -250,8 +250,12 @@ Notes that save an afternoon:
 - `kind: "anthropic"` switches that provider to the Messages API (and to the
   `x-api-key` header for its catalogue).
 - `key_env` accepts a string or an array of strings, tried in order.
-- `mcp_servers` is **user-level only**. A server is a program: a project that
-  could choose one would be remote code execution with your credentials.
+- `mcp_servers` is **user-level only**. A stdio server is a program: a project
+  that could choose one would be remote code execution with your credentials.
+  An **HTTP server** is configured with `"url": "https://…/mcp"` instead of
+  `command`; zode POSTs JSON-RPC to it and reads plain JSON or SSE `data:` lines.
+  The MCP tool exposes `resources`, `read_resource`, `prompts` and `get_prompt`
+  alongside `search`/`list`/`call`.
 - A malformed entry is skipped, never fatal: one bad row must not take the
   working provider down with it.
 

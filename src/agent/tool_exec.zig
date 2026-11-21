@@ -626,6 +626,21 @@ pub fn execOneCall(
     if (std.mem.eql(u8, call.name, "bash") and startedBackground(res)) m.bench.bg_jobs += 1;
     const summary = ops.toolResultSummary(ops.ctx, call.name, res, arena);
     ops.pushToolDone(ops.ctx, m, call.name, summary, ms, res);
+    // 50.2: PostToolUseFailure is a separate event from PostToolUse so an
+    // observer can react to failures without parsing the result text itself.
+    // The classification is presentation-level (the tool's own summary),
+    // never an invented exit state.
+    const trimmed_res = std.mem.trimStart(u8, res, " \t\r\n");
+    if (std.ascii.startsWithIgnoreCase(trimmed_res, "error") or
+        std.ascii.startsWithIgnoreCase(trimmed_res, "failed") or
+        std.ascii.startsWithIgnoreCase(trimmed_res, "denied"))
+    {
+        _ = hooks_mod.fire(m.allocator, state.hooks_set, .{
+            .event = .PostToolUseFailure,
+            .tool = call.name,
+            .subject = trimmed_res,
+        }, state.io) catch &[_]hooks_mod.RunResult{};
+    }
     if (before) |old| {
         if (ops.filePathOf(ops.ctx, call.args_json, arena)) |pth| {
             const after = std.Io.Dir.cwd().readFileAlloc(state.io, pth, arena, .limited(4 * 1024 * 1024)) catch {

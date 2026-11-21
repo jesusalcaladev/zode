@@ -2015,6 +2015,9 @@ pub fn ensureSession(m: *tui.Model, arena: std.mem.Allocator) *session_mod.Sessi
         compact_bg = .{};
         return s;
     };
+    // 50.2: a real SessionStart moment — only once, when the session is first
+    // created, not on every resume or re-entrant ensureSession call.
+    _ = hooks_mod.fire(m.allocator, &hooks_set, .{ .event = .SessionStart }, io_global) catch &.{};
     session = fresh;
     m.session = fresh;
     m.bg.setSession(m.allocator, io_global, fresh.path);

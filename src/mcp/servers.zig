@@ -23,7 +23,11 @@ pub const Server = struct {
     /// The name the model uses to address it (`mcp_call` names it).
     name: []const u8,
     /// The argv to run. `command[0]` is looked up in `PATH`.
-    command: []const []const u8,
+    /// Empty when `url` is set (an HTTP server needs no process).
+    command: []const []const u8 = &.{},
+    /// 50.3: Streamable-HTTP endpoint. When non-empty, the manager uses the
+    /// HTTP/SSE transport instead of spawning a stdio child.
+    url: []const u8 = "",
     /// Extra environment variables for the server.
     env: []const EnvVar = &.{},
 };

@@ -66,6 +66,30 @@ pub fn toolMcp(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![
         return manager.searchTools(arena, query, &err) catch fail(arena, &err);
     }
 
+    // 50.3: the other two capabilities stay OUT of the tool schemas. They are
+    // discovered by name here, exactly like tools: the cached prefix never
+    // grows with a server's resource/prompt list.
+    if (std.ascii.eqlIgnoreCase(op, "resources")) {
+        var err: manager.ErrText = .{};
+        return manager.listResources(arena, &err) catch fail(arena, &err);
+    }
+    if (std.ascii.eqlIgnoreCase(op, "prompts")) {
+        var err: manager.ErrText = .{};
+        return manager.listPrompts(arena, &err) catch fail(arena, &err);
+    }
+    if (std.ascii.eqlIgnoreCase(op, "read_resource")) {
+        const server = common.getStr(obj, "server") orelse return "a `read_resource` needs a `server`.";
+        const uri = common.getStr(obj, "uri") orelse return "a `read_resource` needs a `uri`.";
+        var err: manager.ErrText = .{};
+        return manager.readResource(arena, server, uri, &err) catch fail(arena, &err);
+    }
+    if (std.ascii.eqlIgnoreCase(op, "get_prompt")) {
+        const server = common.getStr(obj, "server") orelse return "a `get_prompt` needs a `server`.";
+        const name = common.getStr(obj, "name") orelse return "a `get_prompt` needs a `name`.";
+        var err: manager.ErrText = .{};
+        return manager.getPrompt(arena, server, name, &err) catch fail(arena, &err);
+    }
+
     if (std.ascii.eqlIgnoreCase(op, "call")) {
         const qualified = qualifiedOf(obj, arena) orelse
             return "a `call` needs a `tool`, and a `server` too unless the tool is named server.tool.";
@@ -120,6 +144,22 @@ fn parseObj(arena: std.mem.Allocator, json: []const u8) !std.json.ObjectMap {
     const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
     if (v != .object) return error.NotAnObject;
     return v.object;
+}
+
+test "50.3: resources, prompts and their readers are real operations" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    for ([_][]const u8{ "resources", "prompts" }) |op| {
+        const body = try std.fmt.allocPrint(a, "{{\"operation\":\"{s}\"}}", .{op});
+        const obj = try parseObj(a, body);
+        const text = try toolMcp(std.testing.io, obj, a);
+        try testing.expect(std.mem.indexOf(u8, text, "unknown `operation`") == null);
+    }
+    // A reader without `server` gets a specific error, not "unknown operation".
+    const bad = try parseObj(a, "{\"operation\":\"read_resource\",\"uri\":\"file:///a\"}");
+    const text = try toolMcp(std.testing.io, bad, a);
+    try testing.expect(std.mem.indexOf(u8, text, "needs a `server`") != null);
 }
 
 test "mcp: a missing operation says which ones exist" {

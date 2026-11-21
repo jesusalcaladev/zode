@@ -31,6 +31,7 @@ const client = @import("client.zig");
 const process = @import("process.zig");
 const servers = @import("servers.zig");
 const search = @import("search.zig");
+const http_transport = @import("http_transport.zig");
 
 /// A caller-owned failure message. The tool shows it; the manager fills it.
 pub const ErrText = struct {
@@ -55,6 +56,8 @@ pub const ErrText = struct {
 const Entry = struct {
     client: *client.Client,
     tools: []const search.Entry,
+    /// Set only for HTTP servers; freed when the entry is stopped.
+    http_ctx: ?*http_transport.Ctx = null,
 };
 
 var lock: std.atomic.Mutex = .unlocked;
@@ -163,6 +166,7 @@ fn stopAllLocked() void {
     while (it.next()) |e| {
         gpa.free(e.key_ptr.*);
         e.value_ptr.*.client.destroy();
+        if (e.value_ptr.*.http_ctx) |hc| gpa.destroy(hc);
     }
     entries.deinit(gpa);
     entries = .empty;
@@ -225,6 +229,109 @@ pub fn list(arena: std.mem.Allocator, err_out: *ErrText) ![]const u8 {
         try out.appendSlice(arena, problems.items);
     }
     return out.items;
+}
+
+/// 50.3: resources published by the configured servers. Read-only, so it
+/// asks for no permission and never changes the cached tool schemas.
+pub fn listResources(arena: std.mem.Allocator, err_out: *ErrText) ![]const u8 {
+    lock2();
+    defer unlock();
+    if (!ready) {
+        err_out.set("the MCP manager is not running in this process", .{});
+        return error.NotReady;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    var any = false;
+    for (server_list) |spec| {
+        const e = ensureLocked(spec, err_out) catch continue;
+        const items = e.client.listResources(arena) catch continue;
+        if (items.len == 0) continue;
+        any = true;
+        try out.appendSlice(arena, spec.name);
+        try out.appendSlice(arena, ":\n");
+        for (items) |r| {
+            try out.appendSlice(arena, "  ");
+            try out.appendSlice(arena, r.uri);
+            if (r.name.len > 0) {
+                try out.appendSlice(arena, " — ");
+                try out.appendSlice(arena, r.name);
+            }
+            try out.append(arena, '\n');
+        }
+    }
+    if (!any) return "no MCP resources published by the configured servers.";
+    return out.items;
+}
+
+/// 50.3: prompts published by the configured servers (names only — the body
+/// is fetched by `getPrompt`, which is why no schema enters the prompt).
+pub fn listPrompts(arena: std.mem.Allocator, err_out: *ErrText) ![]const u8 {
+    lock2();
+    defer unlock();
+    if (!ready) {
+        err_out.set("the MCP manager is not running in this process", .{});
+        return error.NotReady;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    var any = false;
+    for (server_list) |spec| {
+        const e = ensureLocked(spec, err_out) catch continue;
+        const items = e.client.listPrompts(arena) catch continue;
+        if (items.len == 0) continue;
+        any = true;
+        try out.appendSlice(arena, spec.name);
+        try out.appendSlice(arena, ":\n");
+        for (items) |p| {
+            try out.appendSlice(arena, "  ");
+            try out.appendSlice(arena, p.name);
+            if (p.description.len > 0) {
+                try out.appendSlice(arena, " — ");
+                try out.appendSlice(arena, p.description);
+            }
+            try out.append(arena, '\n');
+        }
+    }
+    if (!any) return "no MCP prompts published by the configured servers.";
+    return out.items;
+}
+
+/// 50.3: reads one resource from one server by name. Like `callTool`, this
+/// operates on a USER-configured server and is the model's explicit request.
+pub fn readResource(arena: std.mem.Allocator, server_name: []const u8, uri: []const u8, err_out: *ErrText) ![]const u8 {
+    lock2();
+    defer unlock();
+    if (!ready) {
+        err_out.set("the MCP manager is not running in this process", .{});
+        return error.NotReady;
+    }
+    const e = entries.get(server_name) orelse {
+        err_out.set("MCP server `{s}` is not running", .{server_name});
+        return error.NoServer;
+    };
+    const result = e.client.readResource(arena, uri) catch |err| {
+        err_out.set("resource read failed: {t}", .{err});
+        return err;
+    };
+    return if (result.text.len > 0) result.text else "(the resource had no text content)";
+}
+
+/// 50.3: gets one prompt from one server with optional arguments.
+pub fn getPrompt(arena: std.mem.Allocator, server_name: []const u8, name: []const u8, err_out: *ErrText) ![]const u8 {
+    lock2();
+    defer unlock();
+    if (!ready) {
+        err_out.set("the MCP manager is not running in this process", .{});
+        return error.NotReady;
+    }
+    const e = entries.get(server_name) orelse {
+        err_out.set("MCP server `{s}` is not running", .{server_name});
+        return error.NoServer;
+    };
+    const result = e.client.getPrompt(arena, name, "{}") catch |err| {
+        err_out.set("prompt get failed: {t}", .{err});
+        return err;
+    };
+    return if (result.text.len > 0) result.text else "(the prompt had no text content)";
 }
 
 /// The tools matching `query`, WITH their schemas.
@@ -399,21 +506,41 @@ fn ensureLocked(spec: servers.Server, err_out: *ErrText) !Entry {
         // would answer every question with `ServerClosed`, so it is replaced.
         if (entries.fetchRemove(spec.name)) |kv| gpa.free(kv.key);
         e.client.destroy();
+        if (e.http_ctx) |hc| gpa.destroy(hc);
     }
 
-    const transport = process.spawn(gpa, io_g, spec.command, buildEnvLocked(spec)) catch |err| switch (err) {
-        error.ServerNotFound => {
-            err_out.set("the MCP server `{s}` is not installed (command `{s}` not found in PATH)", .{ spec.name, spec.command[0] });
-            return error.ServerNotFound;
-        },
-        else => {
-            err_out.set("could not start the MCP server `{s}`: {t}", .{ spec.name, err });
+    // 50.3: an HTTP server needs no child process. The transport vtable hides
+    // the difference from Client, so handshake, tools and resources are the
+    // SAME code path for both kinds of server.
+    var http_ctx: ?*http_transport.Ctx = null;
+    var transport: client.Transport = undefined;
+    if (spec.url.len > 0) {
+        const hc = gpa.create(http_transport.Ctx) catch {
+            err_out.set("could not allocate the HTTP transport for `{s}`", .{spec.name});
             return error.SpawnFailed;
-        },
-    };
+        };
+        hc.* = .{ .gpa = gpa, .io = io_g, .url = spec.url };
+        http_ctx = hc;
+        transport = http_transport.transport(hc);
+    } else if (spec.command.len > 0) {
+        transport = process.spawn(gpa, io_g, spec.command, buildEnvLocked(spec)) catch |err| switch (err) {
+            error.ServerNotFound => {
+                err_out.set("the MCP server `{s}` is not installed (command `{s}` not found in PATH)", .{ spec.name, spec.command[0] });
+                return error.ServerNotFound;
+            },
+            else => {
+                err_out.set("could not start the MCP server `{s}`: {t}", .{ spec.name, err });
+                return error.SpawnFailed;
+            },
+        };
+    } else {
+        err_out.set("the MCP server `{s}` has neither a command nor a URL", .{spec.name});
+        return error.SpawnFailed;
+    }
 
     const c = client.Client.create(gpa, io_g, transport) catch |err| {
         transport.close();
+        if (http_ctx) |hc| gpa.destroy(hc);
         err_out.set("out of memory starting the MCP server `{s}`", .{spec.name});
         return err;
     };
@@ -464,7 +591,7 @@ fn ensureLocked(spec: servers.Server, err_out: *ErrText) !Entry {
         return error.OutOfMemory;
     };
     errdefer gpa.free(key);
-    try entries.put(gpa, key, .{ .client = c, .tools = entries_out });
+    try entries.put(gpa, key, .{ .client = c, .tools = entries_out, .http_ctx = http_ctx });
 
     return entries.get(spec.name).?;
 }

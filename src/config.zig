@@ -420,12 +420,20 @@ fn parseMcpServer(arena: std.mem.Allocator, o: std.json.ObjectMap) !mcp_servers.
     if (name_v != .string or name_v.string.len == 0) return error.BadServer;
     const name = try arena.dupe(u8, name_v.string);
 
-    const cmd_v = o.get("command") orelse return error.BadServer;
-    if (cmd_v != .array or cmd_v.array.items.len == 0) return error.BadServer;
+    // 50.3: an HTTP server has a URL and no argv. A non-http URL is refused
+    // rather than silently falling back to a process that does not exist.
+    const url: []const u8 = if (o.get("url")) |uv| (if (uv == .string) uv.string else "") else "";
     var cmd: std.ArrayList([]const u8) = .empty;
-    for (cmd_v.array.items) |c| {
-        if (c != .string or c.string.len == 0) return error.BadServer;
-        try cmd.append(arena, try arena.dupe(u8, c.string));
+    if (url.len > 0) {
+        if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://"))
+            return error.BadServer;
+    } else {
+        const cmd_v = o.get("command") orelse return error.BadServer;
+        if (cmd_v != .array or cmd_v.array.items.len == 0) return error.BadServer;
+        for (cmd_v.array.items) |c| {
+            if (c != .string or c.string.len == 0) return error.BadServer;
+            try cmd.append(arena, try arena.dupe(u8, c.string));
+        }
     }
 
     var envs: std.ArrayList(mcp_servers.EnvVar) = .empty;
@@ -466,6 +474,7 @@ fn parseMcpServer(arena: std.mem.Allocator, o: std.json.ObjectMap) !mcp_servers.
     return .{
         .name = name,
         .command = cmd.items,
+        .url = try arena.dupe(u8, url),
         .env = envs.items,
     };
 }
