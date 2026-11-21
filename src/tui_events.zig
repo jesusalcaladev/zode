@@ -795,6 +795,27 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                     ctx.redraw = true;
                     return;
                 }
+                // A click inside the composer places the caret. The row map
+                // was published by drawInput from the SAME wrap the painter
+                // used, so no rendered string has to be parsed to find the
+                // byte offset. Tag rows (staged images) map to cursor 0.
+                if (m.col >= 3 and m.row >= 0 and
+                    @as(u16, @intCast(m.row)) >= self.input_top_row)
+                {
+                    const rel: usize = @intCast(@as(u16, @intCast(m.row)) - self.input_top_row);
+                    if (rel < self.input_rows) {
+                        const start = self.input_row_starts[rel];
+                        const end = self.input_row_ends[rel];
+                        const col: usize = @as(usize, @intCast(m.col)) - 3;
+                        const off = @min(start + col, end);
+                        const bytes = self.ed.text();
+                        var pos = @min(off -| self.input_text_start, bytes.len);
+                        while (pos > 0 and (bytes[pos] & 0xC0) == 0x80) pos -= 1;
+                        self.ed.setCursor(pos);
+                        ctx.redraw = true;
+                        return;
+                    }
+                }
                 if (self.selectionPoint(m)) |point| {
                     self.selection_start = point;
                     self.selection_end = point;

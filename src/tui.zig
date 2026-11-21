@@ -1730,6 +1730,14 @@ pub const Model = struct {
     selectable_map: std.ArrayList(usize) = .empty,
     selectable_rows: u16 = 0,
     selectable_width: u16 = 0,
+    /// Screen-to-buffer map for the composer, published by `drawInput` and
+    /// read by the click handler. Byte offsets into the displayed text, never
+    /// parsed back out of rendered cells.
+    input_top_row: u16 = 0,
+    input_rows: usize = 0,
+    input_row_starts: [8]usize = undefined,
+    input_row_ends: [8]usize = undefined,
+    input_text_start: usize = 0,
     selection_start: ?SelectionPoint = null,
     selection_end: ?SelectionPoint = null,
     selecting_text: bool = false,
@@ -9597,6 +9605,12 @@ pub fn drawInput(
         while (rit.next() != null) total_rows += 1;
     }
     const first = if (total_rows > input_h) total_rows - input_h else 0;
+    // Publish the row map for click-to-caret. `disp_all` includes the staged
+    // image tags, so `input_text_start` says where the typed text begins and a
+    // click on a tag row never moves the caret into the middle of a tag.
+    self.input_top_row = top;
+    self.input_rows = 0;
+    self.input_text_start = disp_all.len - disp_text.len;
     {
         var rit = ed.RowIter.init(disp_all, ed_w, meas);
         var idx: usize = 0;
@@ -9604,6 +9618,11 @@ pub fn drawInput(
             if (idx < first) continue;
             const i = idx - first;
             if (i >= input_h) break;
+            if (i < self.input_row_starts.len) {
+                self.input_row_starts[i] = piece.offset;
+                self.input_row_ends[i] = piece.offset + piece.bytes.len;
+                self.input_rows = @max(self.input_rows, i + 1);
+            }
             if (piece.bytes.len == 0) continue;
             const row = top + @as(u16, @intCast(i));
             const text_style: vaxis.Style = .{ .fg = theme.input_text.fg };

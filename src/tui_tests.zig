@@ -7561,3 +7561,28 @@ test "ask: number keys answer a choice directly while the panel is open" {
     defer m.askUnlock();
     try std.testing.expectEqualStrings("beta", m.ask_answer.?);
 }
+
+test "input: a click in the composer places the caret at that row and column" {
+    // The mouse used to only select text in the transcript; clicking the text
+    // you were editing did nothing. The row map published by drawInput makes
+    // the mapping precise without parsing rendered cells.
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    try m.ed.insert("first line\nsecond line");
+    const s = try drawTest(&m, arena_state.allocator(), 80, 24);
+    const row = findRow(s, "second line") orelse return error.TestExpectedEqual;
+    try std.testing.expect(row >= m.input_top_row);
+
+    var ctx = testCtx();
+    try typeErasedEventHandler(&m, &ctx, .{ .mouse = .{
+        .col = 6, // 3 columns of margin + 3 graphemes into "second line"
+        .row = @intCast(row),
+        .button = .left,
+        .mods = .{},
+        .type = .press,
+    } });
+    try std.testing.expectEqual(@as(usize, 14), m.ed.cursor);
+}
