@@ -485,7 +485,9 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
     // the commands list the user is looking at.
     if (self.pal.active and self.pal.mode == .models) {
         if (self.takePendingItems()) |items| {
-            self.pal.setItemsOwned(items, &agent.model_groups);
+            // A background refresh must not throw the reader back to the first
+            // row. Keep the selected model by identity, not by index.
+            self.pal.setItemsOwnedPreservingSelection(items, &agent.model_groups);
         }
     } else {
         // Drop stale pending items so they do not leak into the next open.

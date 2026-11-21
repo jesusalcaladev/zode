@@ -267,6 +267,49 @@ pub const Palette = struct {
         self.resetSelection();
     }
 
+    /// Like `setItemsOwned`, but keeps the user's place when a background
+    /// catalog refresh replaces the list. Identity is (kind, label, provider),
+    /// not an index: the worker re-sorts free-first, so indices move.
+    pub fn setItemsOwnedPreservingSelection(self: *Palette, items: []Item, groups: []const Group) void {
+        var label_buf: [256]u8 = undefined;
+        var provider_buf: [128]u8 = undefined;
+        const saved_col = self.column();
+        const saved_scroll = self.scroll[saved_col];
+        var saved_kind: Kind = .model;
+        var saved_label: []const u8 = "";
+        var saved_provider: []const u8 = "";
+        var had_selection = false;
+        if (self.selectedIn(saved_col)) |it| {
+            const nl = @min(it.label.len, label_buf.len);
+            @memcpy(label_buf[0..nl], it.label[0..nl]);
+            const np = @min(it.provider.len, provider_buf.len);
+            @memcpy(provider_buf[0..np], it.provider[0..np]);
+            saved_kind = it.kind;
+            saved_label = label_buf[0..nl];
+            saved_provider = provider_buf[0..np];
+            had_selection = true;
+        }
+
+        // `setItemsOwned` frees the old strings, which is why the identity was
+        // copied into stack buffers first.
+        self.setItemsOwned(items, groups);
+        self.col = @intCast(saved_col);
+        if (!had_selection) {
+            self.refilter();
+            return;
+        }
+        self.refilter();
+        for (self.filtered[self.col].items, 0..) |item_idx, pos| {
+            const it = self.items[item_idx];
+            if (it.kind != saved_kind) continue;
+            if (!std.mem.eql(u8, it.label, saved_label)) continue;
+            if (!std.mem.eql(u8, it.provider, saved_provider)) continue;
+            self.sel[self.col] = pos;
+            self.scroll[self.col] = @min(saved_scroll, pos);
+            break;
+        }
+    }
+
     pub fn setItemsOwned(self: *Palette, items: []Item, groups: []const Group) void {
         self.releaseItems();
         self.items = items;
@@ -2455,4 +2498,53 @@ test "refilter: a provider query filters both columns, a model query only one" {
     pal.refilter();
     try t.expectEqual(@as(usize, 1), pal.countIn(1));
     try t.expectEqual(@as(usize, 3), pal.countIn(0));
+}
+
+test "refresh: a reordered catalog keeps the selected model by identity" {
+    var pal = Palette.init(t.allocator);
+    defer pal.deinit();
+    defer pal.releaseItems();
+    pal.mode = .models;
+    const old = [_]Item{
+        .{ .kind = .provider, .label = "opencode" },
+        .{ .kind = .model, .label = "model-a", .provider = "opencode" },
+        .{ .kind = .model, .label = "model-b", .provider = "opencode" },
+    };
+    pal.setItems(&old, &.{});
+    pal.col = 1;
+    pal.sel[1] = 1; // model-b
+    pal.refilter();
+    try t.expectEqualStrings("model-b", pal.selected().?.label);
+
+    // The worker publishes a re-sorted list with a different index for the
+    // same model; the selection must follow the identity, not the index.
+    const fresh = try t.allocator.alloc(Item, 3);
+    fresh[0] = .{ .kind = .provider, .label = try t.allocator.dupe(u8, "opencode") };
+    fresh[1] = .{ .kind = .model, .label = try t.allocator.dupe(u8, "model-b"), .provider = try t.allocator.dupe(u8, "opencode") };
+    fresh[2] = .{ .kind = .model, .label = try t.allocator.dupe(u8, "model-a"), .provider = try t.allocator.dupe(u8, "opencode") };
+    pal.setItemsOwnedPreservingSelection(fresh, &.{});
+    try t.expectEqual(@as(usize, 1), pal.col);
+    try t.expectEqualStrings("model-b", pal.selected().?.label);
+}
+
+test "refresh: a missing model falls back to the first row without changing column" {
+    var pal = Palette.init(t.allocator);
+    defer pal.deinit();
+    defer pal.releaseItems();
+    pal.mode = .models;
+    const old = [_]Item{
+        .{ .kind = .provider, .label = "opencode" },
+        .{ .kind = .model, .label = "removed-model", .provider = "opencode" },
+    };
+    pal.setItems(&old, &.{});
+    pal.col = 1;
+    pal.sel[1] = 0;
+    pal.refilter();
+
+    const fresh = try t.allocator.alloc(Item, 2);
+    fresh[0] = .{ .kind = .provider, .label = try t.allocator.dupe(u8, "opencode") };
+    fresh[1] = .{ .kind = .model, .label = try t.allocator.dupe(u8, "new-model"), .provider = try t.allocator.dupe(u8, "opencode") };
+    pal.setItemsOwnedPreservingSelection(fresh, &.{});
+    try t.expectEqual(@as(usize, 1), pal.col);
+    try t.expectEqualStrings("new-model", pal.selected().?.label);
 }

@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - make approved memories available to every model (memory) [`fac44dbd`](https://github.com/jesusalcaladev/zode/commit/fac44dbd)
 - search and reuse past prompts with Ctrl+/ (tui) [`136f93c1`](https://github.com/jesusalcaladev/zode/commit/136f93c1)
 - Ctrl+V also pastes text from the native clipboard (tui) [`d458da5c`](https://github.com/jesusalcaladev/zode/commit/d458da5c)
-- make provider search work in the model picker (palette) [`836f865a`](https://github.com/jesusalcaladev/zode/commit/836f865a)
+- make provider search work in the model picker (palette) [`c59bbbd3`](https://github.com/jesusalcaladev/zode/commit/c59bbbd3)
+- keep the selected model across catalog refreshes (palette) [`f8074801`](https://github.com/jesusalcaladev/zode/commit/f8074801)
 
 ### Bug Fixes
 
