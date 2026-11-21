@@ -13,6 +13,7 @@ const plugins_mod = @import("../lib/plugins.zig");
 const pluginstore = @import("../lib/pluginstore.zig");
 const outputstyles = @import("../lib/outputstyles.zig");
 const ask = @import("../lib/ask.zig");
+const memory_store = @import("../lib/memory_store.zig");
 const discovery = @import("discovery.zig");
 
 /// This repo's own AGENTS.md is ~24.5 KB. A 16 KB composition buffer cut it
@@ -40,7 +41,7 @@ pub fn setAppendSystemPrompt(a: std.mem.Allocator, text: []const u8) void {
     append_full_cache = null;
     append_prompt = text;
 }
-var cache_break_prev: ?[8]u64 = null;
+var cache_break_prev: ?[9]u64 = null;
 var cache_break_last_block: ?[]const u8 = null;
 var cache_break_last_pos: usize = 0;
 
@@ -65,12 +66,12 @@ pub fn cacheBreakUnstable() bool {
 
 pub fn cacheBreakLastBlock() ?[]const u8 { return cache_break_last_block; }
 pub fn cacheBreakLastPos() usize { return cache_break_last_pos; }
-pub fn cacheBreakPrev() ?[8]u64 { return cache_break_prev; }
+pub fn cacheBreakPrev() ?[9]u64 { return cache_break_prev; }
 pub fn breakCount() usize { return cache_break_count; }
 pub fn breakAt(i: usize) ?Break {
     return if (i < cache_break_count) cache_break_history[i] else null;
 }
-pub fn setCacheBreakPrev(prev: [8]u64) void { cache_break_prev = prev; }
+pub fn setCacheBreakPrev(prev: [9]u64) void { cache_break_prev = prev; }
 pub fn clearCacheBreakLast() void {
     cache_break_last_block = null;
     cache_break_last_pos = 0;
@@ -214,6 +215,11 @@ pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const
 
     var list_buf: [16 * 1024]u8 = undefined;
     const section = if (include_skills) skillsSectionText(ctx, &list_buf) else "";
+    // Every model gets the approved project memories without having to call a
+    // tool. The block is deterministic and capped, so it only breaks the cache
+    // prefix when the memories themselves change.
+    const memory_block = memory_store.autoBlock(ctx.gpa, ctx.io, ctx.project_cwd, ctx.project_root);
+    defer if (memory_block.len > 0) ctx.gpa.free(@constCast(memory_block));
 
     const style_entries = discovery.discoverStyles(ctx.gpa, ctx.io, ctx.env, ctx.cache_gpa, ctx.project_cwd, ctx.project_root);
     var style_entry: ?outputstyles.Entry = null;
@@ -238,7 +244,7 @@ pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const
         "";
 
     const blocks_len = routing.len + verification_prompt.len + ask.guidance.len +
-        section.len + ctx.location.len + mode_note.len;
+        section.len + memory_block.len + ctx.location.len + mode_note.len;
     var style_buf: [8 * 1024]u8 = undefined;
     const style_block: []const u8 = if (style_entry) |s|
         outputstyles.formatStyle(s.name, s.description, if (s.body) |b| b else "", &style_buf)
@@ -250,14 +256,16 @@ pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const
         .verification = verification_prompt,
         .ask_guidance = ask.guidance,
         .skills = section,
+        .memory = memory_block,
         .location = ctx.location,
         .mode_note = mode_note,
         .style = style_block,
     };
-    var hashes: [8]u64 = undefined;
+    var hashes: [9]u64 = undefined;
     for (&[_][]const u8{
         blocks.base,   blocks.routing,  blocks.verification, blocks.ask_guidance,
-        blocks.skills, blocks.location, blocks.mode_note,    blocks.style,
+        blocks.skills, blocks.memory,   blocks.location,     blocks.mode_note,
+        blocks.style,
     }, 0..) |block, i| {
         hashes[i] = cachebreak.hashBlock(block);
     }
@@ -271,12 +279,13 @@ pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const
         }
     }
     setCacheBreakPrev(hashes);
-    const composed = std.mem.print(out, "{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}", .{
+    const composed = std.mem.print(out, "{s}\n{s}\n{s}{s}{s}{s}{s}\n{s}{s}", .{
         effective_base,
         routing,
         verification_prompt,
         ask.guidance,
         section,
+        memory_block,
         ctx.location,
         mode_note,
         style_block,
@@ -289,7 +298,7 @@ pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const
         const fit = prompt_mod.fitPrefix(effective_base, room);
         break :blk std.mem.print(
             out,
-            "{s}\n{s}: {d} of {d} bytes kept{s}\n{s}\n{s}{s}{s}{s}\n{s}{s}",
+            "{s}\n{s}: {d} of {d} bytes kept{s}\n{s}\n{s}{s}{s}{s}{s}\n{s}{s}",
             .{
                 fit,
                 note_lead,
@@ -300,6 +309,7 @@ pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const
                 verification_prompt,
                 ask.guidance,
                 section,
+                memory_block,
                 ctx.location,
                 mode_note,
                 style_block,

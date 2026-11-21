@@ -28,7 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - keep prompt history across restarts (tui) [`12b1721f`](https://github.com/jesusalcaladev/zode/commit/12b1721f)
 - fold long diff hunks in the transcript (tui) [`54c25227`](https://github.com/jesusalcaladev/zode/commit/54c25227)
 - keep command chrome out of the transcript (tui) [`931d686c`](https://github.com/jesusalcaladev/zode/commit/931d686c)
-- route harness reports to one picker, keep model output visible (tui) [`1b88a9d3`](https://github.com/jesusalcaladev/zode/commit/1b88a9d3)
+- route harness reports to one picker, keep model output visible (tui) [`72108606`](https://github.com/jesusalcaladev/zode/commit/72108606)
+- make approved memories available to every model (memory) [`6b1380a4`](https://github.com/jesusalcaladev/zode/commit/6b1380a4)
 
 ### Bug Fixes
 
@@ -81,6 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - end-to-end smoke for --chat (43.7) (headless) [`4bf7827b`](https://github.com/jesusalcaladev/zode/commit/4bf7827b)
 - wait for asserted screen state instead of fixed sleeps (47.5) (pty) [`d8a5eb1c`](https://github.com/jesusalcaladev/zode/commit/d8a5eb1c)
 - cover the last untested pure module (47.7) (envutil) [`c4425861`](https://github.com/jesusalcaladev/zode/commit/c4425861)
+
+### Styles
+
+- capitalize visible UI labels (tui) [`0c88e35a`](https://github.com/jesusalcaladev/zode/commit/0c88e35a)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

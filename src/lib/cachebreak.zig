@@ -7,13 +7,14 @@
 
 const std = @import("std");
 
-/// The eight blocks of the stable prefix, in composition order.
+/// The blocks of the stable prefix, in composition order.
 pub const Blocks = struct {
     base: []const u8,
     routing: []const u8,
     verification: []const u8,
     ask_guidance: []const u8,
     skills: []const u8,
+    memory: []const u8,
     location: []const u8,
     mode_note: []const u8,
     style: []const u8,
@@ -22,11 +23,11 @@ pub const Blocks = struct {
     pub fn firstDiff(self: *const Blocks, other: *const Blocks) ?usize {
         const a = &[_][]const u8{
             self.base, self.routing, self.verification, self.ask_guidance,
-            self.skills, self.location, self.mode_note, self.style,
+            self.skills, self.memory, self.location, self.mode_note, self.style,
         };
         const b = &[_][]const u8{
             other.base, other.routing, other.verification, other.ask_guidance,
-            other.skills, other.location, other.mode_note, other.style,
+            other.skills, other.memory, other.location, other.mode_note, other.style,
         };
         for (a, 0..) |block, i| {
             if (!std.mem.eql(u8, block, b[i])) return i;
@@ -42,6 +43,7 @@ pub const block_names = [_][]const u8{
     "verification",
     "ask_guidance",
     "skills",
+    "memory",
     "location",
     "mode_note",
     "style",
@@ -102,6 +104,7 @@ test "cachebreak: identical blocks report no break" {
         .routing = "routing",
         .verification = "verification",
         .ask_guidance = "ask",
+        .memory = "",
         .skills = "skills",
         .location = "location",
         .mode_note = "mode",
@@ -117,6 +120,7 @@ test "cachebreak: change in the skills block reports skills" {
         .routing = "routing",
         .verification = "verification",
         .ask_guidance = "ask",
+        .memory = "",
         .skills = "skills v1",
         .location = "location",
         .mode_note = "mode",
@@ -127,6 +131,7 @@ test "cachebreak: change in the skills block reports skills" {
         .routing = "routing",
         .verification = "verification",
         .ask_guidance = "ask",
+        .memory = "",
         .skills = "skills v2",
         .location = "location",
         .mode_note = "mode",
@@ -143,6 +148,7 @@ test "cachebreak: change in the base block reports base" {
         .routing = "routing",
         .verification = "verification",
         .ask_guidance = "ask",
+        .memory = "",
         .skills = "skills",
         .location = "location",
         .mode_note = "mode",
@@ -153,6 +159,7 @@ test "cachebreak: change in the base block reports base" {
         .routing = "routing",
         .verification = "verification",
         .ask_guidance = "ask",
+        .memory = "",
         .skills = "skills",
         .location = "location",
         .mode_note = "mode",
@@ -167,6 +174,7 @@ test "cachebreak: blockOffsets computes positions" {
         .routing = "route",
         .verification = "verify",
         .ask_guidance = "ask",
+        .memory = "",
         .skills = "skills",
         .location = "loc",
         .mode_note = "mode",

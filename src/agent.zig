@@ -2911,6 +2911,8 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
 
     if (std.mem.eql(u8, cmd, "help")) {
         commands_mod.cmdHelp(m);
+    } else if (std.mem.eql(u8, cmd, "memory")) {
+        commands_mod.cmdMemory(m, arg);
     } else if (std.mem.eql(u8, cmd, "quit")) {
         // the TUI handles it
     } else if (std.mem.eql(u8, cmd, "exit")) {
@@ -19697,4 +19699,55 @@ test "subagent: a copied message survives the source buffer being overwritten" {
     // will later walk byte by byte.
     try std.testing.expectEqualStrings("first iteration text", owned);
     try std.testing.expect(std.mem.indexOf(u8, turn_text.items, "second iteration") != null);
+}
+
+test "system prompt carries approved memory to every model without a tool call" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "mproj");
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = root_buf[0..try tmp.dir.realPath(std.testing.io, &root_buf)];
+    var cb: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = try std.mem.print(&cb, "{s}/mproj", .{base});
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var store = try memory_store.Store.resolveForProject(arena, std.testing.io, cwd, null, true);
+    defer store.deinit();
+    try store.saveEntry("remember-me", "Remember me", "fact", "", "the build uses a vendored toolchain");
+
+    // Discovery caches are module globals; reset them so the next prompt test
+    // cannot read pointers into the arena that is about to go away.
+    const saved_cache = prompt_system.agents_md_cache;
+    const saved_io = io_global;
+    const saved_gpa = gpa_global;
+    defer {
+        resetStylesCacheForTest();
+        resetSkillsCacheForTest();
+        prompt_system.agents_md_cache = saved_cache;
+        io_global = saved_io;
+        gpa_global = saved_gpa;
+    }
+
+    // Build directly from a context pointing at the temp project so this does
+    // not depend on the global project info set at startup.
+    const ctx = prompt_system.BuildCtx{
+        .gpa = arena,
+        .io = std.testing.io,
+        .cache_gpa = arena,
+        .env = null,
+        .env_fallback = null,
+        .project_cwd = cwd,
+        .project_root = null,
+        .location = "",
+        .read_only = false,
+        .accept_edits = false,
+        .yolo = false,
+        .current_style = null,
+    };
+    var out: [prompt_system.system_prompt_capacity]u8 = undefined;
+    const prompt = prompt_system.buildSystemPrompt(ctx, &out, false);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "remember-me") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "vendored toolchain") != null);
 }

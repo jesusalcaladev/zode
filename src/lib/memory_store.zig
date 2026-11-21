@@ -9,6 +9,11 @@ pub const project_dir = store.project_dir;
 pub const entries_dir = store.entries_dir;
 pub const pending_dir = store.pending_dir;
 pub const Store = store.Store;
+pub const Entry = store.Entry;
+pub const max_scan_entries = store.max_scan_entries;
+pub const auto_budget = store.auto_budget;
+pub const autoBlock = store.Store.autoBlock;
+pub const auto_budget_bytes = store.auto_budget;
 
 test {
     _ = store;

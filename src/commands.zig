@@ -4,6 +4,7 @@ const agent = @import("agent.zig");
 const cache_stats = @import("cache_stats.zig");
 const compaction = @import("compaction.zig");
 const goal_mod = @import("lib/goal.zig");
+const memory_store = @import("lib/memory_store.zig");
 const providers = @import("lib/providers.zig");
 const config_mod = @import("config.zig");
 const keybinds = @import("lib/keybinds.zig");
@@ -73,6 +74,64 @@ fn collectCommandList(m: *tui.Model, palette_visible: bool, out: *std.ArrayList(
             std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
         out.append(gpa, line) catch {};
     }
+}
+
+/// `/memory`: inspect and approve the project's durable memory. Approved
+/// entries are injected into every model's prompt automatically; proposals
+/// wait in `pending/` until approved here (or via the model's memory tool).
+pub fn cmdMemory(m: *tui.Model, arg: ?[]const u8) void {
+    const a = std.mem.trim(u8, arg orelse "", " \t\r\n");
+    if (!m.io_ready) {
+        m.pushFeedback("Memory: io not ready");
+        return;
+    }
+    var store = memory_store.Store.resolveForProject(
+        m.allocator,
+        m.io,
+        agent.project_info.cwd(),
+        agent.project_info.root(),
+        false,
+    ) catch {
+        m.pushFeedback("Memory: could not open the project store");
+        return;
+    };
+    defer store.deinit();
+    if (store.root.len == 0) {
+        m.pushFeedback("Memory: no store for this project yet");
+        return;
+    }
+
+    if (std.ascii.startsWithIgnoreCase(a, "approve ")) {
+        const id = std.mem.trim(u8, a[8..], " \t\r\n");
+        if (id.len == 0) {
+            m.pushFeedback("Memory: usage /memory approve <id>");
+            return;
+        }
+        const ok = store.approvePending(id) catch false;
+        m.pushFeedback(if (ok) "Memory: proposal approved" else "Memory: no pending proposal with that id");
+        return;
+    }
+
+    const pending = std.ascii.eqlIgnoreCase(a, "pending");
+    var buf: [memory_store.max_scan_entries]memory_store.Entry = undefined;
+    const entries = if (pending) store.loadPending(&buf) catch &.{} else store.loadAll(&buf) catch &.{};
+    var lines: std.ArrayList([]const u8) = .empty;
+    var transferred = false;
+    defer {
+        if (!transferred) for (lines.items) |l| m.allocator.free(l);
+        lines.deinit(m.allocator);
+    }
+    for (entries) |e| {
+        const label = if (e.title.len > 0) e.title else e.id;
+        const line = std.fmt.allocPrint(m.allocator, "{s} — {s}", .{ e.id, label }) catch continue;
+        lines.append(m.allocator, line) catch {};
+    }
+    if (lines.items.len == 0) {
+        m.pushFeedback(if (pending) "Memory: no pending proposals" else "Memory: no approved entries");
+        return;
+    }
+    m.pushNotice(if (pending) "Pending memory" else "Project memory", lines.items);
+    transferred = true;
 }
 
 /// Commands whose whole output is a report about the harness, not a model
@@ -2821,6 +2880,7 @@ pub const shortcuts = [_]struct { key: []const u8, desc: []const u8 }{
 /// `/help`.
 pub const commands = [_]Cmd{
     .{ .key = "/help", .desc = "show commands", .key_hint = "ctrl+p" },
+    .{ .key = "/memory", .desc = "list | pending | approve <id> — durable project memory" },
     .{ .key = "/model", .desc = "pick a model in a modal", .key_hint = "ctrl+p" },
     .{ .key = "/provider", .desc = "pick a provider in a modal" },
     .{ .key = "/providers", .desc = "list providers" },

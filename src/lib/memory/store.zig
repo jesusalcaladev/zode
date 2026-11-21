@@ -10,6 +10,14 @@ const std = @import("std");
 const memory = @import("core.zig");
 const project = @import("../project.zig");
 
+/// How much of the stable system prompt the always-on memory block may use.
+/// Small on purpose: this repeats on EVERY request for every model.
+pub const auto_budget: usize = 4096;
+const auto_entry_cap: usize = 240;
+
+pub const Entry = memory.Entry;
+pub const max_scan_entries = memory.max_scan_entries;
+
 pub const project_dir = ".zode/memory";
 pub const entries_dir = "entries";
 pub const pending_dir = "pending";
@@ -66,6 +74,65 @@ pub const Store = struct {
         return .{ .gpa = gpa, .io = io, .root = p, .source = if (repo_root != null) .repo_root else .cwd };
     }
 
+    /// A compact, deterministic block for the system prompt. Every approved
+    /// memory is present to EVERY model without needing a tool call, within a
+    /// fixed byte budget. Sorted by id (loadAll's order) so the block only
+    /// changes when memories actually change — keeping the cache prefix stable.
+    /// Returns an empty slice when there is nothing to say; caller frees it.
+    pub fn autoBlock(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        cwd: []const u8,
+        repo_root: ?[]const u8,
+    ) []const u8 {
+        var store = resolveForProject(gpa, io, cwd, repo_root, false) catch return "";
+        defer store.deinit();
+        if (store.root.len == 0) return "";
+
+        var buf: [memory.max_scan_entries]memory.Entry = undefined;
+        const entries = store.loadAll(&buf) catch return "";
+        defer store.freeEntries(entries);
+        if (entries.len == 0) return "";
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        out.appendSlice(gpa,
+            "Project memory (durable notes for this project, not proof — verify against current code):\n",
+        ) catch return "";
+
+        var skipped: usize = 0;
+        for (entries) |e| {
+            const id = if (e.id.len > 0) e.id else e.title;
+            if (id.len == 0) continue;
+            const body = firstLine(e.body, auto_entry_cap);
+            var line: std.ArrayList(u8) = .empty;
+            defer line.deinit(gpa);
+            line.appendSlice(gpa, "- ") catch continue;
+            line.appendSlice(gpa, id) catch continue;
+            if (e.title.len > 0 and !std.mem.eql(u8, e.title, id)) {
+                line.appendSlice(gpa, ": ") catch continue;
+                line.appendSlice(gpa, e.title) catch continue;
+            }
+            if (body.len > 0) {
+                line.appendSlice(gpa, " — ") catch continue;
+                line.appendSlice(gpa, body) catch continue;
+            }
+            line.append(gpa, '\n') catch continue;
+            if (out.items.len + line.items.len > auto_budget) {
+                skipped += 1;
+                continue;
+            }
+            out.appendSlice(gpa, line.items) catch continue;
+        }
+        if (skipped > 0) {
+            var note: [96]u8 = undefined;
+            if (std.mem.print(&note, "({d} more recorded memories omitted: prompt budget)\n", .{skipped})) |n| {
+                if (out.items.len + n.len <= auto_budget) out.appendSlice(gpa, n) catch {};
+            } else |_| {}
+        }
+        return out.toOwnedSlice(gpa) catch "";
+    }
+
     pub fn entriesPath(self: *const Store, buf: []u8) ?[]const u8 {
         if (self.root.len == 0) return null;
         return std.mem.print(buf, "{s}/{s}", .{ self.root, entries_dir }) catch null;
@@ -79,6 +146,16 @@ pub const Store = struct {
     pub fn loadAll(self: *const Store, out: []memory.Entry) ![]memory.Entry {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir_path = self.entriesPath(&buf) orelse return out[0..0];
+        return self.loadFrom(dir_path, out);
+    }
+
+    pub fn loadPending(self: *const Store, out: []memory.Entry) ![]memory.Entry {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir_path = self.pendingPath(&buf) orelse return out[0..0];
+        return self.loadFrom(dir_path, out);
+    }
+
+    fn loadFrom(self: *const Store, dir_path: []const u8, out: []memory.Entry) ![]memory.Entry {
         var dir = std.Io.Dir.cwd().openDir(self.io, dir_path, .{ .iterate = true }) catch return out[0..0];
         defer dir.close(self.io);
 
@@ -202,6 +279,16 @@ fn setPrivate(io: std.Io, path: []const u8) void {
     file.setPermissions(io, @enumFromInt(0o600)) catch {};
 }
 
+/// First line of a memory body, cut on a UTF-8 boundary.
+fn firstLine(text: []const u8, cap: usize) []const u8 {
+    const end = @min(text.len, cap);
+    var n = end;
+    while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) n -= 1;
+    var line = std.mem.trim(u8, text[0..n], " \t\r\n");
+    if (std.mem.indexOfScalar(u8, line, '\n')) |nl| line = line[0..nl];
+    return line;
+}
+
 fn dirExists(io: std.Io, path: []const u8) bool {
     var d = std.Io.Dir.cwd().openDir(io, path, .{}) catch return false;
     d.close(io);
@@ -305,4 +392,29 @@ test "memory store: pending proposal requires approval to enter entries" {
     defer s.freeEntries(entries);
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqualStrings("prop1", entries[0].id);
+}
+
+test "autoBlock: every model sees approved memories, never pending ones" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(testing.io, "a");
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+    var cb: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = try std.mem.print(&cb, "{s}/a", .{root});
+
+    var s = try Store.resolveForProject(testing.allocator, testing.io, cwd, null, true);
+    defer s.deinit();
+    try s.savePending("durable-fact", "Durable fact", "fact", "a.zig", "uses a fixed-size arena");
+
+    const before = Store.autoBlock(testing.allocator, testing.io, cwd, null);
+    defer testing.allocator.free(before);
+    try testing.expectEqual(@as(usize, 0), before.len);
+
+    try testing.expect(try s.approvePending("durable-fact"));
+    const after = Store.autoBlock(testing.allocator, testing.io, cwd, null);
+    defer testing.allocator.free(after);
+    try testing.expect(std.mem.indexOf(u8, after, "durable-fact") != null);
+    try testing.expect(std.mem.indexOf(u8, after, "uses a fixed-size arena") != null);
+    try testing.expect(std.mem.indexOf(u8, after, "Project memory") != null);
 }
