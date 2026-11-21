@@ -4,6 +4,7 @@ const hl = @import("highlight.zig");
 const theme = @import("theme.zig");
 const diff_tokenizer = @import("diff_tokenizer.zig");
 const diffview = @import("diffview.zig");
+const diffhunks = @import("diffhunks.zig");
 
 pub const Style = vaxis.Style;
 
@@ -194,6 +195,28 @@ fn fenceLangToken(raw: []const u8) []const u8 {
 /// Right now only the diff uses it: without the file extension the body of a
 /// line (`+const x: u32 = 4`) cannot be tokenized and comes out entirely in the
 /// prefix color, which is the green wall that used to be there.
+/// Long hunks in the transcript are folded by default: a 400-line diff used
+/// to push the actual answer off screen, and the only unfold control lived in
+/// a modal. The marker names the hidden line count; the full bytes stay in
+/// the paragraph/session, so nothing is lost.
+const fold_threshold: usize = 12;
+
+fn foldedDiffText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var split = std.mem.splitScalar(u8, text, '\n');
+    while (split.next()) |l| try lines.append(arena, l);
+    const parsed = try diffhunks.parse(arena, lines.items);
+    var folded: std.ArrayList(usize) = .empty;
+    for (parsed.hunks, 0..) |h, i| {
+        if (h.content_end - h.content_start > fold_threshold) {
+            try folded.append(arena, i);
+        }
+    }
+    if (folded.items.len == 0) return text;
+    const result = try diffhunks.fold(arena, lines.items, folded.items);
+    return std.mem.join(arena, "\n", result);
+}
+
 pub fn parseLang(
     arena: std.mem.Allocator,
     kind: Kind,
@@ -220,8 +243,9 @@ pub fn parseLang(
     // recover them row by row.
     var diff_rows: []const diffview.Line = &.{};
     var diff_ctx = DiffCtx{};
+    const diff_text: []const u8 = if (kind == .diff) try foldedDiffText(arena, text) else text;
     if (kind == .diff) {
-        diff_rows = try diffview.analyze(arena, text, .{ .word_diff = opts.word_diff });
+        diff_rows = try diffview.analyze(arena, diff_text, .{ .word_diff = opts.word_diff });
     }
 
     var idx: usize = 0;
@@ -231,7 +255,7 @@ pub fn parseLang(
     // split once and the loop walks the array.
     var src_lines: std.ArrayList([]const u8) = .empty;
     {
-        var split = std.mem.splitScalar(u8, text, '\n');
+        var split = std.mem.splitScalar(u8, diff_text, '\n');
         while (split.next()) |l| try src_lines.append(arena, l);
     }
 
@@ -2760,4 +2784,45 @@ test "a fenced block stores only the language token from its info string" {
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqual(Kind.code, blocks[0].kind);
     try std.testing.expectEqualStrings("rust", blocks[0].lang);
+}
+
+test "long diff hunks are folded in the transcript, with the hidden count" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("@@ -1,20 +1,20 @@\n");
+    for (0..20) |i| try w.print(" context line {d}\n", .{i});
+    const text = w.buffered();
+
+    const blocks = try parse(arena, .diff, text);
+    var joined: std.ArrayList(u8) = .empty;
+    for (blocks) |b| {
+        for (b.lines) |line| {
+            joined.clearRetainingCapacity();
+            for (line) |seg| joined.appendSlice(arena, seg.text) catch {};
+            if (std.mem.indexOf(u8, joined.items, "folded") != null) break;
+        }
+    }
+    // The trailing empty row counts as a line, so the exact number may be 21;
+    // what matters is that the marker names a hidden count instead of silently
+    // ending the diff.
+    try std.testing.expect(std.mem.indexOf(u8, joined.items, "lines folded") != null);
+}
+
+test "short diff hunks are left untouched" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const text = "@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+    const blocks = try parse(arena, .diff, text);
+    for (blocks) |b| {
+        for (b.lines) |line| {
+            for (line) |seg| {
+                try std.testing.expect(std.mem.indexOf(u8, seg.text, "folded") == null);
+            }
+        }
+    }
 }
