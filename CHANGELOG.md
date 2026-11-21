@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - live reasoning, honest proof line and readable permission dialog (tui) [`2b4721de`](https://github.com/jesusalcaladev/zode/commit/2b4721de)
 - click-to-caret in the composer (tui) [`cf1bb4cb`](https://github.com/jesusalcaladev/zode/commit/cf1bb4cb)
 - keep prompt history across restarts (tui) [`12b1721f`](https://github.com/jesusalcaladev/zode/commit/12b1721f)
-- fold long diff hunks in the transcript (tui) [`39bbe31d`](https://github.com/jesusalcaladev/zode/commit/39bbe31d)
+- fold long diff hunks in the transcript (tui) [`54c25227`](https://github.com/jesusalcaladev/zode/commit/54c25227)
+- keep command chrome out of the transcript (tui) [`370d28c7`](https://github.com/jesusalcaladev/zode/commit/370d28c7)
 
 ### Bug Fixes
 

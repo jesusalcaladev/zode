@@ -6263,7 +6263,7 @@ fn pollTouchedFiles(m: *tui.Model) void {
     // the text into the session: no free here, and freeing an arena slice
     // with the gpa would abort on the length check.
     appendHarnessPrompt(m, text);
-    m.pushInfoFmt("· files changed on disk: cached reads and facts invalidated", .{});
+    m.pushFeedbackFmt("· files changed on disk: cached reads and facts invalidated", .{});
 }
 
 /// A single-line excerpt of a compaction summary for the transcript.
@@ -10064,7 +10064,7 @@ fn withPendingImages(m: *tui.Model, arena: std.mem.Allocator, msgs: []chat.ChatM
     const out = arena.alloc(chat.ChatMessage, msgs.len + 1) catch return msgs;
     @memcpy(out[0..msgs.len], msgs);
     out[msgs.len] = .{ .role = "user", .content = note, .images = imgs };
-    m.pushInfoFmt("· {d} image(s) sent to {s}", .{ m.pending_images.len, curAnswering() });
+    m.pushFeedbackFmt("· {d} image(s) sent to {s}", .{ m.pending_images.len, curAnswering() });
     return out;
 }
 
@@ -10189,7 +10189,7 @@ pub fn attachClipboardImage(m: *tui.Model) void {
             if (bytes.len > 0) return stageClipboardImage(m, f.mime, f.ext, bytes);
         }
     }
-    m.pushInfo("· no image on the clipboard: copy one (a screenshot tool's copy, e.g.) and press Ctrl+V again");
+    m.pushFeedback("· no image on the clipboard: copy one (a screenshot tool's copy, e.g.) and press Ctrl+V again");
 }
 
 /// Runs one clipboard reader. `null` = the tool is missing, failed or the
@@ -10257,11 +10257,11 @@ pub fn stageImageMentions(m: *tui.Model, text: []const u8) void {
 fn stageClipboardImage(m: *tui.Model, mime: []const u8, ext: []const u8, bytes: []const u8) void {
     const gpa = m.allocator;
     if (!models_mod.isVision(curAnswering())) {
-        m.pushInfo("· clipboard image NOT staged: the current model cannot see images (Ctrl+T lists the ones with vision)");
+        m.pushFeedback("· clipboard image NOT staged: the current model cannot see images (Ctrl+T lists the ones with vision)");
         return;
     }
     if (m.draft_images.len >= images_mod.max_images) {
-        m.pushInfoFmt("· clipboard image NOT staged: {d} already waiting with this draft", .{images_mod.max_images});
+        m.pushFeedbackFmt("· clipboard image NOT staged: {d} already waiting with this draft", .{images_mod.max_images});
         return;
     }
     if (bytes.len > images_mod.max_bytes) {
@@ -10272,7 +10272,7 @@ fn stageClipboardImage(m: *tui.Model, mime: []const u8, ext: []const u8, bytes: 
         return;
     }
     if (m.draft_images.total_bytes + bytes.len > images_mod.max_total_bytes_per_request) {
-        m.pushInfo("· clipboard image NOT staged: the message's total image bytes would exceed the cap");
+        m.pushFeedback("· clipboard image NOT staged: the message's total image bytes would exceed the cap");
         return;
     }
     const name = std.fmt.allocPrint(gpa, "clipboard.{s}", .{ext}) catch return;
@@ -10283,7 +10283,7 @@ fn stageClipboardImage(m: *tui.Model, mime: []const u8, ext: []const u8, bytes: 
     };
     defer p.deinit(gpa);
     const b64 = p.image_b64 orelse {
-        m.pushInfo("· clipboard image NOT staged");
+        m.pushFeedback("· clipboard image NOT staged");
         return;
     };
     p.image_b64 = null; // OWNERSHIP MOVES to `draft_images`
@@ -10292,7 +10292,7 @@ fn stageClipboardImage(m: *tui.Model, mime: []const u8, ext: []const u8, bytes: 
     m.draft_images.len += 1;
     m.draft_images.total_bytes += bytes.len;
     m.draft_images.user_attached = true;
-    m.pushInfoFmt("· image staged ({s}, {d} KB) — it goes with your next message", .{
+    m.pushFeedbackFmt("· image staged ({s}, {d} KB) — it goes with your next message", .{
         name, (bytes.len + 1023) / 1024,
     });
 }
@@ -14177,15 +14177,9 @@ test "/help lists the shortcuts, not just the commands" {
     defer m.deinit();
 
     commands_mod.cmdHelp(&m);
-    m.drainPending();
-
-    var joined: std.ArrayList(u8) = .empty;
-    defer joined.deinit(std.testing.allocator);
-    for (m.paras.items) |p| {
-        try joined.appendSlice(std.testing.allocator, p.text);
-        try joined.append(std.testing.allocator, '\n');
-    }
-    const all = joined.items;
+    const help = try helpOverlayText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(help);
+    const all = help;
 
     // The command block, with their shortcut when they have one.
     try std.testing.expect(std.mem.indexOf(u8, all, "commands") != null);
@@ -14218,17 +14212,12 @@ test "/clean shows up in /help with its 'yes'" {
     defer m.deinit();
 
     commands_mod.cmdHelp(&m);
-    m.drainPending();
-    var joined: std.ArrayList(u8) = .empty;
-    defer joined.deinit(std.testing.allocator);
-    for (m.paras.items) |p| {
-        try joined.appendSlice(std.testing.allocator, p.text);
-        try joined.append(std.testing.allocator, '\n');
-    }
+    const help = try helpOverlayText(&m, std.testing.allocator);
+    defer std.testing.allocator.free(help);
     // A cleanup command that is not in /help is a command nobody finds, and worse:
     // one that looks like it does not exist.
-    try std.testing.expect(std.mem.indexOf(u8, joined.items, "/clean") != null);
-    try std.testing.expect(std.mem.indexOf(u8, joined.items, "/clean yes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "/clean") != null);
+    try std.testing.expect(std.mem.indexOf(u8, help, "/clean yes") != null);
 }
 
 test "every listed shortcut really exists (no invented documentation)" {
@@ -17696,6 +17685,17 @@ const CopySession = struct {
 };
 
 /// The text of the whole history, for the assertions.
+/// `/help` no longer writes ~80 paragraphs into the transcript; it opens a
+/// read-only picker. Tests read that picker instead.
+fn helpOverlayText(m: *tui.Model, gpa: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (m.picker_items.items) |it| {
+        try out.appendSlice(gpa, it.label);
+        try out.append(gpa, '\n');
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 fn historyText(m: *tui.Model, gpa: std.mem.Allocator) ![]u8 {
     m.drainPending();
     var out: std.ArrayList(u8) = .empty;
@@ -18022,7 +18022,7 @@ test "/copy shows up in /help" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     commands_mod.cmdHelp(&m);
-    const text = try historyText(&m, std.testing.allocator);
+    const text = try helpOverlayText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "/copy") != null);
 }

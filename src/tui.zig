@@ -239,6 +239,9 @@ pub const PickerItem = struct {
     desc: []const u8 = "",
 };
 
+/// Tag for read-only notice pickers ("NOTE").
+pub const notice_tag: u32 = 0x4e4f5445;
+
 pub const PickerCb = *const fn (*Model, tag: u32, label: []const u8) void;
 
 /// The callback that gets the INDEX of the chosen item instead of its label.
@@ -5392,6 +5395,31 @@ pub const Model = struct {
     /// The end-of-turn proof line. `tested` is green, `typechecked` /
     /// `syntax-checked` are warnings, and a missing check is an error — the
     /// words stay exactly as `proofWord` wrote them, only the colour differs.
+    /// One-line feedback for a user command. A toast, not a transcript
+    /// paragraph: it must not be re-sent to the model on the next turn.
+    pub fn pushFeedback(self: *Model, text: []const u8) void {
+        self.pushNotification(text);
+    }
+
+    pub fn pushFeedbackFmt(self: *Model, comptime fmt: []const u8, args: anytype) void {
+        var buf: [192]u8 = undefined;
+        const text = std.mem.print(&buf, fmt, args) catch return;
+        self.pushNotification(text);
+    }
+
+    /// A multi-line report (help, config, permissions, hooks...) goes to a
+    /// read-only picker instead of N paragraphs in the history. `lines` are
+    /// gpa-owned; the picker takes ownership of the item array, not of the
+    /// line bytes themselves.
+    pub fn pushNotice(self: *Model, title: []const u8, lines: []const []const u8) void {
+        if (lines.len == 0) return;
+        const items = self.allocator.alloc(PickerItem, lines.len) catch return;
+        for (lines, 0..) |line, i| items[i] = .{ .label = line };
+        self.openPickerIdx(notice_tag, title, items, noticeChosen, null);
+    }
+
+    fn noticeChosen(_: *Model, _: u32, _: usize) void {}
+
     pub fn pushProof(self: *Model, text: []const u8, proof: typecheck_mod.Kind) void {
         const style: md.Style = switch (proof) {
             .tests => theme.ok,

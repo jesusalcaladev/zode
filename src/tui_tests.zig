@@ -11,6 +11,7 @@ const vxfw = vaxis.vxfw;
 const agent = @import("agent.zig");
 const ed = @import("lib/editor.zig");
 const prompthistory = @import("lib/prompthistory.zig");
+const commands_mod = @import("commands.zig");
 const keybinds = @import("lib/keybinds.zig");
 const mascot = @import("lib/mascot.zig");
 const md = @import("lib/markdown.zig");
@@ -7615,4 +7616,38 @@ test "input: prompt history is reloaded from disk and reachable with Up" {
     try std.testing.expectEqualStrings(old[0], m.ed.history.items[0]);
     try std.testing.expect(m.ed.historyPrev());
     try std.testing.expectEqualStrings(old[1], m.ed.text());
+}
+
+test "chrome: config command confirmations are toasts, not transcript paragraphs" {
+    // Changing a setting used to append a paragraph for every confirmation,
+    // which stayed in the history and made the transcript look like a log of
+    // the harness instead of a conversation.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("HOME", "/tmp/opencode/zode-chrome-test");
+
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.environ = &env;
+    m.attachIo(threaded.io());
+    const saved_io = agent.io_global;
+    agent.io_global = threaded.io();
+    defer agent.io_global = saved_io;
+
+    commands_mod.cmdPermissions(&m, "reload");
+    commands_mod.cmdHooks(&m, "reload");
+    try std.testing.expect(m.notification_len > 0);
+    try std.testing.expectEqual(@as(usize, 0), m.paras.items.len);
+    try std.testing.expectEqual(@as(usize, 0), m.pending.items.len);
+}
+
+test "chrome: /config report opens a read-only picker instead of ten paragraphs" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    commands_mod.cmdConfig(&m, "report");
+    try std.testing.expect(m.pickerActive());
+    try std.testing.expect(m.picker_items.items.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), m.pending.items.len);
 }

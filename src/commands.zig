@@ -63,7 +63,7 @@ const taskstore = @import("lib/taskstore.zig");
 /// and "what can I press". Before this there was only the first one, and only
 /// without the shortcut column, so half the keybindings were written down
 /// nowhere — you find them by hitting Ctrl+P and hoping.
-fn pushCommandList(m: *tui.Model, palette_visible: bool) void {
+fn collectCommandList(m: *tui.Model, palette_visible: bool, out: *std.ArrayList([]const u8)) void {
     const gpa = m.allocator;
     for (commands) |c| {
         if (c.palette_visible != palette_visible) continue;
@@ -71,16 +71,25 @@ fn pushCommandList(m: *tui.Model, palette_visible: bool) void {
             std.fmt.allocPrint(gpa, "{s: <14} {s}  ({s})", .{ c.key, c.desc, h }) catch continue
         else
             std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
-        m.pushInfoOwned(line);
+        out.append(gpa, line) catch {};
     }
 }
 
 pub fn cmdHelp(m: *tui.Model) void {
     const gpa = m.allocator;
-    m.pushInfoOwned(gpa.dupe(u8, "commands") catch return);
-    pushCommandList(m, true);
-    m.pushInfoOwned(gpa.dupe(u8, "advanced · type these commands directly") catch return);
-    pushCommandList(m, false);
+    // This used to push ~130 paragraphs into the transcript — every one of
+    // them then re-sent to the model on the next turn. A read-only picker
+    // shows the same list without touching the history or the wire.
+    var lines: std.ArrayList([]const u8) = .empty;
+    var transferred = false;
+    defer {
+        if (!transferred) for (lines.items) |l| gpa.free(l);
+        lines.deinit(gpa);
+    }
+    lines.append(gpa, gpa.dupe(u8, "commands") catch return) catch return;
+    collectCommandList(m, true, &lines);
+    lines.append(gpa, gpa.dupe(u8, "advanced · type these commands directly") catch return) catch {};
+    collectCommandList(m, false, &lines);
 
     // The user's own commands, refreshed so a file written a minute ago shows
     // up. They get their own block because they answer a different question:
@@ -88,26 +97,28 @@ pub fn cmdHelp(m: *tui.Model) void {
     agent.refreshUserCommandsModel(m);
     const uc = agent.userCommands();
     if (uc.len > 0) {
-        m.pushInfoOwned(gpa.dupe(u8, "your commands (.zode/commands · ~/.config/zode/commands)") catch return);
+        lines.append(gpa, gpa.dupe(u8, "your commands (.zode/commands · ~/.config/zode/commands)") catch return) catch {};
         var i: usize = 0;
         while (i < uc.len) : (i += 1) {
             if (agent.userCommandInfo(i)) |info| {
                 const origin = if (info.root == 0) "proj" else "user";
                 const line = std.fmt.allocPrint(gpa, "{s: <14} {s: <10} {s}", .{ info.key, origin, info.desc }) catch continue;
-                m.pushInfoOwned(line);
+                lines.append(gpa, line) catch {};
             } else {
                 const c = uc[i];
                 const line = std.fmt.allocPrint(gpa, "{s: <14} {s}", .{ c.key, c.desc }) catch continue;
-                m.pushInfoOwned(line);
+                lines.append(gpa, line) catch {};
             }
         }
     }
 
-    m.pushInfoOwned(gpa.dupe(u8, "shortcuts") catch return);
+    lines.append(gpa, gpa.dupe(u8, "shortcuts") catch return) catch {};
     for (shortcuts) |s| {
         const line = std.fmt.allocPrint(gpa, "{s: <18} {s}", .{ s.key, s.desc }) catch continue;
-        m.pushInfoOwned(line);
+        lines.append(gpa, line) catch {};
     }
+    m.pushNotice("Commands and shortcuts", lines.items);
+    transferred = true;
 }
 
 /// `/allowlist`: which tools are in "always allow".
@@ -160,8 +171,10 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
         if (std.ascii.eqlIgnoreCase(sub, "reload")) {
             agent.loadPermRules();
             agent.loadAllowlist();
-            m.pushInfoOwned(gpa.dupe(u8, "permissions: reloaded rules and allowlist from disk") catch return);
-            // fall through to show current state
+            // A confirmation, not a report: a toast keeps 12 lines of rules
+            // from landing in the transcript after every small config change.
+            m.pushFeedback("permissions: reloaded rules and allowlist from disk");
+            return;
         } else if (sub.len > 7 and std.ascii.eqlIgnoreCase(sub[0..4], "add ")) {
             const rule_text = std.mem.trim(u8, sub[4..], " \t\r\n");
             var arena_state = std.heap.ArenaAllocator.init(gpa);
@@ -179,11 +192,11 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
             // and reload so precedence/ordering is consistent) and persist.
             if (agent.savePermRule(rule)) {
                 agent.loadPermRules();
-                m.pushInfoFmt("permissions add: saved user rule `{s}`", .{rule.text});
+                m.pushFeedback("permissions: saved user rule");
             } else {
-                m.pushInfoFmt("permissions add: could not save rule `{s}` (check user permissions file path)", .{rule.text});
+                m.pushFeedback("permissions: could not save rule (check the user permissions file)");
             }
-            // fall through to show current state
+            return;
         } else if (sub.len > 0) {
             m.pushInfoFmt("permissions: unknown subcommand `{s}` (use: /permissions | /permissions reload | /permissions add <Tool(pattern) action>)", .{sub});
             return;
@@ -276,8 +289,8 @@ pub fn cmdHooks(m: *tui.Model, arg: ?[]const u8) void {
         const sub = std.mem.trim(u8, a, " \t\r\n");
         if (std.ascii.eqlIgnoreCase(sub, "reload")) {
             agent.loadHooks();
-            m.pushInfoOwned(gpa.dupe(u8, "hooks: reloaded from disk") catch return);
-            // fall through to show current state
+            m.pushFeedback("hooks: reloaded from disk");
+            return;
         } else if (sub.len > 0) {
             m.pushInfoFmt("hooks: unknown subcommand `{s}` (use: /hooks | /hooks reload)", .{sub});
             return;
@@ -671,9 +684,9 @@ pub fn cmdVim(m: *tui.Model) void {
     tui.resetVim(m);
     if (m.vim_mode) {
         // Start in insert mode to avoid surprising users mid-typing.
-        m.pushInfo("vim mode: on (insert). Esc -> normal, i/a/... -> insert. /vim to disable.");
+        m.pushFeedback("vim mode: on (insert). Esc -> normal, i/a/... -> insert. /vim to disable.");
     } else {
-        m.pushInfo("vim mode: off");
+        m.pushFeedback("vim mode: off");
     }
 }
 
@@ -1199,24 +1212,37 @@ fn configReport(m: *tui.Model) void {
     const hot_pct = compaction.hotPct(m.environ, ctx);
     const src = compaction.limitSource(m.environ, ctx);
 
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "config  ·  zode {s}", .{build_options.version}) catch return);
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  limit source:  {s}", .{
+    var lines: std.ArrayList([]const u8) = .empty;
+    var transferred = false;
+    defer {
+        if (!transferred) for (lines.items) |l| gpa.free(l);
+        lines.deinit(gpa);
+    }
+    const add = struct {
+        fn run(a: std.mem.Allocator, list: *std.ArrayList([]const u8), comptime fmt: []const u8, args: anytype) void {
+            const line = std.fmt.allocPrint(a, fmt, args) catch return;
+            list.append(a, line) catch a.free(line);
+        }
+    }.run;
+    add(gpa, &lines, "config  ·  zode {s}", .{build_options.version});
+    add(gpa, &lines, "  limit source:  {s}", .{
         switch (src) {
             .model => "the model's own context window",
             .env => "ZODE_CONTEXT_LIMIT",
             .default_ => "the 128k default",
         },
-    }) catch return);
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  limit:         {d} tokens", .{limit}) catch return);
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  budget:        {d} tokens ({d}% of limit)", .{ budget, pct }) catch return);
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  compact:       {s}  ({s})", .{
+    });
+    add(gpa, &lines, "  limit:         {d} tokens", .{limit});
+    add(gpa, &lines, "  budget:        {d} tokens ({d}% of limit)", .{ budget, pct });
+    add(gpa, &lines, "  compact:       {s}  ({s})", .{
         @tagName(eff),
         if (m.compact_mode == null) "from ZODE_COMPACT" else "overridden with /compact",
-    }) catch return);
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  warm (bg):     {d}%  (ZODE_COMPACT_BG_PCT)", .{bg_pct}) catch return);
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  hot (sync):    {d}%  (ZODE_COMPACT_HOT_PCT)", .{hot_pct}) catch return);
-    m.pushInfoOwned(std.fmt.allocPrint(gpa, "  recent window: {d} messages  (ZODE_RECENT_WINDOW)", .{compaction.recentWindow(m.environ)}) catch return);
-    m.pushInfoOwned("");
+    });
+    add(gpa, &lines, "  warm (bg):     {d}%  (ZODE_COMPACT_BG_PCT)", .{bg_pct});
+    add(gpa, &lines, "  hot (sync):    {d}%  (ZODE_COMPACT_HOT_PCT)", .{hot_pct});
+    add(gpa, &lines, "  recent window: {d} messages  (ZODE_RECENT_WINDOW)", .{compaction.recentWindow(m.environ)});
+    m.pushNotice("Configuration", lines.items);
+    transferred = true;
 }
 
 // ── interactive Settings screen (Claude-Code-style internal config) ────
@@ -2212,9 +2238,9 @@ pub fn cmdRename(m: *tui.Model, arg: ?[]const u8) void {
     } else if (new_title != null) {
         m.pushInfoFmt("renamed to \"{s}\"", .{s.custom_title});
     } else if (s.tag.len > 0) {
-        m.pushInfoFmt("session tag set to #{s}", .{s.tag});
+        m.pushFeedbackFmt("session tag set to #{s}", .{s.tag});
     } else {
-        m.pushInfo("session tag cleared");
+        m.pushFeedback("session tag cleared");
     }
 }
 
@@ -3281,7 +3307,7 @@ pub fn cmdAskMode(m: *tui.Model, arg: ?[]const u8) void {
     }
     const next: agent.PermMode = if (agent.read_only) .default else .read_only;
     agent.setPermMode(m, next);
-    m.pushInfoFmt("permission mode: {s}", .{agent.permModeName()});
+    m.pushFeedbackFmt("permission mode: {s}", .{agent.permModeName()});
 }
 
 pub fn cmdDots(m: *tui.Model, arg: ?[]const u8) void {
@@ -3291,7 +3317,7 @@ pub fn cmdDots(m: *tui.Model, arg: ?[]const u8) void {
         if (on) {
             m.show_prompt_dots = true;
             m.requestRedraw();
-            m.pushInfo("prompt dots: on — click a dot on the right rail to jump to that prompt");
+            m.pushFeedback("prompt dots: on — click a dot on the right rail to jump to that prompt");
             return;
         }
         if (off) {
@@ -3299,7 +3325,7 @@ pub fn cmdDots(m: *tui.Model, arg: ?[]const u8) void {
             m.prompt_dot_hover = null;
             m.prompt_dot_len = 0;
             m.requestRedraw();
-            m.pushInfo("prompt dots: off");
+            m.pushFeedback("prompt dots: off");
             return;
         }
         m.pushInfo("/dots: on|off");
@@ -3311,7 +3337,7 @@ pub fn cmdDots(m: *tui.Model, arg: ?[]const u8) void {
         m.prompt_dot_len = 0;
     }
     m.requestRedraw();
-    m.pushInfoFmt("prompt dots: {s}", .{if (m.show_prompt_dots) "on" else "off"});
+    m.pushFeedbackFmt("prompt dots: {s}", .{if (m.show_prompt_dots) "on" else "off"});
 }
 
 pub fn cmdYolo(m: *tui.Model) void {
@@ -3356,13 +3382,13 @@ pub fn cmdMode(m: *tui.Model, arg: ?[]const u8) void {
         const mode = agent.parsePermMode(a);
         if (mode) |mm| {
             agent.setPermMode(m, mm);
-            m.pushInfoFmt("permission mode: {s}", .{agent.permModeName()});
+            m.pushFeedbackFmt("permission mode: {s}", .{agent.permModeName()});
             return;
         }
         m.pushInfo("/mode: build|accept-edits|plan|bypass");
         return;
     }
-    m.pushInfoFmt("permission mode: {s} (shift+tab cycles)", .{agent.permModeName()});
+    m.pushFeedbackFmt("permission mode: {s} (shift+tab cycles)", .{agent.permModeName()});
 }
 
 /// `/skills`: what is loadable, and from where.
@@ -3419,9 +3445,9 @@ pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
             if (found) |n| {
                 const keep_note = if (found_keep) "" else " (coding rules replaced by this style)";
                 const terse_note = if (found_terse) " · terse tool schemas" else "";
-                m.pushInfoFmt("output style: {s}{s}{s} — {s}", .{ n, keep_note, terse_note, found_desc });
+                m.pushFeedbackFmt("output style: {s}{s}{s} — {s}", .{ n, keep_note, terse_note, found_desc });
             } else {
-                m.pushInfoFmt("output style: {s} (not found — was it removed?)", .{name});
+                m.pushFeedbackFmt("output style: {s} (not found — was it removed?)", .{name});
             }
         } else {
             m.pushInfo("no output style selected. /style <name> picks one; /style off clears it.");
@@ -3467,7 +3493,7 @@ pub fn cmdStyle(m: *tui.Model, arg: ?[]const u8) void {
 
     const keep_note = if (found_keep) "" else " — this style replaces the coding rules";
     const terse_note = if (found_terse) " — terse tool schemas (rules restated in this style)" else "";
-    m.pushInfoFmt("output style: {s}{s}{s}", .{ trimmed, keep_note, terse_note });
+    m.pushFeedbackFmt("output style: {s}{s}{s}", .{ trimmed, keep_note, terse_note });
 }
 
 pub fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
@@ -3479,17 +3505,16 @@ pub fn cmdEffort(m: *tui.Model, arg: ?[]const u8) void {
         agent.current_effort = want;
         const got = chat.effortFor(agent.cur_model, want);
         if (got == null) {
-            m.pushInfoFmt("effort → {s} (this model has no effort knob; the level only sets the answer length)", .{
+            m.pushFeedbackFmt("effort → {s} (answer length only on this model)", .{
                 want.label(),
             });
         } else if (got.? != want) {
-            m.pushInfoFmt("effort → {s} (this model tops out at {s}, so {s} is what goes on the wire)", .{
+            m.pushFeedbackFmt("effort → {s} (capped at {s} on this model)", .{
                 want.label(),
-                chat.maxEffortFor(agent.cur_model).label(),
                 got.?.label(),
             });
         } else {
-            m.pushInfoFmt("effort → {s}", .{want.label()});
+            m.pushFeedbackFmt("effort → {s}", .{want.label()});
         }
         return;
     }
@@ -4280,16 +4305,13 @@ fn updateWorker(job: *UpdateJob) void {
 fn announceUpdate(m: *tui.Model, up: selfupdate.Update) void {
     var buf: [160]u8 = undefined;
     const phrase = selfupdate.phrase(&buf, up);
-    m.pushInfoFmt("zode {s} · /update installs it", .{phrase});
     m.pushNotification(phrase);
 }
 
 fn installUpdateNow(m: *tui.Model, ctx: selfupdate.Context) void {
-    m.pushInfoFmt("updating zode from {s}…", .{selfupdate.current_version});
     m.pushNotification("Updating zode…");
     const tag = selfupdate.installLatest(ctx) catch |err| switch (err) {
         error.AlreadyNewest => {
-            m.pushInfoFmt("zode {s} is already the newest release", .{selfupdate.current_version});
             m.pushNotification("zode is already up to date");
             return;
         },
@@ -4301,7 +4323,6 @@ fn installUpdateNow(m: *tui.Model, ctx: selfupdate.Context) void {
     };
     var nbuf: [160]u8 = undefined;
     const note = std.mem.print(&nbuf, "Updated to {s} · restart zode", .{tag}) catch "Updated · restart zode";
-    m.pushInfoFmt("updated to {s} · restart zode to use it", .{tag});
     m.pushNotification(note);
 }
 
