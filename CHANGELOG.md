@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - make approved memories available to every model (memory) [`fac44dbd`](https://github.com/jesusalcaladev/zode/commit/fac44dbd)
 - search and reuse past prompts with Ctrl+/ (tui) [`136f93c1`](https://github.com/jesusalcaladev/zode/commit/136f93c1)
 - Ctrl+V also pastes text from the native clipboard (tui) [`d458da5c`](https://github.com/jesusalcaladev/zode/commit/d458da5c)
+- make provider search work in the model picker (palette) [`836f865a`](https://github.com/jesusalcaladev/zode/commit/836f865a)
 
 ### Bug Fixes
 
@@ -44,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - harden input handling and protect in-progress drafts (tui) [`e992ec6a`](https://github.com/jesusalcaladev/zode/commit/e992ec6a)
 - stop ending turns at 12 iterations and explain gate refusals (agent) [`76e1f0bc`](https://github.com/jesusalcaladev/zode/commit/76e1f0bc)
 - stop inferring tool failures from the summary text (tui) [`b2e5c400`](https://github.com/jesusalcaladev/zode/commit/b2e5c400)
-- finish moving config feedback out of the transcript (tui) [`c5a7deb4`](https://github.com/jesusalcaladev/zode/commit/c5a7deb4)
+- finish moving config feedback out of the transcript (tui) [`18f38529`](https://github.com/jesusalcaladev/zode/commit/18f38529)
 
 ### Chores
 

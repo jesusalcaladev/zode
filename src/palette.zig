@@ -292,14 +292,27 @@ pub const Palette = struct {
         // In `.connect` mode EVERYTHING goes to column 0 (it is a single list),
         // so it behaves like `.commands` but with the provider items.
         const single = self.mode == .commands or self.mode == .connect or self.mode == .key_prompt;
-        // In two-column mode filter ONLY the focused one. Filtering both left
-        // the other blank when searching, which gave the impression that the
-        // models list did not exist: you typed "sonnet" and did not see a single
-        // model, only "No matches" in both columns.
+        // In two-column mode filter ONLY the focused one for a normal query.
+        // Filtering both left the other blank when searching, which gave the
+        // impression that the models list did not exist. The EXCEPTION is a
+        // provider query: then both columns must answer, otherwise typing a
+        // provider name looks like the search does nothing.
         const focus = self.column();
+        var provider_ids: [32][]const u8 = undefined;
+        var provider_count: usize = 0;
+        if (self.mode == .models and q.len > 0) {
+            for (self.items) |it| {
+                if (it.kind != .provider) continue;
+                if (!matches(it, self.groups, q)) continue;
+                if (provider_count >= provider_ids.len) break;
+                provider_ids[provider_count] = it.label;
+                provider_count += 1;
+            }
+        }
+        const provider_query = provider_count > 0;
         for (0..2) |c| {
             self.filtered[c].clearRetainingCapacity();
-            const filter_col = single or c == focus or q.len == 0;
+            const filter_col = single or c == focus or q.len == 0 or provider_query;
             if (filter_col and q.len > 0) {
                 const Scored = struct { idx: u32, score: i32 };
                 var scored: std.ArrayList(Scored) = .empty;
@@ -312,7 +325,9 @@ pub const Palette = struct {
                     else
                         (it.kind == .model);
                     if (!in_col) continue;
-                    if (!matches(it, self.groups, q)) continue;
+                    const own_match = matches(it, self.groups, q);
+                    const from_provider = provider_query and c == 1 and providerHas(it, &provider_ids, provider_count);
+                    if (!own_match and !from_provider) continue;
                     scored.append(self.gpa, .{ .idx = @intCast(i), .score = matchScore(it, self.groups, q) }) catch return;
                 }
                 // Best first; ties keep the original order (stable insertion sort)
@@ -433,11 +448,26 @@ pub const Palette = struct {
 /// starts with a slash) and the search looked broken. Order: prefix first (the
 /// usual and cheap case), then the label's substring, then the hint and
 /// finally the group name, so that "model" brings out the whole group.
+/// True when a model item belongs to one of the providers that matched the
+/// query. Comparison is case-insensitive: the provider row uses its display
+/// id while model items carry the same id from the catalog.
+fn providerHas(item: Item, ids: []const []const u8, n: usize) bool {
+    if (item.kind != .model or item.provider.len == 0) return false;
+    for (ids[0..n]) |id| {
+        if (std.ascii.eqlIgnoreCase(id, item.provider)) return true;
+    }
+    return false;
+}
+
 pub fn matches(item: Item, groups: []const Group, q: []const u8) bool {
     if (q.len == 0) return true;
     if (startsWithIgnoreCase(item.label, q)) return true;
     if (containsIgnoreCase(item.label, q)) return true;
     if (item.hint.len > 0 and containsIgnoreCase(item.hint, q)) return true;
+    // The structured provider is searchable too. The hint happens to include
+    // the provider id today, but it is a display string built by the caller;
+    // relying on it made "search by provider" break whenever that text changed.
+    if (item.provider.len > 0 and containsIgnoreCase(item.provider, q)) return true;
     // The group name is one MORE way to find, never a veto: with a
     // `return containsIgnoreCase(...)` the group vetoed the match, and searching
     // "sonnet" did not find "claude-sonnet-4" (it lives in the "Models" group,
@@ -473,6 +503,10 @@ fn matchScore(item: Item, groups: []const Group, q: []const u8) i32 {
         return fuzzy.score(item.label, q, n, buf[0..n]);
     }
     var s: i32 = 0;
+    if (item.provider.len > 0 and containsIgnoreCase(item.provider, q)) {
+        const score: i32 = if (startsWithIgnoreCase(item.provider, q)) 160 else 125;
+        s = @max(s, score);
+    }
     if (item.hint.len > 0 and containsIgnoreCase(item.hint, q)) s = @max(s, 120);
     for (groups, 0..) |g, i| {
         if (i + 1 == item.group and containsIgnoreCase(g.name, q)) s = @max(s, 80);
@@ -1172,7 +1206,7 @@ fn drawFooter(p: *Painter, pal: *const Palette, box: Box, notice: []const u8) vo
     // pointer and does not say so is a list nobody clicks.
     const hint: []const u8 = switch (pal.mode) {
         .commands => "↑↓ move · enter or click run · esc close",
-        .models => "↑↓ move · click select · tab switch · ctrl+r refresh",
+        .models => "↑↓ move · type a provider to filter both columns · tab switch",
         .connect => "↑↓ move · click add / replace key",
         .key_prompt => "",
     };
@@ -2383,4 +2417,42 @@ test "handleMouse: a closed palette ignores the pointer" {
     try t.expect(!r.changed);
     try t.expect(std.meta.activeTag(r.action) == .none);
     try t.expect(hitTest(&pal, 100, 30, 10, 20) == null);
+}
+
+test "matches: the structured provider is searchable even without a hint" {
+    const it = Item{ .kind = .model, .label = "some-model", .provider = "anthropic" };
+    try t.expect(matches(it, &.{}, "anthropic"));
+    try t.expect(matches(it, &.{}, "ANTHRO"));
+    try t.expect(!matches(it, &.{}, "groq"));
+}
+
+test "refilter: a provider query filters both columns, a model query only one" {
+    var pal = Palette.init(t.allocator);
+    defer pal.deinit();
+    pal.mode = .models;
+    const items = [_]Item{
+        .{ .kind = .provider, .label = "opencode" },
+        .{ .kind = .provider, .label = "openrouter" },
+        .{ .kind = .connect, .label = "Connect an integration" },
+        .{ .kind = .model, .label = "deepseek-chat", .provider = "deepseek" },
+        .{ .kind = .model, .label = "kimi-k2", .provider = "opencode" },
+        .{ .kind = .model, .label = "gpt-5", .provider = "openai" },
+    };
+    pal.setItems(&items, &.{});
+
+    // A provider name is a cross-column query: the provider row and only the
+    // models belonging to it survive.
+    @memcpy(pal.query[0..8], "opencode");
+    pal.query_len = 8;
+    pal.refilter();
+    try t.expectEqual(@as(usize, 1), pal.countIn(0));
+    try t.expectEqual(@as(usize, 1), pal.countIn(1));
+    try t.expectEqualStrings("kimi-k2", pal.items[pal.filtered[1].items[0]].label);
+
+    // A plain model name still filters only the focused column.
+    @memcpy(pal.query[0..3], "gpt");
+    pal.query_len = 3;
+    pal.refilter();
+    try t.expectEqual(@as(usize, 1), pal.countIn(1));
+    try t.expectEqual(@as(usize, 3), pal.countIn(0));
 }
