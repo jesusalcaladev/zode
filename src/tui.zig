@@ -1901,6 +1901,10 @@ pub const Model = struct {
     /// sides hold gpa-owned paths, so exactly one side frees them.
     stashed_text: ?[]u8 = null,
     stashed_images: images_mod.Pending = .{},
+    /// While a config/report command runs, its `.info` lines are collected here
+    /// and shown in one read-only picker instead of N transcript paragraphs.
+    chrome_capture: bool = false,
+    chrome_lines: std.ArrayList([]const u8) = .empty,
     /// The automatic typecheck the harness starts after a write tool touches code.
     ///
     /// It is a struct and not three fields because the headless runner keeps one on
@@ -2479,6 +2483,20 @@ pub const Model = struct {
         self.ed.hist_idx = -1;
     }
 
+    pub fn beginChromeCapture(self: *Model) void {
+        self.chrome_capture = true;
+        self.chrome_lines.clearRetainingCapacity();
+    }
+
+    pub fn endChromeCapture(self: *Model, title: []const u8) void {
+        self.chrome_capture = false;
+        if (self.chrome_lines.items.len == 0) return;
+        const items = self.allocator.alloc(PickerItem, self.chrome_lines.items.len) catch return;
+        for (self.chrome_lines.items, 0..) |line, i| items[i] = .{ .label = line };
+        self.chrome_lines.clearRetainingCapacity(); // labels now owned by the picker
+        self.openPickerIdx(notice_tag, title, items, noticeChosen, null);
+    }
+
     pub fn savePromptHistory(self: *Model) void {
         if (!self.io_ready) return;
         prompthistory.save(self.allocator, self.io, self.environ, self.ed.history.items);
@@ -2589,6 +2607,8 @@ pub const Model = struct {
             self.allocator.free(so.text);
         }
         self.shell_out.deinit(self.allocator);
+        for (self.chrome_lines.items) |line| self.allocator.free(line);
+        self.chrome_lines.deinit(self.allocator);
         self.search_matches.deinit(self.allocator);
         self.folded_hunks.deinit(self.allocator);
         for (self.tool_memos.items) |*memo| memo.deinit(self.allocator);
@@ -5916,6 +5936,10 @@ pub const Model = struct {
     }
 
     fn enqueueOwned(self: *Model, kind: md.Kind, text: []const u8) void {
+        if (self.chrome_capture and kind == .info) {
+            self.chrome_lines.append(self.allocator, text) catch self.allocator.free(text);
+            return;
+        }
         self.lock();
         defer self.unlock();
         self.pending.append(self.allocator, .{ .kind = kind, .text = text }) catch {

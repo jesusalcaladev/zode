@@ -75,6 +75,22 @@ fn collectCommandList(m: *tui.Model, palette_visible: bool, out: *std.ArrayList(
     }
 }
 
+/// Commands whose whole output is a report about the harness, not a model
+/// result. Their `.info` lines are collected and shown in one read-only picker
+/// so they never become transcript paragraphs. Tool results (/diff, /cost)
+/// and model summaries are deliberately NOT in this list.
+pub fn chromeCaptureTitle(cmd: []const u8) ?[]const u8 {
+    const names = [_][]const u8{
+        "status", "doctor", "diag", "usage", "agents", "mcp", "sandbox",
+        "skills", "plugin", "keybinds", "release-notes", "cache",
+        "permissions", "hooks",
+    };
+    for (names) |name| {
+        if (std.mem.eql(u8, cmd, name)) return name;
+    }
+    return null;
+}
+
 pub fn cmdHelp(m: *tui.Model) void {
     const gpa = m.allocator;
     // This used to push ~130 paragraphs into the transcript — every one of
@@ -2898,6 +2914,17 @@ pub const Cmd = struct {
 // ── `/files` ──────────────────────────────────────────────────
 
 /// The text the command pushed, as one string.
+/// Config/report commands now land in a picker rather than `pending`.
+fn noticeText(m: *tui.Model, gpa: std.mem.Allocator) ![]u8 {
+    var all: std.ArrayList(u8) = .empty;
+    errdefer all.deinit(gpa);
+    for (m.picker_items.items) |item| {
+        try all.appendSlice(gpa, item.label);
+        try all.append(gpa, '\n');
+    }
+    return all.toOwnedSlice(gpa);
+}
+
 fn pendingText(m: *tui.Model, gpa: std.mem.Allocator) ![]u8 {
     var all: std.ArrayList(u8) = .empty;
     errdefer all.deinit(gpa);
@@ -3000,7 +3027,7 @@ test "/usage and /doctor are dispatched by submit, not just listed" {
         var m = tui.Model.init(std.testing.allocator);
         defer m.deinit();
         try agent.submit(&m, "/usage");
-        const text = try pendingText(&m, std.testing.allocator);
+        const text = try noticeText(&m, std.testing.allocator);
         defer std.testing.allocator.free(text);
         try std.testing.expect(std.mem.indexOf(u8, text, "usage") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "requests") != null);
@@ -3009,7 +3036,7 @@ test "/usage and /doctor are dispatched by submit, not just listed" {
         var m = tui.Model.init(std.testing.allocator);
         defer m.deinit();
         try agent.submit(&m, "/doctor");
-        const text = try pendingText(&m, std.testing.allocator);
+        const text = try noticeText(&m, std.testing.allocator);
         defer std.testing.allocator.free(text);
         try std.testing.expect(std.mem.indexOf(u8, text, "doctor") != null);
         try std.testing.expect(std.mem.indexOf(u8, text, "yolo") != null);
@@ -3047,7 +3074,7 @@ test "/permissions panel is dispatched" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     try agent.submit(&m, "/permissions");
-    const text = try pendingText(&m, std.testing.allocator);
+    const text = try noticeText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "permissions") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Tool(pattern)") != null);
@@ -3058,7 +3085,7 @@ test "/hooks panel is dispatched" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     try agent.submit(&m, "/hooks");
-    const text = try pendingText(&m, std.testing.allocator);
+    const text = try noticeText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "hooks") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "PreToolUse") != null);
@@ -3105,7 +3132,7 @@ test "/agents panel is dispatched" {
     var m = tui.Model.init(std.testing.allocator);
     defer m.deinit();
     try agent.submit(&m, "/agents");
-    const text = try pendingText(&m, std.testing.allocator);
+    const text = try noticeText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "agents") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "Phase 9") != null);

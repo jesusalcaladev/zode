@@ -2902,6 +2902,13 @@ pub fn submit(m: *tui.Model, input: []const u8) !void {
     const rest = it.rest();
     const arg: ?[]const u8 = if (rest.len == 0) null else rest;
 
+    // Harness reports go to one read-only picker instead of a burst of
+    // transcript paragraphs. A `defer` guarantees the picker opens even when
+    // the command returns early on an error.
+    const chrome = commands_mod.chromeCaptureTitle(cmd);
+    if (chrome != null) m.beginChromeCapture();
+    defer if (chrome) |title| m.endChromeCapture(title);
+
     if (std.mem.eql(u8, cmd, "help")) {
         commands_mod.cmdHelp(m);
     } else if (std.mem.eql(u8, cmd, "quit")) {
