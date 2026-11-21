@@ -572,9 +572,9 @@ pub fn setPermMode(m: *tui.Model, mode: PermMode) void {
 pub fn cyclePermMode(m: *tui.Model) void {
     const next = agent_perms.cycleNext(currentPermMode());
     setPermMode(m, next);
-    // The transcript says it, and the footer's RIGHT group shows the mode: the
-    // mascot's legend belongs to the agent's work and nothing else.
-    m.pushInfoFmt("permission mode: {s}", .{permModeName()});
+    // The footer's RIGHT group shows the mode; a toast confirms the change.
+    // A transcript paragraph would be re-sent to the model on the next turn.
+    m.pushFeedbackFmt("Permission mode: {s}", .{permModeName()});
 }
 
 /// `/ask [on|off]`: Plan mode, retained as a command alias.
@@ -5664,10 +5664,10 @@ fn resolveModel(m: *tui.Model, http: *http_client.Http) ?[]const u8 {
     // to make the decision and threw `context_length` away on the way out, so
     // the budget stayed at 128k for a model that publishes 200k.
     setModelCtx(chosen.id, chosen.context_length);
-    // WHICH and WHY, in the history and not only in the status bar: a silent
-    // choice is indistinguishable from a hardcoded default, which is the thing
-    // this exists to replace.
-    m.pushInfoFmt("model → {s} ({s}; /model to change it)", .{ chosen.id, choice.why });
+    // WHICH and WHY, as a transient notice: a silent choice is indistinguishable
+    // from a hardcoded default, but a transcript paragraph would linger and be
+    // re-sent to the model on the next turn.
+    m.pushFeedbackFmt("Model → {s} ({s}; /model to change it)", .{ chosen.id, choice.why });
     refreshContextUsage(m);
     // Remembered: the next start does not ask the catalogue again, it puts back
     // the model that actually worked here. (Free-auto ROTATIONS are not
@@ -12742,15 +12742,15 @@ pub fn applyProvider(m: *tui.Model, id: []const u8) !void {
     // And ONLY if the provider declares one of its own (the user's config.json)
     // is it used.
     if (def.default_model.len > 0) setModel(def.default_model);
-    m.pushInfoFmt("provider → {s} · model {s}", .{
+    m.pushFeedbackFmt("Provider → {s} · model {s}", .{
         def.id,
         if (cur_model.len > 0) cur_model else "(auto: picked from the catalog)",
     });
     if (had_model and def.default_model.len == 0) {
         // The model of the PREVIOUS provider is not valid here, and staying
         // silent about it means the next turn spends itself on a 400 that says
-        // nothing about the cause.
-        m.pushInfo("that model was from another provider; /model picks one from this provider's catalog");
+        // nothing about the cause. Still transient: this is config feedback.
+        m.pushFeedback("That model was from another provider; /model picks one from this provider's catalog");
     }
     refreshContextUsage(m);
     persistLastModel();
@@ -12768,7 +12768,7 @@ pub fn applyModel(m: *tui.Model, name: []const u8, ctx_tokens: u32) !void {
     router_warned = false; // a new model deserves a new verdict
     routerWarnOnce(m, name);
     resetCheapRouter(m);
-    m.pushInfoFmt("model → {s}", .{name});
+    m.pushFeedbackFmt("Model → {s}", .{name});
     refreshContextUsage(m);
     persistLastModel();
 }
@@ -19770,4 +19770,15 @@ test "system prompt carries approved memory to every model without a tool call" 
     const prompt = prompt_system.buildSystemPrompt(ctx, &out, false);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "remember-me") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "vendored toolchain") != null);
+}
+
+test "config: switching permission mode uses a toast, not a transcript paragraph" {
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+    const saved_mode = currentPermMode();
+    defer setPermMode(&m, saved_mode);
+
+    cyclePermMode(&m);
+    try std.testing.expectEqual(@as(usize, 0), m.pending.items.len);
+    try std.testing.expect(m.notification_len > 0);
 }

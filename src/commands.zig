@@ -256,11 +256,11 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
             defer arena_state.deinit();
             const aa = arena_state.allocator();
             const rule = permrules.parseRule(rule_text, .user, aa) orelse {
-                m.pushInfoFmt("permissions add: invalid rule `{s}` (expected: Tool(pattern) allow|deny|ask|dontAsk)", .{rule_text});
+                m.pushFeedbackFmt("Error: invalid rule `{s}` (expected: Tool(pattern) allow|deny|ask|dontAsk)", .{rule_text});
                 return;
             };
             if ((rule.action == .allow or rule.action == .dontAsk) and permrules.isDangerousPattern(rule.tool, rule.pattern)) {
-                m.pushInfoFmt("permissions add: refused dangerous broad allow `{s}` — use a narrower pattern (e.g. Bash(git *)) or deny/ask", .{rule.text});
+                m.pushFeedbackFmt("Error: refused dangerous broad allow `{s}` — use a narrower pattern (e.g. Bash(git *)) or deny/ask", .{rule.text});
                 return;
             }
             // Add to in-memory rules (local-strength view isn't needed; save as user
@@ -273,7 +273,7 @@ pub fn cmdPermissions(m: *tui.Model, arg: ?[]const u8) void {
             }
             return;
         } else if (sub.len > 0) {
-            m.pushInfoFmt("permissions: unknown subcommand `{s}` (use: /permissions | /permissions reload | /permissions add <Tool(pattern) action>)", .{sub});
+            m.pushFeedbackFmt("Error: unknown subcommand `{s}` (use: /permissions | /permissions reload | /permissions add <Tool(pattern) action>)", .{sub});
             return;
         }
     }
