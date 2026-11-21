@@ -26,7 +26,10 @@ pub const State = struct {
 pub const InitOps = struct {
     fireUserPromptSubmitHooks: *const fn (*tui.Model, []const u8) void,
     resetInheritedGoalState: *const fn (*tui.Model) void,
-    statusIterationLimit: *const fn (*const tui.Model) usize,
+    /// The HARD wall, not the soft target. `statusIterationLimit()` = 12 is a
+    /// reporting target; using it as the loop bound cut tasks at 12 and made
+    /// the user type "continue". Headless already loops on the hard budget.
+    loopHardLimit: *const fn (*const tui.Model) usize,
     loopV2: *const fn () bool,
     loopBudget: *const fn (*const tui.Model) taskloop.Budget,
     loopMark: *const fn (*const tui.Model) loop_evidence.LoopMark,
@@ -38,7 +41,7 @@ pub fn init(m: *tui.Model, user_text: []const u8, ops: InitOps) State {
     // Clear inherited goal state so queued turns don't inherit previous objective.
     ops.resetInheritedGoalState(m);
 
-    var st = State{ .limit = ops.statusIterationLimit(m) };
+    var st = State{ .limit = ops.loopHardLimit(m) };
     m.repeats.reset();
 
     // A NEW turn starts un-cancelled: ESC belongs to the turn it interrupted.
@@ -94,4 +97,47 @@ pub fn run(m: *tui.Model, user_text: []const u8, ops: RunOps) TurnOutcome {
     }
 
     return ops.finishAgentLoopOutcome(m, user_text, st.iterations, st.limit, &st.capped, &st.reason);
+}
+
+// ── tests ────────────────────────────────────────────────────────────────
+
+test "the TUI loop is bounded by the hard wall, not the 12-iteration soft target" {
+    // `statusIterationLimit()` is a REPORTING target (12). Wiring it as the
+    // loop bound cut a 14-iteration task at 12, and the user had to type
+    // "continue" — exactly the failure the budget ladder exists to remove.
+    const S = struct {
+        fn userHook(_: *tui.Model, _: []const u8) void {}
+        fn resetGoal(_: *tui.Model) void {}
+        fn soft(_: *const tui.Model) usize {
+            return 12;
+        }
+        fn hard(_: *const tui.Model) usize {
+            return 60;
+        }
+        fn v2() bool {
+            return true;
+        }
+        fn budget(_: *const tui.Model) taskloop.Budget {
+            return taskloop.Budget.init(12, 60);
+        }
+        fn mark(_: *const tui.Model) loop_evidence.LoopMark {
+            return .{ .files = 0, .plan_done = 0, .verified_writes = 0 };
+        }
+        fn drain(_: *tui.Model) void {}
+    };
+    var m = tui.Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    const st = init(&m, "finish the task", .{
+        .fireUserPromptSubmitHooks = S.userHook,
+        .resetInheritedGoalState = S.resetGoal,
+        .loopHardLimit = S.hard,
+        .loopV2 = S.v2,
+        .loopBudget = S.budget,
+        .loopMark = S.mark,
+        .drainBackgroundTaskNotifications = S.drain,
+    });
+    try std.testing.expectEqual(@as(usize, 60), st.limit);
+    try std.testing.expect(st.policy != null);
+    try std.testing.expectEqual(@as(usize, 60), st.policy.?.budget.hard);
 }

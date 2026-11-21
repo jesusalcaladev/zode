@@ -15,6 +15,13 @@ const outputstyles = @import("../lib/outputstyles.zig");
 const ask = @import("../lib/ask.zig");
 const discovery = @import("discovery.zig");
 
+/// This repo's own AGENTS.md is ~24.5 KB. A 16 KB composition buffer cut it
+/// around line 80, which silently dropped the durable design decisions (the
+/// ceiling turn, the harness-prompt door, the task pipeline) and most of the
+/// project's rules. 64 KB keeps a real instruction file intact; the fallback
+/// truncator is still there for projects much larger than this one.
+pub const system_prompt_capacity: usize = 64 * 1024;
+
 pub const default_system_prompt = prompt_mod.default_system_prompt;
 pub const default_system_prompt_core = prompt_mod.default_system_prompt_core;
 pub const coding_rules = prompt_mod.coding_rules;
@@ -303,12 +310,12 @@ pub fn buildSystemPrompt(ctx: BuildCtx, out: []u8, include_skills: bool) []const
 }
 
 pub fn buildSystemPromptFor(ctx: BuildCtx) ![]u8 {
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [system_prompt_capacity]u8 = undefined;
     return ctx.gpa.dupe(u8, buildSystemPrompt(ctx, &buf, true));
 }
 
 pub fn syncSystemPrompt(s: *session_mod.Session, ctx: BuildCtx) void {
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [system_prompt_capacity]u8 = undefined;
     const want = buildSystemPrompt(ctx, &buf, true);
     for (s.messages.items) |m| {
         if (m.role != .system) continue;

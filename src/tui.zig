@@ -1587,6 +1587,10 @@ pub const Model = struct {
     /// How many times the harness has nudged the model after an empty reply.
     // Reset each turn; bounded to avoid endless nudges.
     empty_reply_nudges: u8 = 0,
+    /// How many times this turn was continued after the provider cut the reply
+    /// at its output limit. Bounded so a provider that always truncates cannot
+    /// spin the loop forever.
+    truncation_continuations: u8 = 0,
     /// Set true when a real allocation failure stopped stream_buf growth.
     stream_truncated: bool = false,
 

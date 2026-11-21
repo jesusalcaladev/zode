@@ -4606,7 +4606,7 @@ const ExitGateAction = loop_guards.ExitGateAction;
 fn loopGuardsOps() loop_guards.UiOps {
     const S = struct {
         fn pushGateLimit(m: *tui.Model, limit: u8) void {
-            m.pushErrorFmt("exit gate refused {d} times on a red build; ending this turn anyway. If this task cannot be completed here, call `goal` with status blocked and what_would_unblock.", .{limit});
+            m.pushErrorFmt("exit gate refused {d} times; ending this turn anyway. If this task cannot be completed here, call `goal` with status blocked and what_would_unblock.", .{limit});
         }
         fn pushRepeatStop(m: *tui.Model, which: []const u8) void {
             m.pushInfoFmt("stopped a repeated tool loop ({s})", .{which});
@@ -4736,7 +4736,7 @@ fn runAgentLoop(m: *tui.Model, user_text: []const u8) TurnOutcome {
         .init = .{
             .fireUserPromptSubmitHooks = fireUserPromptSubmitHooks,
             .resetInheritedGoalState = resetInheritedGoalState,
-            .statusIterationLimit = statusIterationLimit,
+            .loopHardLimit = loopHardLimit,
             .loopV2 = loopV2,
             .loopBudget = loopBudget,
             .loopMark = loopMark,
@@ -6653,7 +6653,9 @@ fn executeTurnRequest(
 
     chat.cancel_current.store(false, .seq_cst);
     if (iteration > 0) {
-        const limit = statusIterationLimit(m);
+        // Show the same wall the loop actually uses. Reporting 12 here while
+        // the loop runs to 60 made the status line lie about the work left.
+        const limit = loopHardLimit(m);
         const it = std.fmt.allocPrint(
             gpa,
             "thinking · iteration {d}/{d}",
@@ -14527,7 +14529,7 @@ test "the skills listing in the PROMPT goes under a tight budget" {
     defer map.deinit();
     try map.put("ZODE_CONTEXT_LIMIT", "6000");
 
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [prompt_system.system_prompt_capacity]u8 = undefined;
     const tight = buildSystemPrompt(env.allocator(), &buf, &map, true);
     // The bundled skills are there, but only their NAMES: 1% of a 6000-token
     // window is 240 characters, and that is not a description.
@@ -14540,7 +14542,7 @@ test "the skills listing in the PROMPT keeps the descriptions when there is room
     var env = PromptTestEnv.init();
     defer env.deinit();
 
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [prompt_system.system_prompt_capacity]u8 = undefined;
     const roomy = buildSystemPrompt(env.allocator(), &buf, null, true);
     try std.testing.expect(std.mem.indexOf(u8, roomy, "- simplify") != null);
     try std.testing.expect(std.mem.indexOf(u8, roomy, "Review recent or targeted code") != null);
@@ -14552,7 +14554,7 @@ test "buildSystemPrompt without skills leaves the cacheable prefix clean" {
     var env = PromptTestEnv.init();
     defer env.deinit();
 
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [prompt_system.system_prompt_capacity]u8 = undefined;
     const prompt = buildSystemPrompt(env.allocator(), &buf, null, false);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "- simplify") == null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Review recent or targeted code") == null);
@@ -14565,7 +14567,7 @@ test "skillsSectionText produces the bundled skill names" {
     var env = PromptTestEnv.init();
     defer env.deinit();
 
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [prompt_system.system_prompt_capacity]u8 = undefined;
     const section = skillsSectionText(env.allocator(), null, &buf);
     try std.testing.expect(section.len > 0);
     try std.testing.expect(std.mem.indexOf(u8, section, "- simplify") != null);
@@ -14729,7 +14731,7 @@ test "prompt: the routing guide survives the project's AGENTS.md" {
     // one that goes missing: a routing table that stops mid-sentence looks like a
     // shorter prompt, not like a broken test. The prompt is the biggest stable prefix
     // in every request, so its length is worth pinning generously.
-    var out: [16 * 1024]u8 = undefined;
+    var out: [prompt_system.system_prompt_capacity]u8 = undefined;
     const composed = buildSystemPrompt(std.testing.allocator, &out, null, true);
     try std.testing.expect(composed.len < out.len); // it FIT: nothing was truncated
     try std.testing.expect(std.mem.indexOf(u8, composed, "No hagas esto.") != null);
@@ -14790,7 +14792,7 @@ test "prompt: the model receives the cwd and, if there is a repo, the branch" {
     prompt_system.agents_md_cache = try std.testing.allocator.dupe(u8, "# test project\n");
     defer if (prompt_system.agents_md_cache != null and saved_agents == null) std.testing.allocator.free(prompt_system.agents_md_cache.?);
 
-    var out: [16 * 1024]u8 = undefined;
+    var out: [prompt_system.system_prompt_capacity]u8 = undefined;
     const composed = buildSystemPrompt(std.testing.allocator, &out, null, true);
     try std.testing.expect(std.mem.indexOf(u8, composed, "Working directory:") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, root) != null);
@@ -14933,7 +14935,7 @@ test "skills: the list is invalidated when a SKILL.md changes on disk" {
     // `skills_cache` is NOT nulled here on purpose: the file's size changed, so
     // the mtime+size stamp is what has to invalidate the cache — the mechanism
     // this test exists for.
-    var pbuf: [16 * 1024]u8 = undefined;
+    var pbuf: [prompt_system.system_prompt_capacity]u8 = undefined;
     const prompt = buildSystemPrompt(std.testing.allocator, &pbuf, null, true);
     try std.testing.expect(prompt.len < pbuf.len); // it FIT: nothing was truncated
     try std.testing.expect(std.mem.indexOf(u8, prompt, "nuevo") != null);
@@ -15147,7 +15149,7 @@ test "system prompt: the volatile parts go LAST, so a mode change does not drop 
     prompt_system.agents_md_cache = fake_base;
     defer prompt_system.agents_md_cache = saved_agents;
 
-    var out: [16 * 1024]u8 = undefined;
+    var out: [prompt_system.system_prompt_capacity]u8 = undefined;
     const p = buildSystemPrompt(std.testing.allocator, &out, null, true);
 
     const at = struct {
@@ -15218,7 +15220,7 @@ test "system prompt: the verification rules are injected even with a project's A
     prompt_system.agents_md_cache = fake;
     defer prompt_system.agents_md_cache = saved_agents;
 
-    var out: [16 * 1024]u8 = undefined;
+    var out: [prompt_system.system_prompt_capacity]u8 = undefined;
     const composed = buildSystemPrompt(std.testing.allocator, &out, null, true);
     try std.testing.expect(std.mem.indexOf(u8, composed, "Reglas del proyecto.") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "NARROWEST command") != null);
@@ -15574,7 +15576,7 @@ test "the headless prompt is the SAME prompt as the TUI's, routing included" {
     prompt_system.agents_md_cache = null;
     defer prompt_system.agents_md_cache = saved_agents;
 
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [prompt_system.system_prompt_capacity]u8 = undefined;
     const from_tui = buildSystemPrompt(a, &buf, null, true);
     // The first call above caches arena-allocated entries in the globals.
     // Drop them before the second call so `freeStylesCacheLocked`/`freeSkillsCacheLocked`
@@ -15645,11 +15647,13 @@ test "the project's own AGENTS.md is READ, even when it is big" {
 }
 
 test "a project whose AGENTS.md does not fit still gets the ROUTING, not just its own text" {
-    // Found by the previous test, which runs in this repository: its `AGENTS.md` is
-    // ~90 KB, the composition buffer is 16 KB, and the old overflow answer was
-    // `catch return base`. So in this very repository the composed prompt was the
-    // project's own text ALONE: no routing table, no verification rule, no ask
-    // guidance, no skills, no location.
+    // Found by the previous test, which runs in this repository: the old 16 KB
+    // composition buffer cut the project's own `AGENTS.md`, and the overflow
+    // answer used to be `catch return base`. In this very repository the prompt
+    // could be the project's text ALONE: no routing table, no verification rule,
+    // no ask guidance, no skills, no location. The buffer is 64 KB now, so the
+    // real file fits; an oversized synthetic base below still exercises the
+    // overflow path.
     //
     // That is the failure this whole table exists to prevent — asked to find a
     // games page, the model ran `bash curl`, because there was no rule saying not
@@ -15682,8 +15686,13 @@ test "a project whose AGENTS.md does not fit still gets the ROUTING, not just it
     prompt_system.agents_md_cache = null;
     defer prompt_system.agents_md_cache = saved_agents;
 
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [prompt_system.system_prompt_capacity]u8 = undefined;
     const composed = buildSystemPrompt(a, &buf, null, true);
+
+    // The 16 KB buffer cut this repo's own instructions around line 80. The
+    // final sections — including the durable design decisions — were simply
+    // absent from the model's context, which read as "the model ignored us".
+    try std.testing.expect(std.mem.indexOf(u8, composed, "What this file is NOT") != null);
 
     // The constant blocks are the ones that must survive the trim.
     for ([_][]const u8{
@@ -15699,13 +15708,28 @@ test "a project whose AGENTS.md does not fit still gets the ROUTING, not just it
             return error.PromptIncomplete;
         }
     }
-    // And the truncation is ANNOUNCED: a project that cannot see half of its own
-    // instructions should be told, not left to guess.
-    if (std.mem.indexOf(u8, composed, "truncated to fit") == null) {
-        return error.TruncationNotAnnounced;
-    }
     // It still fits in the buffer it was given, which is the other half.
     try std.testing.expect(composed.len <= buf.len);
+
+    // The old 16 KB buffer truncated this repo's own instructions, so a note
+    // was ALWAYS present. Now that the buffer is 64 KB the real file can fit —
+    // demanding the note here would pin the bug as the expected behaviour.
+    // Force an oversized base and check that truncation is announced THEN,
+    // while the constant blocks still survive it.
+    const huge = a.alloc(u8, 120 * 1024) catch return error.OutOfMemory;
+    @memset(huge, 'x');
+    for (huge, 0..) |*byte, i| {
+        if (i % 80 == 79) byte.* = '\n';
+    }
+    prompt_system.agents_md_cache = huge;
+    const trimmed = buildSystemPrompt(a, &buf, null, true);
+    if (std.mem.indexOf(u8, trimmed, "truncated to fit") == null) {
+        return error.TruncationNotAnnounced;
+    }
+    for ([_][]const u8{ "NEVER use bash", verification_prompt, ask.guidance }) |needle| {
+        if (std.mem.indexOf(u8, trimmed, needle) == null) return error.PromptIncomplete;
+    }
+    try std.testing.expect(trimmed.len <= buf.len);
 }
 
 test "the headless runner and the TUI share ONE automatic typecheck" {
@@ -16331,7 +16355,7 @@ test "the YOLO mode note is in the prompt, because the model has to know BEFORE 
     defer yolo = saved;
     yolo = true;
 
-    var out: [64 * 1024]u8 = undefined;
+    var out: [prompt_system.system_prompt_capacity]u8 = undefined;
     const composed = buildSystemPrompt(a, &out, null, true);
     try std.testing.expect(std.mem.indexOf(u8, composed, "YOLO MODE is on") != null);
     try std.testing.expect(std.mem.indexOf(u8, composed, "MENTION it in your final summary") != null);

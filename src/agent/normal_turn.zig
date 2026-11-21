@@ -23,6 +23,7 @@ pub fn run(m: *tui.Model, user_text: []const u8, ops: Ops) void {
     defer ops.deinitTurnStats();
     m.implementation_nudges = 0;
     m.empty_reply_nudges = 0;
+    m.truncation_continuations = 0;
 
     const outcome = ops.runAgentLoop(m, user_text);
     m.streamEnd();

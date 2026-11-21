@@ -8,6 +8,15 @@ const submodel_mod = @import("submodel.zig");
 pub const Target = submodel_mod.Target;
 pub const TurnCtx = turn_types.TurnCtx;
 
+/// Providers disagree on the name of "the model ran out of output budget":
+/// OpenAI-compatible ones say `length`, Anthropic-family ones `max_tokens`.
+/// All of them mean the text in this turn is a HALF sentence, not an answer.
+fn isTruncatedFinish(reason: []const u8) bool {
+    return std.mem.eql(u8, reason, "length") or
+        std.mem.eql(u8, reason, "max_tokens") or
+        std.mem.eql(u8, reason, "max_output_tokens");
+}
+
 pub const Ops = struct {
     finishTps: *const fn (usize, i128, u32) void,
     recordSessionUsage: *const fn (*tui.Model, chat.Usage, chat.ProviderKind, []const u8) void,
@@ -55,11 +64,22 @@ pub fn run(
     }
     s.flush();
 
-    const partial = tstate.finish_len > 0 and
-        std.mem.eql(u8, tstate.finish[0..tstate.finish_len], "length");
+    const finish = if (tstate.finish_len > 0) tstate.finish[0..tstate.finish_len] else "";
+    const partial = isTruncatedFinish(finish);
     if (partial) ops.setStatusWithZo(m, .warn, "interrupted");
 
     if (tstate.calls.items.len == 0) {
+        // A truncated reply used to fall through the nudges (they all require
+        // empty or very short text) and be reported as `done`, leaving the
+        // user with half a sentence. Continue it instead, at most twice so a
+        // provider that always truncates cannot spin the loop forever.
+        if (partial and m.truncation_continuations < 2) {
+            m.truncation_continuations += 1;
+            ops.appendHarnessPrompt(m, "Your last reply was cut off at the output limit. Continue exactly where you stopped and finish it in this same turn; do not repeat what you already wrote.");
+            ops.refreshContextUsage(m);
+            return true;
+        }
+
         // Empty reply nudge.
         if (tstate.text.items.len == 0) {
             if (m.empty_reply_nudges < 3) {
@@ -104,4 +124,13 @@ pub fn run(
     try ops.execToolCalls(m, s, tstate);
     ops.refreshContextUsage(m);
     return true;
+}
+
+test "a reply cut at the output limit is recognised across providers" {
+    try std.testing.expect(isTruncatedFinish("length"));
+    try std.testing.expect(isTruncatedFinish("max_tokens"));
+    try std.testing.expect(isTruncatedFinish("max_output_tokens"));
+    try std.testing.expect(!isTruncatedFinish("stop"));
+    try std.testing.expect(!isTruncatedFinish("tool_calls"));
+    try std.testing.expect(!isTruncatedFinish(""));
 }

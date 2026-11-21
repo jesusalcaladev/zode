@@ -31,7 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - apply env timeout before the headless client is built (47) (http) [`577d6143`](https://github.com/jesusalcaladev/zode/commit/577d6143)
 - atomic agent writes, transport retries, durable sessions (48) (reliability) [`9aeada3e`](https://github.com/jesusalcaladev/zode/commit/9aeada3e)
 - Phase 51 quick wins — language gate, real timeouts, honest audits (51) (verification) [`ad3ac96f`](https://github.com/jesusalcaladev/zode/commit/ad3ac96f)
-- harden input handling and protect in-progress drafts (tui) [`9b0511d1`](https://github.com/jesusalcaladev/zode/commit/9b0511d1)
+- harden input handling and protect in-progress drafts (tui) [`e992ec6a`](https://github.com/jesusalcaladev/zode/commit/e992ec6a)
+- stop ending turns at 12 iterations and explain gate refusals (agent) [`b7fef995`](https://github.com/jesusalcaladev/zode/commit/b7fef995)
 
 ### Chores
 

@@ -154,6 +154,7 @@ pub const tool_routing_prompt =
 /// background instead of freezing the input for its whole duration.
 pub const verification_prompt =
     \\Verifying a change (this decides task duration):
+    \\ - Finish the WHOLE request, not the easy part: work through every step you can actually complete. Do not stop after exploring, after a first attempt, or with "let me know if you want me to continue". A short final answer is for a FINISHED task. If something genuinely blocks the rest, name it precisely and say what remains. This rule is unconditional — it applies even when the project has its own instructions.
     \\ - Verify with the NARROWEST command that would fail if wrong: one file's test, one package's type check, re-reading code. Whole suite = end of task, not each edit — a suite pass says less than 3 covering tests and takes 10x longer.
     \\ - Do NOT write a test harness, pty script, fuzzer, or verification script unless the user asked for one. Fixing a bug is not a licence to build a rig; if a regression test is needed, say so in one line.
     \\ - A bug fixed deserves a test that fails BEFORE the fix and passes after — otherwise you hid it, you did not verify it. No test for that area? Say so in one line; silence reads as pass.
@@ -164,6 +165,13 @@ pub const verification_prompt =
     \\ - PRECISE word, not generous. `zig build` = typechecks; `zig build test` = suite passes; reading diff = nothing about behaviour. "It compiles" and "tests pass" are different; claiming tests when only compiled = same error as claiming work done when build is red.
     \\
 ;
+
+test "the completion rule is unconditional, not buried in a replaceable AGENTS.md" {
+    // This block is composed AFTER the project instructions, so it survives a
+    // project file that replaces the built-in prompt and the 16 KB truncation.
+    try std.testing.expect(std.mem.indexOf(u8, verification_prompt, "Finish the WHOLE request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, verification_prompt, "unconditional") != null);
+}
 
 /// The longest prefix of `text` that fits in `room` bytes, cut on a UTF-8
 /// codepoint boundary and — when the line boundary is close enough — after a

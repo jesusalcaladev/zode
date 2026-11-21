@@ -31,13 +31,17 @@ pub fn main() !void {
     var files: usize = 0;
     var scanned: usize = 0;
     var skipped: usize = 0;
-    while (walker.next(io) catch |err| {
-        // A walk error used to end the loop silently: "clean (0 files scanned)"
-        // looked like a pass. It is not.
-        skipped += 1;
-        std.debug.print("memaudit: walk error {t} after {d} files\n", .{ err, scanned });
-        break;
-    }) |e| {
+    // A labeled loop is required here: in Zig 0.17 a plain `break` inside the
+    // `catch` of a `while` condition is a "break expression outside loop" error.
+    outer: while (true) {
+        const maybe_e = walker.next(io) catch |err| {
+            // A walk error used to end the loop silently: "clean (0 files scanned)"
+            // looked like a pass. It is not.
+            skipped += 1;
+            std.debug.print("memaudit: walk error {t} after {d} files\n", .{ err, scanned });
+            break :outer;
+        };
+        const e = maybe_e orelse break :outer;
         if (e.kind != .file or !std.mem.endsWith(u8, e.basename, ".zig")) continue;
         // e.path borrows the walker buffer and dies on the next call: copy it.
         const rel = gpa.dupe(u8, e.path) catch {
