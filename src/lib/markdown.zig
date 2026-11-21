@@ -107,9 +107,10 @@ const styles = struct {
     const task_open = theme.task_open;
     const link = theme.link;
     /// Inline `code`. Amber, to match the number tokens: an inline code span and
-    /// a numeric literal are the same kind of thing you look up.
-    const inline_code = Style{ .fg = .{ .rgb = .{ 0xff, 0xcb, 0x6b } } };
-    const sep = fg(8);
+    /// a numeric literal are the same kind of thing you look up. Both come from
+    /// `theme` — a hardcoded RGB here silently ignored every theme change.
+    const inline_code = theme.code_num;
+    const sep = theme.gutter;
 };
 
 /// Parses text (possibly markdown) into blocks. Memory: arena.
@@ -348,8 +349,20 @@ pub fn parseLang(
                 while (nh < trimmed.len and trimmed[nh] == '#') nh += 1;
                 if (nh < trimmed.len and trimmed[nh] == ' ') {
                     const heading_text = trimmed[nh + 1 ..];
+                    // All levels used the SAME style, so a `####` subheading
+                    // shouted as loudly as the document title. Level 1 keeps
+                    // the strong heading role, 2 the brand accent, deeper ones
+                    // a bold but quieter ink — all from the theme.
+                    var deep_heading = theme.ink;
+                    deep_heading.bold = true;
+                    const heading_style: Style = if (nh == 1)
+                        styles.heading
+                    else if (nh == 2)
+                        theme.brand_hi
+                    else
+                        deep_heading;
                     const segs = try arena.alloc(Segment, 1);
-                    segs[0] = .{ .text = heading_text, .style = styles.heading };
+                    segs[0] = .{ .text = heading_text, .style = heading_style };
                     // Air BEFORE the heading: a title glued to the paragraph above
                     // it is not a title. Only inside the paragraph, so the layout
                     // does not add a second one at the top.

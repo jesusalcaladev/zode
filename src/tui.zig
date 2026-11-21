@@ -878,6 +878,7 @@ fn buildCodeBlockLines(
     blk: anytype,
     width: u16,
     nerd_icons: bool,
+    query: ?[]const u8,
 ) ![]const PLine {
     // ── first pass: build every line's cells and find the max width ─────────
     var raw_lines: std.ArrayList([]const CellRun) = .empty;
@@ -900,6 +901,9 @@ fn buildCodeBlockLines(
                     .w = gw,
                     .style = seg.style,
                     .link = if (uri) |u| .{ .uri = u } else .{},
+                    // Ctrl+F must find symbols where they actually live: code
+                    // fences and diffs are the most searched text in a session.
+                    .match = searchHitAt(seg.text, off, query),
                 });
                 ln_w += gw;
             }
@@ -997,7 +1001,7 @@ fn buildCodeBlockLines(
                     if (used + c.w > text_w_) break;
                     var st = c.style;
                     st.bg = theme.code_bg.bg;
-                    try out.append(pa_, .{ .text = c.text, .w = c.w, .style = st });
+                    try out.append(pa_, .{ .text = c.text, .w = c.w, .style = st, .match = c.match });
                     used += c.w;
                 }
                 if (text_w_ == 0) i = src.len;
@@ -1090,6 +1094,7 @@ fn buildDiffBlockLines(
     blk: anytype,
     width: u16,
     nerd_icons: bool,
+    query: ?[]const u8,
 ) ![]const PLine {
     // ── first pass: build every line's cells and find the max width ─────────
     var raw_lines: std.ArrayList([]const CellRun) = .empty;
@@ -1110,6 +1115,9 @@ fn buildDiffBlockLines(
                     .w = gw,
                     .style = seg.style,
                     .link = if (uri) |u| .{ .uri = u } else .{},
+                    // Ctrl+F must find symbols where they actually live: code
+                    // fences and diffs are the most searched text in a session.
+                    .match = searchHitAt(seg.text, off, query),
                 });
                 ln_w += gw;
             }
@@ -1152,7 +1160,7 @@ fn buildDiffBlockLines(
                 // Preserve the diff's own style (fg/bg). Do NOT overwrite with
                 // code_bg — an added line keeps its green band, a removed line
                 // its red band, context stays untinted.
-                try out.append(pa, .{ .text = c.text, .w = c.w, .style = c.style });
+                try out.append(pa, .{ .text = c.text, .w = c.w, .style = c.style, .match = c.match });
                 used += c.w;
             }
             if (text_w == 0) i = src.len;
@@ -1238,7 +1246,7 @@ fn buildLinesBase(
             // language chip, lines wrapped in │ … │, bottom border. The box is
             // self-contained (its own borders), so it needs no blank separator
             // rows around it — the border IS the separation.
-            const code_lines = try buildCodeBlockLines(pa, ctx, blk, width, nerd_icons);
+            const code_lines = try buildCodeBlockLines(pa, ctx, blk, width, nerd_icons, search);
             for (code_lines) |ln| try lines.append(pa, ln);
             continue;
         }
@@ -1248,7 +1256,7 @@ fn buildLinesBase(
             // bottom borders, optional language chip, `│ … │` padding. The
             // diff's own per-line colours (green add / red del / grey context)
             // are preserved inside the box.
-            const diff_lines = try buildDiffBlockLines(pa, ctx, blk, width, nerd_icons);
+            const diff_lines = try buildDiffBlockLines(pa, ctx, blk, width, nerd_icons, search);
             for (diff_lines) |ln| try lines.append(pa, ln);
             continue;
         }
@@ -2920,7 +2928,9 @@ pub const Model = struct {
     pub fn transcriptSearchNext(self: *Model, forward: bool) bool {
         const n = self.search_matches.items.len;
         if (n == 0) {
-            if (self.search_has_query) self.pushInfo("search: no matches");
+            // A toast, not a transcript paragraph: search feedback used to be
+            // appended to the session and re-sent to the model on later turns.
+            if (self.search_has_query) self.pushNotification("search: no matches");
             return false;
         }
         if (forward) {
@@ -2945,9 +2955,11 @@ pub const Model = struct {
             self.runTranscriptSearch();
             self.closeTranscriptSearch();
             if (self.search_matches.items.len == 0 and self.search_query_len > 0) {
-                self.pushInfo("search: no matches");
+                self.pushNotification("search: no matches");
             } else if (self.search_matches.items.len > 0) {
-                self.pushInfoFmt("search: {d}/{d}", .{ self.search_current + 1, self.search_matches.items.len });
+                var note_buf: [64]u8 = undefined;
+                const note = std.mem.print(&note_buf, "search: {d}/{d}", .{ self.search_current + 1, self.search_matches.items.len }) catch "search";
+                self.pushNotification(note);
             }
             return true;
         }
@@ -10015,6 +10027,7 @@ pub fn drawLines(
     history_h: u16,
     pad: u16,
     x_off: u16,
+    current_match: bool,
 ) void {
     const hh: usize = history_h;
     // The history has matching air on both sides, like the input box.
@@ -10041,7 +10054,13 @@ pub fn drawLines(
             // loop just swaps in a background style and keeps the grapheme's
             // own foreground so the text stays readable under NO_COLOR.
             var st = cell.style;
-            if (cell.match) st.bg = theme.search_match.bg;
+            if (cell.match) {
+                // `search_match_current` existed in the theme but was never
+                // used: with 20 hits on screen nobody could tell which one
+                // Enter would jump to next.
+                st.bg = if (current_match) theme.search_match_current.bg else theme.search_match.bg;
+                if (current_match) st.bold = true;
+            }
             p.putStableLinked(col, row, cell.text, cell.w, st, cell.link);
             const new_col: usize = @as(usize, col) + @as(usize, cell.w);
             col = if (new_col > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(new_col);
@@ -11128,11 +11147,17 @@ pub fn drawStateFooter(
         if (self.queuedNext()) |next| {
             const trimmed = std.mem.trim(u8, next, " \t\r\n");
             if (trimmed.len > 0) {
-                var tbuf: [48]u8 = undefined;
+                var cap_buf: [64]u8 = undefined;
+                var shown_buf: [68]u8 = undefined;
+                // A raw `trimmed[0..39]` cut a multibyte codepoint in half and
+                // the footer painted a replacement glyph. Clip by COLUMNS with
+                // the same helper the rest of the composer uses.
                 const shown = if (trimmed.len <= 40)
                     trimmed
-                else
-                    std.mem.print(&tbuf, "{s}…", .{trimmed[0..39]}) catch "";
+                else blk: {
+                    const clipped = textcap.clipInto(trimmed, 40, &cap_buf);
+                    break :blk std.mem.print(&shown_buf, "{s}…", .{clipped}) catch clipped;
+                };
                 if (shown.len > 0) {
                     var both: [192]u8 = undefined;
                     const joined = std.mem.print(&both, "{s} · {s}", .{ detail, shown }) catch "";
@@ -11159,6 +11184,9 @@ pub fn drawStateFooter(
     // gauge, the throughput while it streams, and the scroll hint.
     var right: [12]InfoSeg = undefined;
     var rn: usize = 0;
+    // Index where the context gauge starts, so we can tell AFTER the tail-drop
+    // whether it survived. No parsing of rendered strings: it is a segment ID.
+    var ctx_start: ?usize = null;
 
     if (sessionInfo(self, arena)) |segs| {
         for (segs) |s| {
@@ -11169,6 +11197,7 @@ pub fn drawStateFooter(
         }
     }
     if (contextInfo(arena)) |segs| {
+        ctx_start = rn;
         if (rn > 0 and rn < right.len) {
             right[rn] = .{ .text = " · ", .style = theme.line };
             rn += 1;
@@ -11268,6 +11297,7 @@ pub fn drawStateFooter(
     }
 
     const right_segs = right[0..rn];
+    const ctx_visible = if (ctx_start) |start| start < rn else false;
     const right_width = segsWidth(right_segs);
     const right_start: u16 = if (right_edge > right_width) right_edge - right_width else 0;
 
@@ -11333,6 +11363,26 @@ pub fn drawStateFooter(
         }
     }
 
+    // The context budget is the one number you need at a glance near a compact
+    // threshold. It lives in the right group when there is room, but that group
+    // drops from the TAIL — so on a narrow terminal the gauge vanished exactly
+    // when a long session made it most useful. Fall back to a compact form in
+    // the left group, which is never reordered by the tail-drop loop.
+    if (!ctx_visible and (agent.ctx_used != 0 or agent.ctx_real)) {
+        var cb: [16]u8 = undefined;
+        const txt = std.mem.print(&cb, "ctx {d}%", .{agent.ctx_pct}) catch "";
+        var ctx_style = theme.status;
+        if (agent.ctx_pct >= 95) {
+            ctx_style = theme.err;
+        } else if (agent.ctx_pct >= 80) {
+            ctx_style = theme.warn;
+        }
+        const ctx_cols: u16 = @intCast(columnsOf(p, txt));
+        if (txt.len > 0 and col + 1 + ctx_cols <= left_limit) {
+            col = p.putClipped(col + 1, row, txt, left_limit -| col, ctx_style);
+        }
+    }
+
     // The `?` hint: the discoverability of the shortcut list.
     //
     // It is the reference implementation's footer hint, and it is here for the
@@ -11386,7 +11436,14 @@ pub fn drawTranscriptSearchBar(p: *Painter, m: *const Model, width: u16, height:
     p.fillRange(x0, x0 + box_w, y0, " ", theme.selected);
     var buf: [192]u8 = undefined;
     const q = m.search_query_buf[0..m.search_query_len];
-    const label = std.mem.print(&buf, " / {s}_  (Enter search, Esc close)", .{q}) catch " / ";
+    const label = if (m.search_has_query and m.search_matches.items.len > 0)
+        std.mem.print(&buf, " / {s}_  {d}/{d}  (Enter search, Esc close)", .{
+            q,
+            @min(m.search_current + 1, m.search_matches.items.len),
+            m.search_matches.items.len,
+        }) catch " / "
+    else
+        std.mem.print(&buf, " / {s}_  (Enter search, Esc close)", .{q}) catch " / ";
     _ = p.putClipped(x0 + 1, y0, label, box_w -| 2, theme.selected);
 }
 

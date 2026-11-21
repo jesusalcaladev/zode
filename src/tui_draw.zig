@@ -325,6 +325,12 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
     const content_lines = self.heightPrefix(self.paras.items.len) + live_lines.len;
     const hero = tui.heroFrame(self, wrap_width + 2 * hist_margin, history_h, content_lines);
     const pad = hero.pad;
+    // Structured search state: the current hit is a PARAGRAPH index, not a
+    // rendered string. The paint loop only needs to know which block it is in.
+    const current_match_para: ?usize = if (self.search_has_query and self.search_matches.items.len > 0)
+        self.search_matches.items[@min(self.search_current, self.search_matches.items.len - 1)]
+    else
+        null;
     // ── paint cached paragraphs ──
     // Use `heightPrefix(para_idx)` for the absolute line position of each
     // cached paragraph. This correctly handles gaps in the cache (virtual
@@ -336,13 +342,13 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
         // The cached entry is the WHOLE paragraph (separator row counted in
         // already, see `layoutOne`), so its first line sits exactly at the
         // paragraph's absolute start.
-        tui.drawLines(&p, c.lines, para_abs_start, first_visible, history_h, pad, hero.x_off);
+        tui.drawLines(&p, c.lines, para_abs_start, first_visible, history_h, pad, hero.x_off, current_match_para != null and current_match_para.? == c.para_idx);
     }
     // ── paint live paragraph ──
     // Its absolute position is the total height of all closed paragraphs.
     if (live_active) {
         const live_abs_start = self.heightPrefix(self.paras.items.len);
-        tui.drawLines(&p, live_lines, live_abs_start, first_visible, history_h, pad, hero.x_off);
+        tui.drawLines(&p, live_lines, live_abs_start, first_visible, history_h, pad, hero.x_off, false);
     }
 
     tui.drawHistoryScrollbar(&p, width, history_h, first_visible, vis.max_offset);

@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - rewind, claude commands, acp fork, append prompt, durable bg, stats (50) (ecosystem) [`361f91be`](https://github.com/jesusalcaladev/zode/commit/361f91be)
 - hook types, MCP resources/prompts + HTTP/SSE transport (50.2, 50.3) (ecosystem) [`31662b21`](https://github.com/jesusalcaladev/zode/commit/31662b21)
 - close remaining backlog - ACP images and facade tests (50.7, 51.3, 51.9) [`29a4c686`](https://github.com/jesusalcaladev/zode/commit/29a4c686)
+- make search, headings and the context gauge readable (tui) [`03752a08`](https://github.com/jesusalcaladev/zode/commit/03752a08)
 
 ### Bug Fixes
 
@@ -32,7 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - atomic agent writes, transport retries, durable sessions (48) (reliability) [`9aeada3e`](https://github.com/jesusalcaladev/zode/commit/9aeada3e)
 - Phase 51 quick wins — language gate, real timeouts, honest audits (51) (verification) [`ad3ac96f`](https://github.com/jesusalcaladev/zode/commit/ad3ac96f)
 - harden input handling and protect in-progress drafts (tui) [`e992ec6a`](https://github.com/jesusalcaladev/zode/commit/e992ec6a)
-- stop ending turns at 12 iterations and explain gate refusals (agent) [`b7fef995`](https://github.com/jesusalcaladev/zode/commit/b7fef995)
+- stop ending turns at 12 iterations and explain gate refusals (agent) [`76e1f0bc`](https://github.com/jesusalcaladev/zode/commit/76e1f0bc)
 
 ### Chores
 
