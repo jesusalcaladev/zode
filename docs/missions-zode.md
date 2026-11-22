@@ -59,6 +59,25 @@ With workers enabled the driver writes one prompt per task under
 `.mission/prompts/` and starts them in the same shell wave. The lead receives the
 failure summary afterwards. The harness still owns verification and completion.
 
+## Continuous improvement (on by default)
+
+When the original criteria are green, the mission does **not** stop. It enters an
+audit/improve cycle:
+
+```
+checks green → AUDIT (read-only) → FINDING impact/risk/files
+             → implement worthwhile finding → VERIFY → next cycle
+```
+
+It stops when two consecutive audits find nothing above `min_impact` (default
+`medium`), when `max_improve_cycles` (5) is reached, on budget, or on `STOP`.
+The final `finish_reason` says why (`no-high-value-improvements`,
+`improve-cycle-limit`, `budget`, `stop-file`). `continuous_improvement: false`
+in `state.json` (or frontmatter) opts out for deterministic runs.
+
+Findings go to `.mission/reports/auditor.txt`; accepted work is tracked in
+`.mission/improvements.md`. Same contract and stop reasons as the OpenCode plugin.
+
 ## Roles, memory and continuity
 
 The driver now mirrors the OpenCode plugin's full contract:

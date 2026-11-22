@@ -420,6 +420,88 @@ fn chainNext(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     return true;
 }
 
+fn improveCycle(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, state: *mission_io.State) !bool {
+    if (!state.continuous_improvement) return false;
+    if (state.auditor_text.len == 0) {
+        const report = callRole(gpa, io, env, root, "auditor",
+            "[MISSION AUDITOR] Read the workspace. Emit FINDING: impact=high|medium|low risk=low|medium|high files=a.zig,b.zig description. Write NO FINDINGS if nothing valuable.") orelse "NO FINDINGS";
+        state.auditor_text = try gpa.dupe(u8, report);
+        try mission_io.saveState(gpa, io, root, state.*);
+        try mission_io.appendJournal(gpa, io, root, "improvement audit dispatched");
+        return true;
+    }
+
+    const findings = mission.improve.parseFindings(gpa, state.auditor_text) catch &.{};
+    const action = mission.improve.decide(.{
+        .findings = findings,
+        .min_impact = state.min_impact,
+        .improve_cycles = state.improve_cycles,
+        .max_cycles = state.max_improve_cycles,
+        .clean_rounds = state.clean_audit_rounds,
+        .max_clean_rounds = state.max_clean_audit_rounds,
+        .stop_file = mission_io.stopRequested(gpa, io, root),
+        .out_of_budget = state.budget_usd > 0 and state.cost_usd >= state.budget_usd,
+    });
+
+    switch (action) {
+        .stop => |reason| {
+            const note = try std.fmt.allocPrint(gpa, "continuous improvement stopping: {s}", .{reason});
+            defer gpa.free(note);
+            try mission_io.appendJournal(gpa, io, root, note);
+            state.continuous_improvement = false;
+            try mission_io.saveState(gpa, io, root, state.*);
+            return false;
+        },
+        .audit => {
+            state.clean_audit_rounds += 1;
+            state.auditor_text = "";
+            try mission_io.saveState(gpa, io, root, state.*);
+            const note = try std.fmt.allocPrint(gpa, "audit without valuable findings ({d}/{d})", .{ state.clean_audit_rounds, state.max_clean_audit_rounds });
+            defer gpa.free(note);
+            try mission_io.appendJournal(gpa, io, root, note);
+            return true;
+        },
+        .implement => |finding| {
+            const tasks = try mission_io.loadTasks(gpa, io, root);
+            const id: u32 = @intCast(tasks.len + 1);
+            var files = std.ArrayList([]const u8).empty;
+            try files.appendSlice(gpa, finding.files);
+            const task = mission.Task{
+                .id = id,
+                .subject = finding.text[0..@min(finding.text.len, 120)],
+                .files = try files.toOwnedSlice(gpa),
+                .verify = "",
+            };
+            var next_tasks = std.ArrayList(mission.Task).empty;
+            try next_tasks.appendSlice(gpa, tasks);
+            try next_tasks.append(gpa, task);
+            try mission_io.saveTasks(gpa, io, root, next_tasks.items);
+
+            var leases = std.ArrayList(mission.lease.Lease).empty;
+            try leases.appendSlice(gpa, state.leases);
+            try leases.append(gpa, .{ .id = id, .subject = task.subject, .verify = "" });
+            state.leases = try leases.toOwnedSlice(gpa);
+            state.improve_cycles += 1;
+            state.clean_audit_rounds = 0;
+            state.auditor_text = "";
+            state.stage = "implement";
+            try mission_io.saveState(gpa, io, root, state.*);
+
+            const line = try std.fmt.allocPrint(gpa, "- [ ] id: imp-{d} | impact: {s} | risk: {s} | files: {any} | {s}\n", .{
+                id, finding.impact, finding.risk, finding.files, finding.text[0..@min(finding.text.len, 120)],
+            });
+            defer gpa.free(line);
+            const backlog = try mission_io.readImprovements(gpa, io, root);
+            defer gpa.free(backlog);
+            try mission_io.writeImprovements(gpa, io, root, try std.fmt.allocPrint(gpa, "{s}{s}", .{ backlog, line }));
+            const note = try std.fmt.allocPrint(gpa, "improvement cycle {d}: #{d}", .{ state.improve_cycles, id });
+            defer gpa.free(note);
+            try mission_io.appendJournal(gpa, io, root, note);
+            return true;
+        },
+    }
+}
+
 fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8) !u8 {
     try mission_io.ensureV2Files(gpa, io, root);
     var state = try mission_io.loadState(gpa, io, root);
@@ -615,6 +697,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
 
         switch (decision) {
             .complete => {
+                if (try improveCycle(gpa, io, env, root, &state)) continue;
                 const chained = try chainNext(gpa, io, env, root, &state);
                 state.status = if (chained) .running else .complete;
                 try mission_io.saveState(gpa, io, root, state);

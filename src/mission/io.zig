@@ -73,6 +73,13 @@ pub const State = struct {
     review_text: []const u8 = "",
     research_text: []const u8 = "",
     leases: []const mission.lease.Lease = &.{},
+    continuous_improvement: bool = true,
+    improve_cycles: usize = 0,
+    max_improve_cycles: usize = 5,
+    min_impact: []const u8 = "medium",
+    clean_audit_rounds: usize = 0,
+    max_clean_audit_rounds: usize = 2,
+    auditor_text: []const u8 = "",
 };
 
 fn pathFor(gpa: std.mem.Allocator, root: []const u8, name: []const u8) ![]const u8 {
@@ -467,6 +474,13 @@ pub fn loadState(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !State {
         .review_text = try gpa.dupe(u8, objStr(o, "review_text") orelse ""),
         .research_text = try gpa.dupe(u8, objStr(o, "research_text") orelse ""),
         .leases = try leases.toOwnedSlice(gpa),
+        .continuous_improvement = objBool(o, "continuous_improvement", true),
+        .improve_cycles = @intCast(@max(0, objInt(o, "improve_cycles", 0))),
+        .max_improve_cycles = @intCast(@max(1, objInt(o, "max_improve_cycles", 5))),
+        .min_impact = try gpa.dupe(u8, objStr(o, "min_impact") orelse "medium"),
+        .clean_audit_rounds = @intCast(@max(0, objInt(o, "clean_audit_rounds", 0))),
+        .max_clean_audit_rounds = @intCast(@max(1, objInt(o, "max_clean_audit_rounds", 2))),
+        .auditor_text = try gpa.dupe(u8, objStr(o, "auditor_text") orelse ""),
     };
 }
 
@@ -513,7 +527,13 @@ pub fn saveState(gpa: std.mem.Allocator, io: std.Io, root: []const u8, state: St
         try writeString(&w, l.verify);
         try w.writeByte('}');
     }
-    try w.writeAll("]}\n");
+    try w.writeAll("],\"continuous_improvement\":");
+    try w.writeAll(if (state.continuous_improvement) "true" else "false");
+    try w.print(",\"improve_cycles\":{d},\"max_improve_cycles\":{d},\"min_impact\":", .{ state.improve_cycles, state.max_improve_cycles });
+    try writeString(&w, state.min_impact);
+    try w.print(",\"clean_audit_rounds\":{d},\"max_clean_audit_rounds\":{d},\"auditor_text\":", .{ state.clean_audit_rounds, state.max_clean_audit_rounds });
+    try writeString(&w, state.auditor_text);
+    try w.writeAll("}\n");
     try writeAtomic(io, path, w.buffered());
 }
 
@@ -560,6 +580,12 @@ pub fn readSummary(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]cons
 pub fn writeSummary(gpa: std.mem.Allocator, io: std.Io, root: []const u8, text: []const u8) !void {
     try writeNamed(gpa, io, root, mission.summary_file, text);
 }
+pub fn readImprovements(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]const u8 {
+    return readNamed(gpa, io, root, mission.improvements_file);
+}
+pub fn writeImprovements(gpa: std.mem.Allocator, io: std.Io, root: []const u8, text: []const u8) !void {
+    try writeNamed(gpa, io, root, mission.improvements_file, text);
+}
 pub fn readRoadmap(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]const u8 {
     return readNamed(gpa, io, root, mission.roadmap_file);
 }
@@ -582,12 +608,12 @@ pub fn ensureV2Files(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !void
     const meta = pathFor(gpa, root, mission.dir_name) catch return;
     defer gpa.free(meta);
     try dir.createDirPath(io, meta);
-    const names = [_][]const u8{ mission.charter_file, mission.memory_file, mission.summary_file, mission.roadmap_file };
+    const names = [_][]const u8{ mission.charter_file, mission.memory_file, mission.summary_file, mission.roadmap_file, mission.improvements_file };
     for (names) |name| {
         const path = try pathFor(gpa, root, name);
         defer gpa.free(path);
         if (!exists(io, path)) {
-            const text = if (std.mem.eql(u8, name, mission.roadmap_file)) "# Roadmap\n\n" else if (std.mem.eql(u8, name, mission.charter_file)) "# Charter\n\nCompletion is defined by criteria.json.\n" else "";
+            const text = if (std.mem.eql(u8, name, mission.roadmap_file)) "# Roadmap\n\n" else if (std.mem.eql(u8, name, mission.improvements_file)) "# Improvements\n\n" else if (std.mem.eql(u8, name, mission.charter_file)) "# Charter\n\nCompletion is defined by criteria.json.\n" else "";
             try writeAtomic(io, path, text);
         }
     }

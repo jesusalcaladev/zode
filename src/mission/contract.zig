@@ -15,6 +15,7 @@ pub const memory = @import("memory.zig");
 pub const roles = @import("roles.zig");
 pub const chain = @import("chain.zig");
 pub const lease = @import("lease.zig");
+pub const improve = @import("improve.zig");
 
 pub const dir_name = ".mission";
 pub const mission_file = "mission.md";
@@ -30,6 +31,7 @@ pub const memory_file = "memory.md";
 pub const summary_file = "summary.md";
 pub const progress_file = "progress.json";
 pub const roadmap_file = "roadmap.md";
+pub const improvements_file = "improvements.md";
 pub const reports_dir = "reports";
 
 pub const Status = enum {
