@@ -263,8 +263,175 @@ fn callWorkers(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Envi
     defer gpa.free(result.stderr);
 }
 
+fn objectiveFrom(text: []const u8) []const u8 {
+    var body = text;
+    if (std.mem.startsWith(u8, body, "---")) {
+        if (std.mem.indexOfPos(u8, body, 4, "---")) |end| body = body[end + 3 ..];
+    }
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len > 0 and t[0] != '#') return t;
+    }
+    return "Autonomous mission";
+}
+
+fn jsonQuote(gpa: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    try out.append(gpa, '"');
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(gpa, "\\\""),
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        else => try out.append(gpa, c),
+    };
+    try out.append(gpa, '"');
+    return out.toOwnedSlice(gpa);
+}
+
+fn jsonChecks(gpa: std.mem.Allocator, checks: []const mission.Check) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "{\"version\":1,\"checks\":[");
+    for (checks, 0..) |c, i| {
+        if (i > 0) try out.append(gpa, ',');
+        const id = try jsonQuote(gpa, c.id);
+        defer gpa.free(id);
+        const cmd = try jsonQuote(gpa, c.cmd);
+        defer gpa.free(cmd);
+        const expect = try jsonQuote(gpa, c.expect);
+        defer gpa.free(expect);
+        const part = try std.fmt.allocPrint(gpa, "{{\"id\":{s},\"cmd\":{s},\"expect\":{s},\"timeout_ms\":{d}}}", .{ id, cmd, expect, c.timeout_ms });
+        defer gpa.free(part);
+        try out.appendSlice(gpa, part);
+    }
+    try out.appendSlice(gpa, "]}");
+    return out.toOwnedSlice(gpa);
+}
+
+fn jsonTasks(gpa: std.mem.Allocator, tasks: []const mission.Task) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, "{\"version\":1,\"tasks\":[");
+    for (tasks, 0..) |t, i| {
+        if (i > 0) try out.append(gpa, ',');
+        const subject = try jsonQuote(gpa, t.subject);
+        defer gpa.free(subject);
+        const verify = try jsonQuote(gpa, t.verify);
+        defer gpa.free(verify);
+        const head = try std.fmt.allocPrint(gpa, "{{\"id\":{d},\"subject\":{s},\"verify\":{s},\"files\":[", .{ t.id, subject, verify });
+        defer gpa.free(head);
+        try out.appendSlice(gpa, head);
+        for (t.files, 0..) |f, j| {
+            if (j > 0) try out.append(gpa, ',');
+            const q = try jsonQuote(gpa, f);
+            defer gpa.free(q);
+            try out.appendSlice(gpa, q);
+        }
+        try out.appendSlice(gpa, "],\"blocked_by\":[");
+        for (t.blocked_by, 0..) |d, j| {
+            if (j > 0) try out.append(gpa, ',');
+            const dep = try std.fmt.allocPrint(gpa, "{d}", .{d});
+            defer gpa.free(dep);
+            try out.appendSlice(gpa, dep);
+        }
+        const tail = try std.fmt.allocPrint(gpa, "],\"status\":\"{s}\"}}", .{@tagName(t.status)});
+        defer gpa.free(tail);
+        try out.appendSlice(gpa, tail);
+    }
+    try out.appendSlice(gpa, "]}");
+    return out.toOwnedSlice(gpa);
+}
+
+fn atomicText(gpa: std.mem.Allocator, io: std.Io, root: []const u8, name: []const u8, text: []const u8) !void {
+    const path = try std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ root, mission.dir_name, name });
+    defer gpa.free(path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
+}
+
+fn readReport(gpa: std.mem.Allocator, io: std.Io, root: []const u8, role: []const u8) ?[]const u8 {
+    const path = std.fmt.allocPrint(gpa, "{s}/{s}/{s}/{s}.txt", .{ root, mission.dir_name, mission.reports_dir, role }) catch return null;
+    defer gpa.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 * 1024)) catch null;
+}
+
+fn callRole(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, role: []const u8, prompt: []const u8) ?[]const u8 {
+    const report_path = std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ mission.dir_name, mission.reports_dir, role }) catch return null;
+    defer gpa.free(report_path);
+    const full_prompt = std.fmt.allocPrint(gpa,
+        "{s}\n\nWrite your final report to the file `{s}.txt` in the mission directory using your write tool. Keep it short and include SEVERITY lines when reviewing.",
+        .{ prompt, report_path },
+    ) catch return null;
+    defer gpa.free(full_prompt);
+    _ = callAgent(gpa, io, env, root, full_prompt, null);
+    return readReport(gpa, io, root, role);
+}
+
+fn distillMemory(gpa: std.mem.Allocator, io: std.Io, root: []const u8, state: *mission_io.State) !void {
+    if (state.turn == 0 or state.turn % 4 != 0) return;
+    const journal = try mission_io.readJournal(gpa, io, root);
+    defer gpa.free(journal);
+    const memory = try mission_io.readMemory(gpa, io, root);
+    defer gpa.free(memory);
+    const out = try mission.memory.distill(gpa, journal, memory, mission.memory.budget);
+    try mission_io.writeMemory(gpa, io, root, out.memory);
+    try mission_io.writeSummary(gpa, io, root, out.summary);
+    const note = try std.fmt.allocPrint(gpa, "memory compacted: {s}", .{out.summary});
+    defer gpa.free(note);
+    try mission_io.appendJournal(gpa, io, root, note);
+}
+
+fn chainNext(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, state: *mission_io.State) !bool {
+    _ = env;
+    const text = try mission_io.readRoadmap(gpa, io, root);
+    defer gpa.free(text);
+    const items = try mission.chain.parseRoadmap(gpa, text);
+    if (items.len == 0) return false;
+    const item = mission.chain.nextItem(items) orelse {
+        try mission_io.appendJournal(gpa, io, root, "chain exhausted: all roadmap items done");
+        return false;
+    };
+    const plan = try mission.planFromObjective(gpa, item.title);
+    const checks_json = try jsonChecks(gpa, plan.checks);
+    defer gpa.free(checks_json);
+    const tasks_json = try jsonTasks(gpa, plan.tasks);
+    defer gpa.free(tasks_json);
+    try atomicText(gpa, io, root, mission.criteria_file, checks_json);
+    try atomicText(gpa, io, root, mission.tasks_file, tasks_json);
+    state.* = .{
+        .status = .running,
+        .max_turns = state.max_turns,
+        .budget_usd = state.budget_usd,
+        .max_failures = state.max_failures,
+        .max_extensions = state.max_extensions,
+        .max_wallclock_min = state.max_wallclock_min,
+        .max_writes = state.max_writes,
+        .lease_ms = state.lease_ms,
+        .chain_index = state.chain_index + 1,
+        .chain_total = items.len,
+        .stage = "investigate",
+        .strategy_tier = 1,
+    };
+    try mission_io.saveState(gpa, io, root, state.*);
+    const note = try std.fmt.allocPrint(gpa, "chain: starting mission {d}/{d} — {s}", .{ state.chain_index, state.chain_total, item.title });
+    defer gpa.free(note);
+    try mission_io.appendJournal(gpa, io, root, note);
+    return true;
+}
+
 fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8) !u8 {
+    try mission_io.ensureV2Files(gpa, io, root);
     var state = try mission_io.loadState(gpa, io, root);
+    const roadmap = try mission_io.readRoadmap(gpa, io, root);
+    defer gpa.free(roadmap);
+    const roadmap_items = try mission.chain.parseRoadmap(gpa, roadmap);
+    state.chain_total = roadmap_items.len;
+    const mission_path = try std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ root, mission.dir_name, mission.mission_file });
+    defer gpa.free(mission_path);
+    const mission_text = std.Io.Dir.cwd().readFileAlloc(io, mission_path, gpa, .limited(256 * 1024)) catch "";
+    defer if (mission_text.len > 0) gpa.free(mission_text);
+    const objective = objectiveFrom(mission_text);
     const worker_count_raw = envGet(env, "ZODE_MISSION_WORKERS") orelse "1";
     const workers = std.fmt.parseInt(usize, worker_count_raw, 10) catch 1;
     var models = std.ArrayList([]const u8).empty;
@@ -296,6 +463,29 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
             }
         }
 
+        try distillMemory(gpa, io, root, &state);
+
+        const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+        var expired_ids: [64]u32 = undefined;
+        const expired_n = mission.lease.expired(state.leases, now_ms, &expired_ids);
+        if (expired_n > 0) {
+            const mutable_leases = try gpa.dupe(mission.lease.Lease, state.leases);
+            state.leases = mutable_leases;
+            for (expired_ids[0..expired_n]) |id| {
+                _ = mission.lease.fail(mutable_leases, id, "lease expired");
+            }
+            const current_tasks = try mission_io.loadTasks(gpa, io, root);
+            for (current_tasks) |*t| {
+                for (expired_ids[0..expired_n]) |id| {
+                    if (t.id == id) t.status = .pending;
+                }
+            }
+            try mission_io.saveTasks(gpa, io, root, current_tasks);
+            const note = try std.fmt.allocPrint(gpa, "leases expired and reclaimed: {d}", .{expired_n});
+            defer gpa.free(note);
+            try mission_io.appendJournal(gpa, io, root, note);
+        }
+
         const checks = try mission_io.loadCriteria(gpa, io, root);
         defer gpa.free(checks);
         const tasks = try mission_io.loadTasks(gpa, io, root);
@@ -312,7 +502,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
         if (all_done) state.tasks_done = tasks.len;
         state.strategy_tier = mission.nextStrategy(state.strategy_tier, progress);
 
-        const decision = mission.decide(.{
+        var decision = mission.decide(.{
             .status = state.status,
             .stop_file = mission_io.stopRequested(gpa, io, root),
             .turn = state.turn,
@@ -331,12 +521,109 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
         defer gpa.free(line);
         try mission_io.appendJournal(gpa, io, root, line);
 
+        // EXTEND can raise a budget stop, but never a blocked mission.
+        if (decision == .stop and mission_io.extendRequested(gpa, io, root) and state.extensions < state.max_extensions) {
+            const reason = decision.stop;
+            if (reason != .blocked and reason != .review_high) {
+                _ = mission_io.consumeExtend(gpa, io, root);
+                const budget = mission.chain.applyExtension(.{
+                    .max_turns = state.max_turns,
+                    .max_wallclock_min = state.max_wallclock_min,
+                    .max_writes = state.max_writes,
+                });
+                state.extensions += 1;
+                state.max_turns = budget.max_turns;
+                state.max_wallclock_min = budget.max_wallclock_min;
+                state.max_writes = budget.max_writes;
+                decision = .work;
+                const note = try std.fmt.allocPrint(gpa, "budget extended {d}/{d} after {s}", .{ state.extensions, state.max_extensions, @tagName(reason) });
+                defer gpa.free(note);
+                try mission_io.appendJournal(gpa, io, root, note);
+            }
+        }
+
+        // Role stages: investigate → implement → verify → review → done.
+        // This must also gate an otherwise-green turn: review comes first.
+        if (decision == .work or decision == .complete) {
+            if (state.strategy_tier >= 2 and state.turn > 4 and green < results.len) {
+                const replan_prompt = "OUTPUT ONLY a new JSON mission plan. Change the approach. {\"objective\":\"...\",\"checks\":[{\"id\":\"x\",\"cmd\":\"...\",\"expect\":\"exit0\"}],\"tasks\":[{\"id\":1,\"subject\":\"...\",\"files\":[\"...\"],\"verify\":\"x\"}]}";
+                if (callAgentCapture(gpa, io, env, "zode --chat", replan_prompt)) |text| {
+                    defer gpa.free(text);
+                    if (mission.planFromJson(gpa, text)) |new_plan| {
+                        const cj = try jsonChecks(gpa, new_plan.checks);
+                        defer gpa.free(cj);
+                        const tj = try jsonTasks(gpa, new_plan.tasks);
+                        defer gpa.free(tj);
+                        try atomicText(gpa, io, root, mission.criteria_file, cj);
+                        try atomicText(gpa, io, root, mission.tasks_file, tj);
+                        state.strategy_tier = 1;
+                        state.best_green = 0;
+                        try mission_io.appendJournal(gpa, io, root, "re-plan applied at tier 2; strategy reset");
+                    } else |_| {}
+                }
+            }
+            if (std.mem.eql(u8, state.stage, "investigate")) {
+                const report = callRole(gpa, io, env, root, "investigator", try std.fmt.allocPrint(gpa, "[MISSION INVESTIGATOR] Objective: {s}\nRead the workspace. Do not edit files.", .{objective}));
+                if (report) |text| state.research_text = try gpa.dupe(u8, text);
+                state.stage = "implement";
+                try mission_io.saveState(gpa, io, root, state);
+                try mission_io.appendJournal(gpa, io, root, "investigator finished; implementers may now write");
+                continue;
+            }
+            const stage_info = mission.roles.stageFor(
+                std.meta.stringToEnum(mission.roles.Stage, state.stage) orelse .implement,
+                all_done,
+                mission.roles.parseReview(state.review_text),
+                state.review_attempts,
+            );
+            if (stage_info.stage == .review and state.review_text.len == 0) {
+                _ = callRole(gpa, io, env, root, "reviewer", try std.fmt.allocPrint(gpa, "[MISSION REVIEWER] Objective: {s}\nReview files and write SEVERITY findings. Do not edit files.", .{objective}));
+                if (readReport(gpa, io, root, "reviewer")) |text| {
+                    state.review_text = try gpa.dupe(u8, text);
+                } else {
+                    state.review_text = "SEVERITY: low — no review report produced";
+                }
+                state.stage = "review";
+                try mission_io.saveState(gpa, io, root, state);
+                try mission_io.appendJournal(gpa, io, root, "reviewer dispatched; completion held until review is clean");
+                continue;
+            }
+            if (stage_info.decision == .retry) {
+                state.review_attempts += 1;
+                state.stage = "implement";
+                state.review_text = "";
+                const current = try mission_io.loadTasks(gpa, io, root);
+                for (current) |*t| t.status = .pending;
+                try mission_io.saveTasks(gpa, io, root, current);
+                const rework_leases = try gpa.dupe(mission.lease.Lease, state.leases);
+                for (rework_leases) |*l| {
+                    l.status = .pending;
+                    l.owner = "";
+                    l.lease_until = 0;
+                    l.attempts = 0;
+                }
+                state.leases = rework_leases;
+                try mission_io.saveState(gpa, io, root, state);
+                const note = try std.fmt.allocPrint(gpa, "review requires rework (attempt {d})", .{state.review_attempts});
+                defer gpa.free(note);
+                try mission_io.appendJournal(gpa, io, root, note);
+                continue;
+            }
+            if (stage_info.decision == .complete) decision = .complete;
+            if (stage_info.decision == .blocked) decision = .{ .stop = .review_high };
+        }
+
         switch (decision) {
             .complete => {
-                state.status = .complete;
+                const chained = try chainNext(gpa, io, env, root, &state);
+                state.status = if (chained) .running else .complete;
                 try mission_io.saveState(gpa, io, root, state);
-                std.debug.print("MISSION COMPLETE: {s}\n", .{root});
-                return 0;
+                if (!chained) {
+                    std.debug.print("MISSION COMPLETE: {s}\n", .{root});
+                    return 0;
+                }
+                std.debug.print("MISSION COMPLETE — chaining next roadmap item\n", .{});
+                continue;
             },
             .stop => |reason| {
                 state.status = if (reason == .blocked) .blocked else .aborted;
@@ -357,8 +644,26 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
             const waves = try mission.wavesFor(gpa, tasks, workers);
             defer gpa.free(waves);
             if (waves.len > 0) {
+                const worker_leases = try gpa.dupe(mission.lease.Lease, state.leases);
+                state.leases = worker_leases;
+                for (waves) |wave| {
+                    for (wave.ids) |id| {
+                        _ = mission.lease.claim(worker_leases, id, "worker", now_ms, state.lease_ms);
+                    }
+                }
                 try mission_io.appendJournal(gpa, io, root, "dispatching parallel workers");
                 for (waves) |wave| callWorkers(gpa, io, env, root, tasks, wave, if (models.items.len > 0) models.items[model_index] else null);
+                const after = try mission_io.runChecks(gpa, io, root, checks);
+                defer gpa.free(after);
+                if (mission.allGreen(after)) {
+                    for (worker_leases) |*l| {
+                        if (l.status == .in_progress) _ = mission.lease.release(worker_leases, l.id, .completed);
+                    }
+                } else {
+                    for (worker_leases) |*l| {
+                        if (l.status == .in_progress) _ = mission.lease.fail(worker_leases, l.id, "worker checks still red");
+                    }
+                }
             }
         }
 
@@ -382,6 +687,8 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
         const ok = callAgent(gpa, io, env, root, prompt.items, model);
         if (ok) {
             state.failures = 0;
+            state.writes += 1;
+            state.last_prompt_at = std.Io.Timestamp.now(io, .real).toMilliseconds();
         } else {
             state.failures += 1;
             const note = try std.fmt.allocPrint(gpa, "agent turn failed ({d}/{d})", .{ state.failures, state.max_failures });

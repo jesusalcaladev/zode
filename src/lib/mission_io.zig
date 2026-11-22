@@ -58,6 +58,21 @@ pub const State = struct {
     verdict_blocked: bool = false,
     last_commit: []const u8 = "",
     test_hashes: []const TestHash = &.{},
+    stage: []const u8 = "investigate",
+    review_attempts: usize = 0,
+    extensions: usize = 0,
+    max_extensions: usize = 3,
+    chain_index: usize = 0,
+    chain_total: usize = 0,
+    lease_ms: i64 = 300_000,
+    writes: usize = 0,
+    max_writes: usize = 0,
+    max_wallclock_min: usize = 0,
+    last_prompt_at: i64 = 0,
+    model_rotation_index: usize = 0,
+    review_text: []const u8 = "",
+    research_text: []const u8 = "",
+    leases: []const mission.lease.Lease = &.{},
 };
 
 fn pathFor(gpa: std.mem.Allocator, root: []const u8, name: []const u8) ![]const u8 {
@@ -399,6 +414,30 @@ pub fn loadState(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !State {
             }
         }
     }
+    var leases = std.ArrayList(mission.lease.Lease).empty;
+    errdefer leases.deinit(gpa);
+    if (o.get("leases")) |lv| {
+        if (lv == .array) {
+            for (lv.array.items) |item| {
+                if (item != .object) continue;
+                const subject = objStr(item.object, "subject") orelse continue;
+                const id_v = objInt(item.object, "id", 0);
+                if (id_v <= 0) continue;
+                const status_s_l = objStr(item.object, "status") orelse "pending";
+                const status_l: mission.lease.Status = if (std.mem.eql(u8, status_s_l, "in_progress")) .in_progress else if (std.mem.eql(u8, status_s_l, "completed")) .completed else if (std.mem.eql(u8, status_s_l, "failed")) .failed else .pending;
+                try leases.append(gpa, .{
+                    .id = @intCast(id_v),
+                    .subject = try gpa.dupe(u8, subject),
+                    .status = status_l,
+                    .owner = try gpa.dupe(u8, objStr(item.object, "owner") orelse ""),
+                    .attempts = @intCast(@max(0, objInt(item.object, "attempts", 0))),
+                    .lease_until = objInt(item.object, "lease_until", 0),
+                    .last_error = try gpa.dupe(u8, objStr(item.object, "last_error") orelse ""),
+                    .verify = try gpa.dupe(u8, objStr(item.object, "verify") orelse ""),
+                });
+            }
+        }
+    }
     return .{
         .status = parseStatus(status_s),
         .turn = @intCast(@max(0, objInt(o, "turn", 0))),
@@ -413,6 +452,21 @@ pub fn loadState(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !State {
         .verdict_blocked = objBool(o, "verdict_blocked", false),
         .last_commit = try gpa.dupe(u8, commit),
         .test_hashes = try hashes.toOwnedSlice(gpa),
+        .stage = try gpa.dupe(u8, objStr(o, "stage") orelse "investigate"),
+        .review_attempts = @intCast(@max(0, objInt(o, "review_attempts", 0))),
+        .extensions = @intCast(@max(0, objInt(o, "extensions", 0))),
+        .max_extensions = @intCast(@max(1, objInt(o, "max_extensions", 3))),
+        .chain_index = @intCast(@max(0, objInt(o, "chain_index", 0))),
+        .chain_total = @intCast(@max(0, objInt(o, "chain_total", 0))),
+        .lease_ms = @max(1000, objInt(o, "lease_ms", 300_000)),
+        .writes = @intCast(@max(0, objInt(o, "writes", 0))),
+        .max_writes = @intCast(@max(0, objInt(o, "max_writes", 0))),
+        .max_wallclock_min = @intCast(@max(0, objInt(o, "max_wallclock_min", 0))),
+        .last_prompt_at = objInt(o, "last_prompt_at", 0),
+        .model_rotation_index = @intCast(@max(0, objInt(o, "model_rotation_index", 0))),
+        .review_text = try gpa.dupe(u8, objStr(o, "review_text") orelse ""),
+        .research_text = try gpa.dupe(u8, objStr(o, "research_text") orelse ""),
+        .leases = try leases.toOwnedSlice(gpa),
     };
 }
 
@@ -437,6 +491,28 @@ pub fn saveState(gpa: std.mem.Allocator, io: std.Io, root: []const u8, state: St
         try writeString(&w, h.path);
         try w.print(",\"hash\":\"{d}\"}}", .{h.hash});
     }
+    try w.writeAll("],\"stage\":");
+    try writeString(&w, state.stage);
+    try w.print(",\"review_attempts\":{d},\"extensions\":{d},\"max_extensions\":{d},\"chain_index\":{d},\"chain_total\":{d},\"lease_ms\":{d},\"writes\":{d},\"max_writes\":{d},\"max_wallclock_min\":{d},\"last_prompt_at\":{d},\"model_rotation_index\":{d},\"review_text\":", .{
+        state.review_attempts, state.extensions, state.max_extensions, state.chain_index, state.chain_total,
+        state.lease_ms, state.writes, state.max_writes, state.max_wallclock_min, state.last_prompt_at, state.model_rotation_index,
+    });
+    try writeString(&w, state.review_text);
+    try w.writeAll(",\"research_text\":");
+    try writeString(&w, state.research_text);
+    try w.writeAll(",\"leases\":[");
+    for (state.leases, 0..) |l, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.print("{{\"id\":{d},\"subject\":", .{l.id});
+        try writeString(&w, l.subject);
+        try w.print(",\"status\":\"{s}\",\"owner\":", .{@tagName(l.status)});
+        try writeString(&w, l.owner);
+        try w.print(",\"attempts\":{d},\"lease_until\":{d},\"last_error\":", .{ l.attempts, l.lease_until });
+        try writeString(&w, l.last_error);
+        try w.writeAll(",\"verify\":");
+        try writeString(&w, l.verify);
+        try w.writeByte('}');
+    }
     try w.writeAll("]}\n");
     try writeAtomic(io, path, w.buffered());
 }
@@ -455,6 +531,66 @@ pub fn stopRequested(gpa: std.mem.Allocator, io: std.Io, root: []const u8) bool 
     const path = pathFor(gpa, root, mission.stop_file) catch return false;
     defer gpa.free(path);
     return exists(io, path);
+}
+
+fn readNamed(gpa: std.mem.Allocator, io: std.Io, root: []const u8, name: []const u8) ![]const u8 {
+    const path = try pathFor(gpa, root, name);
+    defer gpa.free(path);
+    return dir.readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024)) catch gpa.dupe(u8, "");
+}
+
+fn writeNamed(gpa: std.mem.Allocator, io: std.Io, root: []const u8, name: []const u8, text: []const u8) !void {
+    const path = try pathFor(gpa, root, name);
+    defer gpa.free(path);
+    try writeAtomic(io, path, text);
+}
+
+pub fn readJournal(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]const u8 {
+    return readNamed(gpa, io, root, mission.journal_file);
+}
+pub fn readMemory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]const u8 {
+    return readNamed(gpa, io, root, mission.memory_file);
+}
+pub fn writeMemory(gpa: std.mem.Allocator, io: std.Io, root: []const u8, text: []const u8) !void {
+    try writeNamed(gpa, io, root, mission.memory_file, text);
+}
+pub fn readSummary(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]const u8 {
+    return readNamed(gpa, io, root, mission.summary_file);
+}
+pub fn writeSummary(gpa: std.mem.Allocator, io: std.Io, root: []const u8, text: []const u8) !void {
+    try writeNamed(gpa, io, root, mission.summary_file, text);
+}
+pub fn readRoadmap(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]const u8 {
+    return readNamed(gpa, io, root, mission.roadmap_file);
+}
+pub fn writeRoadmap(gpa: std.mem.Allocator, io: std.Io, root: []const u8, text: []const u8) !void {
+    try writeNamed(gpa, io, root, mission.roadmap_file, text);
+}
+pub fn extendRequested(gpa: std.mem.Allocator, io: std.Io, root: []const u8) bool {
+    const path = pathFor(gpa, root, mission.extend_file) catch return false;
+    defer gpa.free(path);
+    return exists(io, path);
+}
+pub fn consumeExtend(gpa: std.mem.Allocator, io: std.Io, root: []const u8) bool {
+    const path = pathFor(gpa, root, mission.extend_file) catch return false;
+    defer gpa.free(path);
+    if (!exists(io, path)) return false;
+    dir.deleteFile(io, path) catch return false;
+    return true;
+}
+pub fn ensureV2Files(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !void {
+    const meta = pathFor(gpa, root, mission.dir_name) catch return;
+    defer gpa.free(meta);
+    try dir.createDirPath(io, meta);
+    const names = [_][]const u8{ mission.charter_file, mission.memory_file, mission.summary_file, mission.roadmap_file };
+    for (names) |name| {
+        const path = try pathFor(gpa, root, name);
+        defer gpa.free(path);
+        if (!exists(io, path)) {
+            const text = if (std.mem.eql(u8, name, mission.roadmap_file)) "# Roadmap\n\n" else if (std.mem.eql(u8, name, mission.charter_file)) "# Charter\n\nCompletion is defined by criteria.json.\n" else "";
+            try writeAtomic(io, path, text);
+        }
+    }
 }
 
 fn exitCode(term: std.process.Child.Term) u8 {

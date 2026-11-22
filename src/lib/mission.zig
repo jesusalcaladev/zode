@@ -10,6 +10,11 @@
 
 const std = @import("std");
 
+pub const memory = @import("mission_memory.zig");
+pub const roles = @import("mission_roles.zig");
+pub const chain = @import("mission_chain.zig");
+pub const lease = @import("mission_lease.zig");
+
 pub const dir_name = ".mission";
 pub const mission_file = "mission.md";
 pub const criteria_file = "criteria.json";
@@ -17,7 +22,14 @@ pub const tasks_file = "tasks.json";
 pub const state_file = "state.json";
 pub const journal_file = "journal.md";
 pub const stop_file = "STOP";
+pub const extend_file = "EXTEND";
 pub const evidence_dir = "evidence";
+pub const charter_file = "charter.md";
+pub const memory_file = "memory.md";
+pub const summary_file = "summary.md";
+pub const progress_file = "progress.json";
+pub const roadmap_file = "roadmap.md";
+pub const reports_dir = "reports";
 
 pub const Status = enum {
     running,
@@ -56,6 +68,8 @@ pub const StopReason = enum {
     deadline,
     blocked,
     failures,
+    writes,
+    review_high,
     test_erosion,
 
     pub fn name(self: StopReason) []const u8 {
@@ -66,6 +80,8 @@ pub const StopReason = enum {
             .deadline => "deadline",
             .blocked => "blocked",
             .failures => "repeated-execution-failure",
+            .writes => "write-ceiling",
+            .review_high => "review-high",
             .test_erosion => "test-erosion",
         };
     }
@@ -115,6 +131,8 @@ pub const DecideArgs = struct {
     deadline_exceeded: bool = false,
     failures: usize = 0,
     max_failures: usize = 3,
+    writes: usize = 0,
+    max_writes: usize = 0,
     verdict_blocked: bool = false,
     all_checks_green: bool = false,
     all_tasks_done: bool = false,
@@ -129,6 +147,7 @@ pub fn decide(args: DecideArgs) Decision {
     if (args.deadline_exceeded) return .{ .stop = .deadline };
     if (args.budget_usd > 0 and args.cost_usd >= args.budget_usd) return .{ .stop = .budget };
     if (args.turn >= args.max_turns) return .{ .stop = .turns };
+    if (args.max_writes > 0 and args.writes >= args.max_writes) return .{ .stop = .writes };
     if (args.failures >= args.max_failures) return .{ .stop = .failures };
     if (args.verdict_blocked) return .{ .stop = .blocked };
     if (args.all_checks_green and args.all_tasks_done) return .complete;

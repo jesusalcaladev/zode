@@ -36,7 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - keep the selected model across catalog refreshes (palette) [`93389c31`](https://github.com/jesusalcaladev/zode/commit/93389c31)
 - make /focus a real quiet transcript (tui) [`af2d7528`](https://github.com/jesusalcaladev/zode/commit/af2d7528)
 - headless autonomous mission runner (mission) [`20212f85`](https://github.com/jesusalcaladev/zode/commit/20212f85)
-- add recovery, model rotation, test guard and model planner (mission) [`db735578`](https://github.com/jesusalcaladev/zode/commit/db735578)
+- add recovery, model rotation, test guard and model planner (mission) [`dfba48c8`](https://github.com/jesusalcaladev/zode/commit/dfba48c8)
+- full contract parity with the OpenCode plugin (mission) [`8fc4e65a`](https://github.com/jesusalcaladev/zode/commit/8fc4e65a)
 
 ### Bug Fixes
 

@@ -47,6 +47,26 @@ With workers enabled the driver writes one prompt per task under
 `.mission/prompts/` and starts them in the same shell wave. The lead receives the
 failure summary afterwards. The harness still owns verification and completion.
 
+## Roles, memory and continuity
+
+The driver now mirrors the OpenCode plugin's full contract:
+
+- **Memory**: `charter.md`, `memory.md`, `summary.md`. Every 4 turns the journal
+  is distilled into bounded memory and injected into agent prompts.
+- **Roles in one workspace** (no worktrees): read-only investigator, implementer
+  (assigned files), tester and reviewer. Stage machine:
+  `investigate → implement → verify → review → done`. Completion requires a clean
+  review; `SEVERITY: high` reopens tasks (max 2) then blocks with `review-high`.
+- **Leases**: tasks are claimed with `lease_ms` (default 5 min), expire and retry;
+  agents can renew via a heartbeat instruction in their prompt.
+- **Continuity**: `.mission/roadmap.md` checklists chain missions in the same
+  workspace, carrying memory forward. `EXTEND` grants bounded budget raises.
+- **Watchdog**: a tier-2 stall asks the model for a new validated JSON plan.
+
+Role reports are written to `.mission/reports/<role>.txt` by the agent's own
+write tool; the harness parses them. Criteria, state and tasks remain
+harness-owned and should never be edited by an agent.
+
 ## Recovery and integrity
 
 - A failed agent turn increments `failures`, backs off (2s, 4s, 8s… capped at 30s),
