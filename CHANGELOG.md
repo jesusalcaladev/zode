@@ -37,7 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - make /focus a real quiet transcript (tui) [`af2d7528`](https://github.com/jesusalcaladev/zode/commit/af2d7528)
 - headless autonomous mission runner (mission) [`20212f85`](https://github.com/jesusalcaladev/zode/commit/20212f85)
 - add recovery, model rotation, test guard and model planner (mission) [`dfba48c8`](https://github.com/jesusalcaladev/zode/commit/dfba48c8)
-- full contract parity with the OpenCode plugin (mission) [`8fc4e65a`](https://github.com/jesusalcaladev/zode/commit/8fc4e65a)
+- full contract parity with the OpenCode plugin (mission) [`e4a539c8`](https://github.com/jesusalcaladev/zode/commit/e4a539c8)
 
 ### Bug Fixes
 
@@ -75,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - use the Model's io instead of agent.io_global (25 sites) (42.8) [`b4436af8`](https://github.com/jesusalcaladev/zode/commit/b4436af8)
 - pass the autocomplete count into drawAutocomplete (tui) [`9ace7f27`](https://github.com/jesusalcaladev/zode/commit/9ace7f27)
 - remove the duplicated palette key dispatch (47.6) (tui) [`965d2cf2`](https://github.com/jesusalcaladev/zode/commit/965d2cf2)
+- integrate mission runtime into zode (core) [`29dc45f4`](https://github.com/jesusalcaladev/zode/commit/29dc45f4)
 
 ### Performance
 
@@ -97,6 +98,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - capitalize visible UI labels (tui) [`0c88e35a`](https://github.com/jesusalcaladev/zode/commit/0c88e35a)
 - give the Ctrl+R hint its own key colour (tui) [`bf8817bc`](https://github.com/jesusalcaladev/zode/commit/bf8817bc)
+
+### Other
+
+- Merge mission runtime: autonomous mission supervisor with roles, memory and chaining [`816bd24b`](https://github.com/jesusalcaladev/zode/commit/816bd24b)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

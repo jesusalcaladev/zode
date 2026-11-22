@@ -268,18 +268,13 @@ pub fn build(b: *std.Build) void {
     // compiling the suite in ReleaseSafe takes 2 minutes and finds no MORE bug —
     // it finds fewer, because the DebugAllocator and the overflow checks are
     // exactly what catch them.
-    // The mission contract is shared by the unit tests and the headless tool.
+    // Mission runtime lives in the CORE (src/mission/), imported by main.zig
+    // like any other feature. There is no separate mission binary.
     const mission_mod = b.createModule(.{
-        .root_source_file = b.path("src/lib/mission.zig"),
+        .root_source_file = b.path("src/mission/contract.zig"),
         .target = target,
         .optimize = .safe,
     });
-    const mission_io_mod = b.createModule(.{
-        .root_source_file = b.path("src/lib/mission_io.zig"),
-        .target = target,
-        .optimize = .safe,
-    });
-    mission_io_mod.addImport("mission", mission_mod);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_all.zig"),
@@ -293,7 +288,6 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addImport("vaxis", vaxis.module("vaxis"));
     test_mod.addImport("mission", mission_mod);
-    test_mod.addImport("mission_io", mission_io_mod);
 
     // The network E2E test (a REAL turn against a REAL provider) is OFF by default and
     // behind `zig build test -De2e`. Two reasons, and the second is the one that matters:
@@ -437,21 +431,6 @@ pub fn build(b: *std.Build) void {
     ma_run.setName("memaudit_run");
     ma_run.has_side_effects = true;
     ma_step.dependOn(&ma_run.step);
-
-    // mission: the autonomous mission runner. Pure contract in lib/mission.zig,
-    // persistence and process execution in lib/mission_io.zig, CLI in tools.
-    const ms_cli_mod = b.createModule(.{
-        .root_source_file = b.path("tools/mission.zig"),
-        .target = target,
-        .optimize = .safe,
-    });
-    ms_cli_mod.addImport("mission", mission_mod);
-    ms_cli_mod.addImport("mission_io", mission_io_mod);
-    const ms_exe = b.addExecutable(.{ .name = "zode-mission", .root_module = ms_cli_mod });
-    b.installArtifact(ms_exe);
-    const ms_step = b.step("mission", "Build the headless autonomous mission runner");
-    ms_step.dependOn(&ms_exe.step);
-    ms_step.dependOn(b.getInstallStep());
 
     // churn: Zig-native changeset tool for version bumps and changelogs.
     // Share the release rules with the main tree instead of duplicating them.

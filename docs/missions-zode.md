@@ -14,20 +14,32 @@ ceiling are checked before the completion branch.
 ## Build
 
 ```bash
-zig build mission            # installs ./zig-out/bin/zode-mission
+zig build                    # builds the single zode binary
 zig build test               # includes the mission unit tests
 ```
+
+The mission runtime is **inside the zode core**, not a separate binary:
+
+```bash
+zode mission plan "..."      # create .mission/
+zode mission status [path]   # durable state
+zode mission check [path]    # run criteria
+zode mission run [path]      # supervise until complete
+```
+
+Or set `"settings": { "mode": "mission" }` in `~/.config/zode/config.json`
+(also accepts `"interactive"` and `"auto"`).
 
 ## Use
 
 ```bash
 # Create a workspace with a heuristic plan derived from the objective.
-./zig-out/bin/zode-mission plan "Create alpha.txt containing alpha and beta.txt containing beta"
+zode mission plan "Create alpha.txt containing alpha and beta.txt containing beta"
 
 # Inspect, verify, and drive the agent until the criteria are green.
-./zig-out/bin/zode-mission status ./missions/<id>
-./zig-out/bin/zode-mission check  ./missions/<id>
-./zig-out/bin/zode-mission run    ./missions/<id>
+zode mission status ./missions/<id>
+zode mission check  ./missions/<id>
+zode mission run    ./missions/<id>
 ```
 
 `run` repeats: run checks → write evidence → apply task results → decide → append

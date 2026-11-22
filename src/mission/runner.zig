@@ -1,17 +1,17 @@
-//! Headless mission runner — the executable half of the zode port.
+//! Mission runner — part of the zode core, dispatched by `zode mission`.
 //!
-//!   zode-mission plan "<objective>"       create .mission/ with executable checks
-//!   zode-mission status <workspace>       show state, checks and next task
-//!   zode-mission check <workspace>        run the checks and write evidence
-//!   zode-mission run <workspace>          supervise until complete or stopped
+//!   zode mission plan "<objective>"       create .mission/ with executable checks
+//!   zode mission status <workspace>       show state, checks and next task
+//!   zode mission check <workspace>        run the checks and write evidence
+//!   zode mission run <workspace>          supervise until complete or stopped
 //!
 //! The agent command comes from ZODE_MISSION_AGENT (default: `zode --chat`).
 //! ZODE_MISSION_WORKERS (default 1) enables parallel worker prompts in waves.
 //! Same on-disk contract as the OpenCode plugin: `docs/missions-zode.md`.
 
 const std = @import("std");
-const mission = @import("mission");
-const mission_io = @import("mission_io");
+const mission = @import("contract.zig");
+const mission_io = @import("io.zig");
 
 const dir = std.Io.Dir.cwd();
 
@@ -33,7 +33,7 @@ const plan_prompt_fmt =
 
 fn usage() void {
     std.debug.print(
-        \\usage: zode-mission <command> [args]
+        \\usage: zode mission <command> [args]
         \\  plan <objective>     create a mission workspace under ./missions/
         \\  status <workspace>   print the durable state
         \\  check <workspace>    run criteria and write evidence
@@ -130,7 +130,7 @@ fn cmdPlan(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         }
     }
     try mission_io.writePlanFiles(gpa, io, root, plan);
-    std.debug.print("mission created: {s} (plan: {s})\n  checks: {d}\n  tasks: {d}\nnext: zode-mission run {s}\n", .{
+    std.debug.print("mission created: {s} (plan: {s})\n  checks: {d}\n  tasks: {d}\nnext: zode mission run {s}\n", .{
         root, source, plan.checks.len, plan.tasks.len, root,
     });
     return 0;
@@ -636,7 +636,10 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
 
         const commit_msg = try std.fmt.allocPrint(gpa, "mission: turn {d} verified progress", .{state.turn});
         defer gpa.free(commit_msg);
-        if (try mission_io.gitCommit(gpa, io, root, commit_msg)) {
+        var commit_paths = std.ArrayList([]const u8).empty;
+        defer commit_paths.deinit(gpa);
+        for (tasks) |t| try commit_paths.appendSlice(gpa, t.files);
+        if (try mission_io.gitCommit(gpa, io, root, commit_msg, commit_paths.items)) {
             std.debug.print("checkpoint committed\n", .{});
         }
 
@@ -716,36 +719,34 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
     return 0;
 }
 
-pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const io = init.io;
-    var it = std.process.Args.Iterator.init(init.minimal.args);
-    _ = it.next();
-    const command = it.next() orelse {
+pub fn run(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, argv: []const []const u8) !u8 {
+    if (argv.len == 0) {
         usage();
-        std.process.exit(2);
-    };
-    var code: u8 = 0;
+        return 2;
+    }
+    const command = argv[0];
+    const rest = argv[1..];
     if (std.mem.eql(u8, command, "plan")) {
         var objective = std.ArrayList(u8).empty;
         defer objective.deinit(gpa);
-        while (it.next()) |part| {
+        for (rest) |part| {
             if (objective.items.len > 0) try objective.append(gpa, ' ');
             try objective.appendSlice(gpa, part);
         }
-        code = try cmdPlan(gpa, io, init.environ_map, objective.items);
+        return cmdPlan(gpa, io, env, objective.items);
     } else if (std.mem.eql(u8, command, "status")) {
-        const root = it.next() orelse ". ";
-        code = try printStatus(gpa, io, std.mem.trim(u8, root, " "));
+        const root = if (rest.len > 0) rest[0] else ".";
+        return printStatus(gpa, io, root);
     } else if (std.mem.eql(u8, command, "check")) {
-        const root = it.next() orelse ".";
-        code = try cmdCheck(gpa, io, root);
+        const root = if (rest.len > 0) rest[0] else ".";
+        return cmdCheck(gpa, io, root);
     } else if (std.mem.eql(u8, command, "run")) {
-        const root = it.next() orelse ".";
-        code = try cmdRun(gpa, io, init.environ_map, root);
-    } else {
+        const root = if (rest.len > 0) rest[0] else ".";
+        return cmdRun(gpa, io, env, root);
+    } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help")) {
         usage();
-        code = 2;
+        return 0;
     }
-    std.process.exit(code);
+    usage();
+    return 2;
 }

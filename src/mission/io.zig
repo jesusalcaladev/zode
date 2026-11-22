@@ -5,7 +5,7 @@
 //! All model-facing text is English. No TUI, no network, no provider calls here.
 
 const std = @import("std");
-const mission = @import("mission");
+const mission = @import("contract.zig");
 const dir = std.Io.Dir.cwd();
 
 // Local copies so this module owns a single file namespace: importing the
@@ -638,9 +638,17 @@ pub fn runChecks(gpa: std.mem.Allocator, io: std.Io, root: []const u8, checks: [
     return out.toOwnedSlice(gpa);
 }
 
-pub fn gitCommit(gpa: std.mem.Allocator, io: std.Io, root: []const u8, message: []const u8) !bool {
+pub fn gitCommit(gpa: std.mem.Allocator, io: std.Io, root: []const u8, message: []const u8, paths: []const []const u8) !bool {
+    // Never `git add -A`: a mission must not commit unrelated user changes.
+    if (paths.len == 0) return false;
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(gpa);
+    try argv.append(gpa, "git");
+    try argv.append(gpa, "add");
+    try argv.append(gpa, "--");
+    try argv.appendSlice(gpa, paths);
     const add = std.process.run(gpa, io, .{
-        .argv = &.{ "git", "add", "-A" },
+        .argv = argv.items,
         .cwd = .{ .path = root },
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
