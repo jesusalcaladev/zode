@@ -10,10 +10,11 @@
 
 const std = @import("std");
 
-pub const memory = @import("mission_memory.zig");
-pub const roles = @import("mission_roles.zig");
-pub const chain = @import("mission_chain.zig");
-pub const lease = @import("mission_lease.zig");
+pub const io = @import("io.zig");
+pub const memory = @import("memory.zig");
+pub const roles = @import("roles.zig");
+pub const chain = @import("chain.zig");
+pub const lease = @import("lease.zig");
 
 pub const dir_name = ".mission";
 pub const mission_file = "mission.md";

@@ -32,6 +32,8 @@ const mcp_servers = @import("mcp/servers.zig");
 /// under a single `settings` object in config.json so a patch can update them
 /// without touching (or losing) the provider/LSP/MCP fields around them.
 pub const Settings = struct {
+    /// Agent mode: interactive (default), mission (autonomous supervisor), auto.
+    mode: ?[]const u8 = null,
     output_style: ?[]const u8 = null,
     effort: ?[]const u8 = null,
     permission_mode: ?[]const u8 = null,
@@ -217,6 +219,11 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
     if (root.get("settings")) |sv| {
         if (sv == .object) {
             const so = sv.object;
+            if (so.get("mode")) |v| {
+                if (v == .string and (std.mem.eql(u8, v.string, "interactive") or std.mem.eql(u8, v.string, "mission") or std.mem.eql(u8, v.string, "auto"))) {
+                    cfg.settings.mode = try arena.dupe(u8, v.string);
+                }
+            }
             if (so.get("output_style")) |v| {
                 if (v == .string) cfg.settings.output_style = try arena.dupe(u8, v.string);
             }
@@ -762,6 +769,7 @@ test "allDefs: the config ones come after the built-in ones" {
 /// written, so "unset" stays unset (env/model decides) rather than freezing a
 /// value the user never chose.
 fn settingValue(v: Settings, key: []const u8, arena: std.mem.Allocator) ?std.json.Value {
+    if (std.mem.eql(u8, key, "mode")) if (v.mode) |s| return .{ .string = arena.dupe(u8, s) catch return null };
     if (std.mem.eql(u8, key, "output_style")) if (v.output_style) |s| return .{ .string = arena.dupe(u8, s) catch return null };
     if (std.mem.eql(u8, key, "effort")) if (v.effort) |s| return .{ .string = arena.dupe(u8, s) catch return null };
     if (std.mem.eql(u8, key, "permission_mode")) if (v.permission_mode) |s| return .{ .string = arena.dupe(u8, s) catch return null };
@@ -781,7 +789,7 @@ fn settingValue(v: Settings, key: []const u8, arena: std.mem.Allocator) ?std.jso
 }
 
 const setting_keys = [_][]const u8{
-    "output_style", "effort", "permission_mode", "compaction", "task_parallel",
+    "mode", "output_style", "effort", "permission_mode", "compaction", "task_parallel",
     "max_iter", "context_limit", "auto_check", "web_allow_local", "prompt_cache",
     "read_cache_bytes", "color_palette", "vim_mode", "nerd_icons", "active_agent",
 };
