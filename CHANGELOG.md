@@ -38,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - headless autonomous mission runner (mission) [`20212f85`](https://github.com/jesusalcaladev/zode/commit/20212f85)
 - add recovery, model rotation, test guard and model planner (mission) [`dfba48c8`](https://github.com/jesusalcaladev/zode/commit/dfba48c8)
 - full contract parity with the OpenCode plugin (mission) [`e4a539c8`](https://github.com/jesusalcaladev/zode/commit/e4a539c8)
-- continuous improvement loop for missions (core) [`e6a1aa79`](https://github.com/jesusalcaladev/zode/commit/e6a1aa79)
+- continuous improvement loop for missions (core) [`da601944`](https://github.com/jesusalcaladev/zode/commit/da601944)
 
 ### Bug Fixes
 
@@ -65,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - new improvement backlog from a six-track code audit (tasks) [`a674eb1b`](https://github.com/jesusalcaladev/zode/commit/a674eb1b)
 - record the two remaining deferrals with their real blockers (tasks) [`5d2c8cd2`](https://github.com/jesusalcaladev/zode/commit/5d2c8cd2)
 - add Claude Code parity backlog (phases 48-51) (tasks) [`2aa540d7`](https://github.com/jesusalcaladev/zode/commit/2aa540d7)
+- record mission runtime gaps vs the OpenCode plugin [`964e9ab0`](https://github.com/jesusalcaladev/zode/commit/964e9ab0)
 
 ### Refactors
 
