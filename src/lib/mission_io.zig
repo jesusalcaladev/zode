@@ -39,6 +39,11 @@ fn writeAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
     try tmp.replace(io);
 }
 
+pub const TestHash = struct {
+    path: []const u8,
+    hash: u64,
+};
+
 pub const State = struct {
     status: mission.Status = .running,
     turn: usize = 0,
@@ -52,6 +57,7 @@ pub const State = struct {
     strategy_tier: u8 = 1,
     verdict_blocked: bool = false,
     last_commit: []const u8 = "",
+    test_hashes: []const TestHash = &.{},
 };
 
 fn pathFor(gpa: std.mem.Allocator, root: []const u8, name: []const u8) ![]const u8 {
@@ -61,6 +67,93 @@ fn pathFor(gpa: std.mem.Allocator, root: []const u8, name: []const u8) ![]const 
 fn exists(io: std.Io, path: []const u8) bool {
     _ = dir.statFile(io, path, .{}) catch return false;
     return true;
+}
+
+fn fnv1a64(bytes: []const u8) u64 {
+    var h: u64 = 0xcbf29ce484222325;
+    for (bytes) |b| {
+        h ^= b;
+        h *%= 0x100000001b3;
+    }
+    return h;
+}
+
+fn isTestFile(rel: []const u8) bool {
+    const name = std.fs.path.basename(rel);
+    if (std.mem.indexOf(u8, name, ".test.") != null or std.mem.indexOf(u8, name, ".spec.") != null) return true;
+    if (std.mem.startsWith(u8, name, "test_") and std.mem.endsWith(u8, name, ".py")) return true;
+    if (std.mem.indexOf(u8, rel, "/tests/") != null or std.mem.startsWith(u8, rel, "tests/")) {
+        return std.mem.endsWith(u8, name, ".zig") or std.mem.endsWith(u8, name, ".py") or std.mem.endsWith(u8, name, ".js") or std.mem.endsWith(u8, name, ".ts");
+    }
+    return false;
+}
+
+fn skipDir(name: []const u8) bool {
+    const names = [_][]const u8{ ".git", ".mission", "node_modules", "zig-cache", ".zig-cache", "zig-out", "dist", "build" };
+    for (names) |n| if (std.mem.eql(u8, name, n)) return true;
+    return false;
+}
+
+/// Hash every test file under `root`. Adding a test is fine; editing or
+/// deleting an existing one is refused by `checkTestIntegrity`.
+pub fn hashTests(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]TestHash {
+    var out = std.ArrayList(TestHash).empty;
+    errdefer out.deinit(gpa);
+    var stack = std.ArrayList([]const u8).empty;
+    defer stack.deinit(gpa);
+    try stack.append(gpa, try gpa.dupe(u8, ""));
+    while (stack.items.len > 0) {
+        const rel = stack.pop().?;
+        const full = if (rel.len == 0) try gpa.dupe(u8, root) else try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, rel });
+        defer gpa.free(full);
+        var sub = dir.openDir(io, full, .{ .iterate = true }) catch continue;
+        defer sub.close(io);
+        var it = sub.iterate();
+        while (it.next(io) catch null) |entry| {
+            const child_rel = if (rel.len == 0)
+                try gpa.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rel, entry.name });
+            if (entry.kind == .directory) {
+                if (!skipDir(entry.name)) try stack.append(gpa, child_rel) else gpa.free(child_rel);
+                continue;
+            }
+            if (entry.kind != .file or !isTestFile(child_rel)) {
+                gpa.free(child_rel);
+                continue;
+            }
+            const child_full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, child_rel });
+            defer gpa.free(child_full);
+            const bytes = dir.readFileAlloc(io, child_full, gpa, .limited(16 * 1024 * 1024)) catch {
+                gpa.free(child_rel);
+                continue;
+            };
+            defer gpa.free(bytes);
+            try out.append(gpa, .{ .path = child_rel, .hash = fnv1a64(bytes) });
+        }
+    }
+    std.mem.sort(TestHash, out.items, {}, struct {
+        fn lessThan(_: void, a: TestHash, b: TestHash) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lessThan);
+    return out.toOwnedSlice(gpa);
+}
+
+pub fn checkTestIntegrity(baseline: []const TestHash, current: []const TestHash) ?[]const u8 {
+    if (baseline.len == 0) return null;
+    for (baseline) |before| {
+        var found = false;
+        for (current) |now| {
+            if (std.mem.eql(u8, before.path, now.path)) {
+                found = true;
+                if (before.hash != now.hash) return before.path;
+                break;
+            }
+        }
+        if (!found) return before.path;
+    }
+    return null;
 }
 
 fn objStr(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -293,6 +386,19 @@ pub fn loadState(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !State {
     const o = parsed.object;
     const status_s = objStr(o, "status") orelse "running";
     const commit = objStr(o, "last_commit") orelse "";
+    var hashes = std.ArrayList(TestHash).empty;
+    errdefer hashes.deinit(gpa);
+    if (o.get("test_hashes")) |hv| {
+        if (hv == .array) {
+            for (hv.array.items) |item| {
+                if (item != .object) continue;
+                const p = objStr(item.object, "path") orelse continue;
+                const h_s = objStr(item.object, "hash") orelse continue;
+                const h = std.fmt.parseInt(u64, h_s, 10) catch continue;
+                try hashes.append(gpa, .{ .path = try gpa.dupe(u8, p), .hash = h });
+            }
+        }
+    }
     return .{
         .status = parseStatus(status_s),
         .turn = @intCast(@max(0, objInt(o, "turn", 0))),
@@ -306,19 +412,33 @@ pub fn loadState(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !State {
         .strategy_tier = @intCast(@max(1, @min(3, objInt(o, "strategy_tier", 1)))),
         .verdict_blocked = objBool(o, "verdict_blocked", false),
         .last_commit = try gpa.dupe(u8, commit),
+        .test_hashes = try hashes.toOwnedSlice(gpa),
     };
 }
 
 pub fn saveState(gpa: std.mem.Allocator, io: std.Io, root: []const u8, state: State) !void {
     const path = try pathFor(gpa, root, mission.state_file);
     defer gpa.free(path);
-    try writeJson(gpa, io, path,
-        "{{\"version\":1,\"status\":\"{s}\",\"turn\":{d},\"max_turns\":{d},\"failures\":{d},\"max_failures\":{d},\"cost_usd\":{d},\"budget_usd\":{d},\"best_green\":{d},\"tasks_done\":{d},\"strategy_tier\":{d},\"verdict_blocked\":{s},\"last_commit\":\"{s}\"}}\n",
+    var buf: [128 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.print(
+        "{{\"version\":1,\"status\":\"{s}\",\"turn\":{d},\"max_turns\":{d},\"failures\":{d},\"max_failures\":{d},\"cost_usd\":{d},\"budget_usd\":{d},\"best_green\":{d},\"tasks_done\":{d},\"strategy_tier\":{d},\"verdict_blocked\":{s},\"last_commit\":",
         .{
             state.status.name(), state.turn, state.max_turns, state.failures, state.max_failures,
             state.cost_usd, state.budget_usd, state.best_green, state.tasks_done, state.strategy_tier,
-            if (state.verdict_blocked) "true" else "false", state.last_commit,
-        });
+            if (state.verdict_blocked) "true" else "false",
+        },
+    );
+    try writeString(&w, state.last_commit);
+    try w.writeAll(",\"test_hashes\":[");
+    for (state.test_hashes, 0..) |h, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"path\":");
+        try writeString(&w, h.path);
+        try w.print(",\"hash\":\"{d}\"}}", .{h.hash});
+    }
+    try w.writeAll("]}\n");
+    try writeAtomic(io, path, w.buffered());
 }
 
 pub fn appendJournal(gpa: std.mem.Allocator, io: std.Io, root: []const u8, line: []const u8) !void {
@@ -443,9 +563,12 @@ test "mission_io: state survives a JSON round trip" {
     const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
     try dir.createDirPath(io, meta);
 
-    const first = State{ .turn = 4, .status = .blocked, .max_turns = 9, .cost_usd = 1.25 };
+    const hashes = [_]TestHash{.{ .path = "cli.test.js", .hash = 17_192_427_771_940_152_780 }};
+    const first = State{ .turn = 4, .status = .blocked, .max_turns = 9, .cost_usd = 1.25, .test_hashes = &hashes };
     try saveState(a, io, root, first);
     const loaded = try loadState(a, io, root);
+    try std.testing.expectEqual(@as(usize, 1), loaded.test_hashes.len);
+    try std.testing.expectEqual(@as(u64, 17_192_427_771_940_152_780), loaded.test_hashes[0].hash);
     try std.testing.expectEqual(@as(usize, 4), loaded.turn);
     try std.testing.expectEqual(mission.Status.blocked, loaded.status);
     try std.testing.expectEqual(@as(usize, 9), loaded.max_turns);
@@ -466,6 +589,26 @@ test "mission_io: STOP is detected from disk" {
     const stop_path = try pathFor(a, root, mission.stop_file);
     try writeAtomic(io,stop_path, "");
     try std.testing.expect(stopRequested(a, io, root));
+}
+
+test "mission_io: test erosion is detected by hash and count" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const root = try testRoot(a, "hash-guard");
+    defer cleanRoot(io, root);
+    try dir.createDirPath(io, root);
+
+    const file = try std.fmt.allocPrint(a, "{s}/cli.test.js", .{root});
+    try dir.writeFile(io, .{ .sub_path = file, .data = "test('a', () => {});\n" });
+    const baseline = try hashTests(a, io, root);
+    try std.testing.expectEqual(@as(usize, 1), baseline.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), checkTestIntegrity(baseline, baseline));
+
+    try dir.writeFile(io, .{ .sub_path = file, .data = "test('a', () => {}); // weakened\n" });
+    const changed = try hashTests(a, io, root);
+    try std.testing.expect(checkTestIntegrity(baseline, changed) != null);
 }
 
 test "mission_io: checks run and write evidence" {

@@ -35,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - make provider search work in the model picker (palette) [`c59bbbd3`](https://github.com/jesusalcaladev/zode/commit/c59bbbd3)
 - keep the selected model across catalog refreshes (palette) [`93389c31`](https://github.com/jesusalcaladev/zode/commit/93389c31)
 - make /focus a real quiet transcript (tui) [`af2d7528`](https://github.com/jesusalcaladev/zode/commit/af2d7528)
-- headless autonomous mission runner (mission) [`b1dbb40b`](https://github.com/jesusalcaladev/zode/commit/b1dbb40b)
+- headless autonomous mission runner (mission) [`20212f85`](https://github.com/jesusalcaladev/zode/commit/20212f85)
+- add recovery, model rotation, test guard and model planner (mission) [`db735578`](https://github.com/jesusalcaladev/zode/commit/db735578)
 
 ### Bug Fixes
 

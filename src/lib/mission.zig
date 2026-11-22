@@ -288,6 +288,125 @@ pub fn wavesFor(gpa: std.mem.Allocator, tasks: []const Task, max_workers: usize)
     return waves.toOwnedSlice(gpa);
 }
 
+fn safeId(s: []const u8) bool {
+    if (s.len == 0 or s.len > 32) return false;
+    if (!(std.ascii.isAlphanumeric(s[0]) or s[0] == '_')) return false;
+    for (s) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) return false;
+    }
+    return true;
+}
+
+fn unsafeCommand(cmd: []const u8) bool {
+    const denied = [_][]const u8{ "sudo ", "rm -rf /", "mkfs", "dd if=", "curl ", "wget " };
+    for (denied) |needle| {
+        if (std.mem.indexOf(u8, cmd, needle) != null) return true;
+    }
+    return std.mem.indexOf(u8, cmd, "| sh") != null or std.mem.indexOf(u8, cmd, "| bash") != null;
+}
+
+/// Model-authored plan -> validated contract. A rejected plan degrades to the
+/// heuristic planner; a bad criterion must never become the definition of done.
+pub fn planFromJson(gpa: std.mem.Allocator, data: []const u8) !Plan {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, gpa, data, .{}) catch return error.InvalidPlan;
+    if (parsed != .object) return error.InvalidPlan;
+    const o = parsed.object;
+
+    const cv = o.get("checks") orelse return error.InvalidPlan;
+    if (cv != .array or cv.array.items.len == 0 or cv.array.items.len > 10) return error.InvalidPlan;
+    var checks = std.ArrayList(Check).empty;
+    errdefer checks.deinit(gpa);
+    for (cv.array.items) |item| {
+        if (item != .object) continue;
+        const id_v = item.object.get("id") orelse continue;
+        const cmd_v = item.object.get("cmd") orelse continue;
+        if (id_v != .string or cmd_v != .string) continue;
+        if (!safeId(id_v.string) or cmd_v.string.len == 0 or cmd_v.string.len > 500) continue;
+        if (unsafeCommand(cmd_v.string)) continue;
+        var expect: []const u8 = "exit0";
+        if (item.object.get("expect")) |ev| {
+            if (ev == .string and std.mem.startsWith(u8, ev.string, "contains:") and ev.string.len > 9) expect = ev.string;
+        }
+        var timeout_ms: u32 = 30000;
+        if (item.object.get("timeout_ms")) |tv| {
+            if (tv == .integer and tv.integer > 0) timeout_ms = @intCast(@min(600000, @as(i64, @max(1000, tv.integer))));
+        }
+        try checks.append(gpa, .{
+            .id = try gpa.dupe(u8, id_v.string),
+            .cmd = try gpa.dupe(u8, cmd_v.string),
+            .expect = try gpa.dupe(u8, expect),
+            .timeout_ms = timeout_ms,
+        });
+    }
+    if (checks.items.len == 0) return error.InvalidPlan;
+
+    var check_ids = std.ArrayList([]const u8).empty;
+    defer check_ids.deinit(gpa);
+    for (checks.items) |c| try check_ids.append(gpa, c.id);
+
+    const tv = o.get("tasks") orelse return error.InvalidPlan;
+    if (tv != .array or tv.array.items.len == 0 or tv.array.items.len > 12) return error.InvalidPlan;
+    var tasks = std.ArrayList(Task).empty;
+    errdefer tasks.deinit(gpa);
+    for (tv.array.items, 0..) |item, index| {
+        if (item != .object) continue;
+        const subject_v = item.object.get("subject") orelse continue;
+        if (subject_v != .string or subject_v.string.len < 3) continue;
+        const id: u32 = @intCast(index + 1);
+        var files = std.ArrayList([]const u8).empty;
+        if (item.object.get("files")) |fv| {
+            if (fv == .array) {
+                for (fv.array.items) |f| {
+                    if (f != .string) continue;
+                    const p = std.mem.trim(u8, f.string, " \t");
+                    if (p.len == 0 or p.len > 160 or p[0] == '/' or std.mem.indexOf(u8, p, "..") != null) continue;
+                    try files.append(gpa, try gpa.dupe(u8, p));
+                }
+            }
+        }
+        var deps = std.ArrayList(u32).empty;
+        if (item.object.get("blocked_by")) |bv| {
+            if (bv == .array) {
+                for (bv.array.items) |d| {
+                    if (d == .integer and d.integer > 0 and d.integer <= tv.array.items.len and d.integer != id) {
+                        try deps.append(gpa, @intCast(d.integer));
+                    }
+                }
+            }
+        }
+        var verify: []const u8 = "";
+        if (item.object.get("verify")) |vv| {
+            if (vv == .string) {
+                for (check_ids.items) |cid| {
+                    if (std.mem.eql(u8, cid, vv.string)) {
+                        verify = try gpa.dupe(u8, vv.string);
+                        break;
+                    }
+                }
+            }
+        }
+        if (verify.len == 0) verify = try gpa.dupe(u8, check_ids.items[check_ids.items.len - 1]);
+        try tasks.append(gpa, .{
+            .id = id,
+            .subject = try gpa.dupe(u8, subject_v.string[0..@min(subject_v.string.len, 160)]),
+            .files = try files.toOwnedSlice(gpa),
+            .verify = verify,
+            .blocked_by = try deps.toOwnedSlice(gpa),
+        });
+    }
+    if (tasks.items.len == 0) return error.InvalidPlan;
+
+    var objective: []const u8 = "Autonomous mission";
+    if (o.get("objective")) |ov| {
+        if (ov == .string and ov.string.len > 2) objective = ov.string;
+    }
+    return .{
+        .objective = try gpa.dupe(u8, objective),
+        .checks = try checks.toOwnedSlice(gpa),
+        .tasks = try tasks.toOwnedSlice(gpa),
+    };
+}
+
 fn isWordChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '-' or c == '.';
 }
@@ -440,6 +559,24 @@ test "planFromObjective derives real file and content checks" {
         if (std.mem.indexOf(u8, c.cmd, "beta.txt") != null) found_beta = true;
     }
     try std.testing.expect(found_beta);
+}
+
+test "planFromJson validates model plans and rejects unsafe checks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const good =
+        \\{"objective":"Build a CLI","checks":[{"id":"tests","cmd":"node --test","expect":"exit0"}],"tasks":[{"id":1,"subject":"Write tests","files":["cli.test.js"],"verify":"tests","blocked_by":[]}]}
+    ;
+    const plan = try planFromJson(a, good);
+    try std.testing.expectEqual(@as(usize, 1), plan.checks.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.tasks.len);
+    try std.testing.expectEqualStrings("tests", plan.tasks[0].verify);
+
+    const bad =
+        \\{"checks":[{"id":"x","cmd":"sudo rm -rf /","expect":"exit0"}],"tasks":[{"id":1,"subject":"do it","verify":"x"}]}
+    ;
+    try std.testing.expectError(error.InvalidPlan, planFromJson(a, bad));
 }
 
 test "nextStrategy escalates only without verified progress" {

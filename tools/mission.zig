@@ -15,6 +15,22 @@ const mission_io = @import("mission_io");
 
 const dir = std.Io.Dir.cwd();
 
+fn nap(ms: u64) void {
+    const ts = std.os.linux.timespec{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = std.os.linux.nanosleep(&ts, null);
+}
+
+const plan_prompt_fmt =
+    \\You are the planner of an autonomous coding harness. Convert the objective into an executable JSON plan.
+    \\Output ONLY one JSON object, no markdown, no explanation.
+    \\SHAPE: {{"objective":"...","checks":[{{"id":"short_id","cmd":"shell command","expect":"exit0 | contains:text","timeout_ms":30000}}],"tasks":[{{"id":1,"subject":"short imperative","files":["relative/path"],"verify":"check_id","blocked_by":[]}}]}}
+    \\RULES: 1..10 checks; commands finish under 30s and are safe; 1..12 tasks with sequential ids; verify MUST name a check id; disjoint files for parallel tasks; no destructive commands.
+    \\OBJECTIVE: {s}
+;
+
 fn usage() void {
     std.debug.print(
         \\usage: zode-mission <command> [args]
@@ -57,7 +73,42 @@ fn slugify(gpa: std.mem.Allocator, objective: []const u8) ![]const u8 {
     return out.toOwnedSlice(gpa);
 }
 
-fn cmdPlan(gpa: std.mem.Allocator, io: std.Io, objective: []const u8) !u8 {
+fn callAgentCapture(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, command: []const u8, prompt: []const u8) ?[]const u8 {
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(gpa);
+    var it = std.mem.tokenizeScalar(u8, command, ' ');
+    while (it.next()) |part| argv.append(gpa, part) catch return null;
+    argv.append(gpa, prompt) catch return null;
+    const result = std.process.run(gpa, io, .{
+        .argv = argv.items,
+        .environ_map = env,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return null;
+    defer gpa.free(result.stderr);
+    if (switch (result.term) {
+        .exited => |code| code != 0,
+        else => true,
+    }) {
+        gpa.free(result.stdout);
+        return null;
+    }
+    return result.stdout;
+}
+
+fn planWithModel(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, objective: []const u8) ?mission.Plan {
+    const command = envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat";
+    const prompt = std.fmt.allocPrint(gpa, plan_prompt_fmt, .{objective}) catch return null;
+    defer gpa.free(prompt);
+    const raw = callAgentCapture(gpa, io, env, command, prompt) orelse return null;
+    defer gpa.free(raw);
+    const start = std.mem.indexOfScalar(u8, raw, '{') orelse return null;
+    const end = std.mem.lastIndexOfScalar(u8, raw, '}') orelse return null;
+    if (end <= start) return null;
+    return mission.planFromJson(gpa, raw[start .. end + 1]) catch null;
+}
+
+fn cmdPlan(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, objective: []const u8) !u8 {
     if (objective.len < 3) {
         std.debug.print("an objective of at least 3 characters is required\n", .{});
         return 2;
@@ -67,10 +118,20 @@ fn cmdPlan(gpa: std.mem.Allocator, io: std.Io, objective: []const u8) !u8 {
     const secs = std.Io.Timestamp.now(io, .real).toSeconds();
     const root = try std.fmt.allocPrint(gpa, "./missions/{s}-{d}", .{ slug, @as(u64, @intCast(@max(0, secs))) });
     defer gpa.free(root);
-    const plan = try mission.planFromObjective(gpa, objective);
+    const heuristic = try mission.planFromObjective(gpa, objective);
+    var plan = heuristic;
+    var source: []const u8 = "heuristic";
+    if (envGet(env, "ZODE_MISSION_PLANNER") != null) {
+        if (planWithModel(gpa, io, env, objective)) |model_plan| {
+            plan = model_plan;
+            source = "model";
+        } else {
+            std.debug.print("model planner unavailable; using heuristic plan\n", .{});
+        }
+    }
     try mission_io.writePlanFiles(gpa, io, root, plan);
-    std.debug.print("mission created: {s}\n  checks: {d}\n  tasks: {d}\nnext: zode-mission run {s}\n", .{
-        root, plan.checks.len, plan.tasks.len, root,
+    std.debug.print("mission created: {s} (plan: {s})\n  checks: {d}\n  tasks: {d}\nnext: zode-mission run {s}\n", .{
+        root, source, plan.checks.len, plan.tasks.len, root,
     });
     return 0;
 }
@@ -118,23 +179,37 @@ fn agentArgv(gpa: std.mem.Allocator, agent_command: []const u8, prompt: []const 
     return argv.toOwnedSlice(gpa);
 }
 
-fn callAgent(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, prompt: []const u8) void {
+fn callAgent(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, prompt: []const u8, model: ?[]const u8) bool {
     const command = envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat";
-    const argv = agentArgv(gpa, command, prompt) catch return;
+    const argv = agentArgv(gpa, command, prompt) catch return false;
     defer gpa.free(argv);
+    var child_env = std.process.Environ.Map.init(gpa);
+    defer child_env.deinit();
+    if (env) |parent| {
+        var it = parent.iterator();
+        while (it.next()) |kv| {
+            child_env.put(kv.key_ptr.*, kv.value_ptr.*) catch return false;
+        }
+    }
+    if (model) |m| child_env.put("ZODE_MODEL", m) catch return false;
     const result = std.process.run(gpa, io, .{
         .argv = argv,
         .cwd = .{ .path = root },
+        .environ_map = &child_env,
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
     }) catch {
         std.debug.print("agent command failed: {s}\n", .{command});
-        return;
+        return false;
     };
     defer gpa.free(result.stdout);
     defer gpa.free(result.stderr);
     if (result.stdout.len > 0) std.debug.print("{s}", .{result.stdout});
     if (result.stderr.len > 0) std.debug.print("{s}", .{result.stderr});
+    return switch (result.term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn writeWorkerPrompts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, tasks: []const mission.Task, wave: mission.Wave) ![]const []const u8 {
@@ -158,12 +233,17 @@ fn writeWorkerPrompts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, task
     return prompts.toOwnedSlice(gpa);
 }
 
-fn callWorkers(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, tasks: []const mission.Task, wave: mission.Wave) void {
+fn callWorkers(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, tasks: []const mission.Task, wave: mission.Wave, model: ?[]const u8) void {
     const paths = writeWorkerPrompts(gpa, io, root, tasks, wave) catch return;
     defer gpa.free(paths);
     const command = envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat";
     var script = std.ArrayList(u8).empty;
     defer script.deinit(gpa);
+    if (model) |m| {
+        const prefix = std.fmt.allocPrint(gpa, "export ZODE_MODEL='{s}'; ", .{m}) catch return;
+        defer gpa.free(prefix);
+        script.appendSlice(gpa, prefix) catch return;
+    }
     script.appendSlice(gpa, "for p in") catch return;
     for (paths) |p| {
         const piece = std.fmt.allocPrint(gpa, " '{s}'", .{p}) catch return;
@@ -187,8 +267,35 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
     var state = try mission_io.loadState(gpa, io, root);
     const worker_count_raw = envGet(env, "ZODE_MISSION_WORKERS") orelse "1";
     const workers = std.fmt.parseInt(usize, worker_count_raw, 10) catch 1;
+    var models = std.ArrayList([]const u8).empty;
+    defer models.deinit(gpa);
+    if (envGet(env, "ZODE_MISSION_MODELS")) |raw| {
+        var mit = std.mem.tokenizeScalar(u8, raw, ',');
+        while (mit.next()) |m| {
+            const clean = std.mem.trim(u8, m, " \t");
+            if (clean.len > 0) try models.append(gpa, clean);
+        }
+    }
+    var model_index: usize = 0;
 
     while (state.status == .running) {
+        const current_hashes = try mission_io.hashTests(gpa, io, root);
+        defer gpa.free(current_hashes);
+        if (state.test_hashes.len == 0) {
+            state.test_hashes = try gpa.dupe(mission_io.TestHash, current_hashes);
+            try mission_io.saveState(gpa, io, root, state);
+        } else {
+            if (mission_io.checkTestIntegrity(state.test_hashes, current_hashes)) |eroded| {
+                const note = try std.fmt.allocPrint(gpa, "test erosion refused progress: {s}", .{eroded});
+                defer gpa.free(note);
+                try mission_io.appendJournal(gpa, io, root, note);
+                state.status = .aborted;
+                try mission_io.saveState(gpa, io, root, state);
+                std.debug.print("MISSION STOPPED (test-erosion): {s}\n", .{eroded});
+                return 1;
+            }
+        }
+
         const checks = try mission_io.loadCriteria(gpa, io, root);
         defer gpa.free(checks);
         const tasks = try mission_io.loadTasks(gpa, io, root);
@@ -251,7 +358,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
             defer gpa.free(waves);
             if (waves.len > 0) {
                 try mission_io.appendJournal(gpa, io, root, "dispatching parallel workers");
-                for (waves) |wave| callWorkers(gpa, io, env, root, tasks, wave);
+                for (waves) |wave| callWorkers(gpa, io, env, root, tasks, wave, if (models.items.len > 0) models.items[model_index] else null);
             }
         }
 
@@ -271,8 +378,32 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
         }
         if (state.strategy_tier >= 2) prompt.appendSlice(gpa, "Strategy tier 2: change the approach, do not repeat the same edit. ") catch return 1;
         prompt.appendSlice(gpa, "Keep working until every check is green. Do not declare done; the harness decides completion.") catch return 1;
+        const model = if (models.items.len > 0) models.items[model_index] else null;
+        const ok = callAgent(gpa, io, env, root, prompt.items, model);
+        if (ok) {
+            state.failures = 0;
+        } else {
+            state.failures += 1;
+            const note = try std.fmt.allocPrint(gpa, "agent turn failed ({d}/{d})", .{ state.failures, state.max_failures });
+            defer gpa.free(note);
+            try mission_io.appendJournal(gpa, io, root, note);
+            if (state.failures >= state.max_failures) {
+                state.status = .aborted;
+                try mission_io.saveState(gpa, io, root, state);
+                std.debug.print("MISSION STOPPED (repeated-execution-failure): {s}\n", .{root});
+                return 1;
+            }
+            if (models.items.len > 0) {
+                model_index = (model_index + 1) % models.items.len;
+                const rotated = try std.fmt.allocPrint(gpa, "model rotated to {s}", .{models.items[model_index]});
+                defer gpa.free(rotated);
+                try mission_io.appendJournal(gpa, io, root, rotated);
+            }
+            const backoff_ms = @min(@as(u64, 2000) << @intCast(@min(state.failures - 1, 4)), 30_000);
+            nap(backoff_ms);
+            try mission_io.appendJournal(gpa, io, root, "retrying after backoff");
+        }
         try mission_io.saveState(gpa, io, root, state);
-        callAgent(gpa, io, env, root, prompt.items);
     }
     try mission_io.saveState(gpa, io, root, state);
     return 0;
@@ -295,7 +426,7 @@ pub fn main(init: std.process.Init) !void {
             if (objective.items.len > 0) try objective.append(gpa, ' ');
             try objective.appendSlice(gpa, part);
         }
-        code = try cmdPlan(gpa, io, objective.items);
+        code = try cmdPlan(gpa, io, init.environ_map, objective.items);
     } else if (std.mem.eql(u8, command, "status")) {
         const root = it.next() orelse ". ";
         code = try printStatus(gpa, io, std.mem.trim(u8, root, " "));

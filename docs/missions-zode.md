@@ -40,10 +40,26 @@ file, the turn/cost ceiling, `max_failures`, or a `blocked` verdict.
 | --- | --- | --- |
 | `ZODE_MISSION_AGENT` | `zode --chat` | Command used for each lead/worker turn; the prompt is appended as the last argument |
 | `ZODE_MISSION_WORKERS` | `1` | Parallel workers per wave. `>1` spawns one background agent per ready task, grouped by disjoint `files` |
+| `ZODE_MISSION_PLANNER` | unset | Set to any value to ask the agent for a JSON plan; falls back to the heuristic plan on error |
+| `ZODE_MISSION_MODELS` | unset | Comma-separated model ids. On a failed turn the driver rotates to the next one by setting `ZODE_MODEL` for the child |
 
 With workers enabled the driver writes one prompt per task under
 `.mission/prompts/` and starts them in the same shell wave. The lead receives the
 failure summary afterwards. The harness still owns verification and completion.
+
+## Recovery and integrity
+
+- A failed agent turn increments `failures`, backs off (2s, 4s, 8s… capped at 30s),
+  rotates to the next model in `ZODE_MISSION_MODELS`, and retries. After
+  `max_failures` the mission aborts with `repeated-execution-failure` instead of
+  spinning.
+- Before each decision the driver hashes every test file in the workspace and
+  stores the baseline in `state.json` as decimal strings (64-bit FNV fits in a
+  string, not in a JSON `i64`). Editing or deleting a test that existed at the
+  start aborts with `test-erosion`. Adding tests is allowed.
+- `plan` with `ZODE_MISSION_PLANNER` asks the agent for a JSON plan and validates
+  it: unsafe commands (`sudo`, `rm -rf /`, pipes to shell), bad ids, path
+  traversal and missing `verify` checks are rejected before anything is written.
 
 ## Files
 
