@@ -1,4 +1,5 @@
 const std = @import("std");
+const stopgate = @import("stopgate");
 
 pub const Kind = enum { probe, change, long };
 
@@ -106,7 +107,13 @@ pub const Policy = struct {
     }
 
     pub fn decide(self: *Policy, iteration: usize) Decision {
-        if (!self.budget.allows(iteration)) return .{ .stop = .ceiling };
+        // The ceiling is now the SAME ordered stop rule the mission supervisor
+        // uses. `Budget.allows` is kept for callers that only ask "is there
+        // room for another iteration"; the decision itself lives in stopgate.
+        if (stopgate.isStop(stopgate.firstStop(.{
+            .turn = iteration,
+            .max_turns = self.budget.hard,
+        }))) return .{ .stop = .ceiling };
         if (!self.budget.atTarget(iteration)) return .work;
         if (self.progress.changes > self.marks_at_target and self.budget.extend(iteration)) {
             self.marks_at_target = self.progress.changes;

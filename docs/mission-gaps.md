@@ -66,9 +66,13 @@ and the OpenCode plugin as of plugin commit `6fc066f`. Items are ordered by impa
 
 ## 5. Code quality
 
-- The zode runtime still duplicates a few decisions that already exist in the
-  interactive core (`exitgate`, `taskloop`, `team`, `pipeline`). The long-term
-  goal is one shared decision layer for both interactive and mission modes.
+- ~~**Shared hard-stop layer.**~~ **DONE.** `src/lib/stopgate.zig` owns the
+  ordered kill-switch/deadline/budget/turn/write/failure/blocked rules. Both
+  `taskloop.Policy.decide` and `mission.contract.decide` delegate to it; the
+  mission keeps only its own completion test (green checks + done tasks). It is
+  registered as its own Build module because a `.zig` file may belong to only
+  one module. `exitgate`'s verification gate and the team/pipeline stage
+  machines remain separate concerns by design.
 - Parity tests: the plugin has 80 tests including cache, facts, instructions and
   scoped commits; zode's mission tests cover contracts and IO but not these.
 

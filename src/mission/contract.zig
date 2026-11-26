@@ -9,6 +9,7 @@
 //! directory can move between the two harnesses without a format translation.
 
 const std = @import("std");
+const stopgate = @import("stopgate");
 
 pub const io = @import("io.zig");
 pub const memory = @import("memory.zig");
@@ -146,14 +147,35 @@ pub const DecideArgs = struct {
 /// matters: a kill switch and an explicit blocked verdict are honoured before
 /// the "work is done" branch, so a mission can always be stopped.
 pub fn decide(args: DecideArgs) Decision {
-    if (args.stop_file) return .{ .stop = .stop_file };
-    if (args.status != .running) return .{ .stop = .stop_file };
-    if (args.deadline_exceeded) return .{ .stop = .deadline };
-    if (args.budget_usd > 0 and args.cost_usd >= args.budget_usd) return .{ .stop = .budget };
-    if (args.turn >= args.max_turns) return .{ .stop = .turns };
-    if (args.max_writes > 0 and args.writes >= args.max_writes) return .{ .stop = .writes };
-    if (args.failures >= args.max_failures) return .{ .stop = .failures };
-    if (args.verdict_blocked) return .{ .stop = .blocked };
+    // The hard stops are ONE ordered rule shared with the interactive loop.
+    // Only this module's own completion test is local: a taskloop has no
+    // harness checks, a mission does.
+    const reason = stopgate.firstStop(.{
+        .stop_file = args.stop_file,
+        .active = args.status == .running,
+        .deadline_exceeded = args.deadline_exceeded,
+        .cost_usd = args.cost_usd,
+        .budget_usd = args.budget_usd,
+        .turn = args.turn,
+        .max_turns = args.max_turns,
+        .writes = args.writes,
+        .max_writes = args.max_writes,
+        .failures = args.failures,
+        .max_failures = args.max_failures,
+        .blocked = args.verdict_blocked,
+    });
+    switch (reason) {
+        .none => {},
+        // Preserve the historical mapping: a non-running mission reports the
+        // same reason as an explicit STOP file.
+        .stop_file, .inactive => return .{ .stop = .stop_file },
+        .deadline => return .{ .stop = .deadline },
+        .budget => return .{ .stop = .budget },
+        .turns => return .{ .stop = .turns },
+        .writes => return .{ .stop = .writes },
+        .failures => return .{ .stop = .failures },
+        .blocked => return .{ .stop = .blocked },
+    }
     if (args.all_checks_green and args.all_tasks_done) return .complete;
     return .work;
 }
@@ -540,6 +562,25 @@ test "decide: hard stops beat a green, complete mission" {
     }));
     // Zero budget means unlimited, not "stop immediately".
     try std.testing.expectEqual(Decision.work, decide(.{ .budget_usd = 0, .cost_usd = 1000 }));
+}
+
+test "decide: hard stops are the shared stopgate rule" {
+    // Both loops must agree on WHY they stop, not just THAT they stop.
+    const cases = [_]struct { args: DecideArgs, expected: StopReason }{
+        .{ .args = .{ .stop_file = true }, .expected = .stop_file },
+        .{ .args = .{ .status = .blocked }, .expected = .stop_file },
+        .{ .args = .{ .deadline_exceeded = true }, .expected = .deadline },
+        .{ .args = .{ .cost_usd = 5, .budget_usd = 5 }, .expected = .budget },
+        .{ .args = .{ .turn = 16 }, .expected = .turns },
+        .{ .args = .{ .writes = 4, .max_writes = 4 }, .expected = .writes },
+        .{ .args = .{ .failures = 3 }, .expected = .failures },
+        .{ .args = .{ .verdict_blocked = true }, .expected = .blocked },
+    };
+    for (cases) |c| {
+        const d = decide(c.args);
+        try std.testing.expect(d == .stop);
+        try std.testing.expectEqual(c.expected, d.stop);
+    }
 }
 
 test "evaluateExpect: exit0 and contains" {

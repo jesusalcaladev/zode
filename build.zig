@@ -89,12 +89,24 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", version);
     const build_options_mod = build_options.createModule();
 
+    // Shared PURE decision rules. A Zig source file can belong to only one
+    // module: taskloop lives in the root module and the mission contract in
+    // `mission_mod`, so importing stopgate.zig by relative path from both is a
+    // compile error. Registering it as its own module and importing that module
+    // into both is the bridge that lets one rule serve both runners.
+    const stopgate_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib/stopgate.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
     exe_mod.addImport("build_options", build_options_mod);
+    exe_mod.addImport("stopgate", stopgate_mod);
 
     const vaxis = b.dependency("vaxis", .{
         .target = target,
@@ -141,6 +153,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .debug,
     });
     debug_mod.addImport("vaxis", vaxis.module("vaxis"));
+    debug_mod.addImport("stopgate", stopgate_mod);
     // `build_options` is NOT optional: `main.zig` and `lib/selfupdate.zig`
     // import it for the version, and a module that does not have it cannot
     // compile at all.
@@ -215,6 +228,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     check_probe_mod.addImport("vaxis", vaxis.module("vaxis"));
+    check_probe_mod.addImport("stopgate", stopgate_mod);
     const check_probe = b.addExecutable(.{ .name = "check_probe", .root_module = check_probe_mod });
     const check_probe_run = b.addRunArtifact(check_probe);
     check_probe_run.addArgs(run_args);
@@ -227,6 +241,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     shell_mod.addImport("vaxis", vaxis.module("vaxis"));
+    shell_mod.addImport("stopgate", stopgate_mod);
     const shell_probe = b.addExecutable(.{ .name = "shell_probe", .root_module = shell_mod });
     const shell_probe_run = b.addRunArtifact(shell_probe);
     shell_probe_run.addArgs(run_args);
@@ -239,6 +254,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     roster_mod.addImport("vaxis", vaxis.module("vaxis"));
+    roster_mod.addImport("stopgate", stopgate_mod);
     const roster_probe = b.addExecutable(.{ .name = "roster_probe", .root_module = roster_mod });
     const roster_probe_run = b.addRunArtifact(roster_probe);
     roster_probe_run.addArgs(run_args);
@@ -257,6 +273,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     lsp_probe_mod.addImport("vaxis", vaxis.module("vaxis"));
+    lsp_probe_mod.addImport("stopgate", stopgate_mod);
     const lsp_probe = b.addExecutable(.{ .name = "lsp_probe", .root_module = lsp_probe_mod });
     const lsp_probe_run = b.addRunArtifact(lsp_probe);
     lsp_probe_run.addArgs(run_args);
@@ -275,6 +292,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = .safe,
     });
+    mission_mod.addImport("stopgate", stopgate_mod);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_all.zig"),
@@ -288,6 +306,7 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addImport("vaxis", vaxis.module("vaxis"));
     test_mod.addImport("mission", mission_mod);
+    test_mod.addImport("stopgate", stopgate_mod);
 
     // The network E2E test (a REAL turn against a REAL provider) is OFF by default and
     // behind `zig build test -De2e`. Two reasons, and the second is the one that matters:
@@ -344,6 +363,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     ui_frame_mod.addImport("vaxis", vaxis.module("vaxis"));
+    ui_frame_mod.addImport("stopgate", stopgate_mod);
     // The harness renders the REAL `drawFn`, and `tui.zig` pulls in
     // `lib/selfupdate.zig` and `commands.zig`, which read the version from
     // `build_options`. Without it the step does not compile at all, which is

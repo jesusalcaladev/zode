@@ -84,6 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - remove the duplicated palette key dispatch (47.6) (tui) [`965d2cf2`](https://github.com/jesusalcaladev/zode/commit/965d2cf2)
 - integrate mission runtime into zode (core) [`7644158c`](https://github.com/jesusalcaladev/zode/commit/7644158c)
 - remove dead code and close one-shot leaks (mission) [`0c0ead9c`](https://github.com/jesusalcaladev/zode/commit/0c0ead9c)
+- share hard-stop decisions between both runners [`15bbb9a7`](https://github.com/jesusalcaladev/zode/commit/15bbb9a7)
 
 ### Performance
 
@@ -101,7 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - end-to-end smoke for --chat (43.7) (headless) [`4bf7827b`](https://github.com/jesusalcaladev/zode/commit/4bf7827b)
 - wait for asserted screen state instead of fixed sleeps (47.5) (pty) [`d8a5eb1c`](https://github.com/jesusalcaladev/zode/commit/d8a5eb1c)
 - cover the last untested pure module (47.7) (envutil) [`c4425861`](https://github.com/jesusalcaladev/zode/commit/c4425861)
-- add parity cases for supervisor decisions (mission) [`01ad08a0`](https://github.com/jesusalcaladev/zode/commit/01ad08a0)
+- add parity cases for supervisor decisions (mission) [`9dfef4d9`](https://github.com/jesusalcaladev/zode/commit/9dfef4d9)
 
 ### Styles
 

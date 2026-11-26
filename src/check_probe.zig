@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
         if (!std.mem.eql(u8, bgproc.stateWord(&reg, id), "running")) break;
     }
 
-    const out = try check_tool.report(a, &reg, id);
+    const out = try check_tool.report(init.io, a, &reg, id);
     try w.print("---REPORT---\n{s}\n---END---\n", .{out});
     try w.flush();
 }
