@@ -9467,9 +9467,9 @@ pub fn acceptAutocomplete(self: *Model) bool {
         // input is exactly a bare `/token`).
         .command => {
             const cmd = matchLabel(self, self.ac.sel) orelse return false;
-            self.ed.clear();
-            self.ed.insert(cmd) catch return false;
-            self.ed.insertChar(' ') catch {};
+            const full = std.fmt.allocPrint(self.allocator, "{s} ", .{cmd}) catch return false;
+            defer self.allocator.free(full);
+            self.ed.replaceRange(0, self.ed.text().len, full, full.len) catch return false;
             resetAutocomplete(self);
             return true;
         },
@@ -9488,9 +9488,7 @@ pub fn acceptAutocomplete(self: *Model) bool {
     const start = self.ac.prefix_len;
     const end = @min(self.ed.cursor, text.len);
     if (start > end or start > text.len) return false;
-    self.ed.deleteRange(start, end) catch return false;
-    self.ed.setCursor(start);
-    self.ed.insert(repl) catch return false;
+    self.ed.replaceRange(start, end, repl, start + repl.len) catch return false;
     // A file mention ends the token: close the popup (it reopens on the next
     // keystroke if the text still qualifies).
     resetAutocomplete(self);

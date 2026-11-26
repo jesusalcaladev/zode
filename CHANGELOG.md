@@ -44,7 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add progress and cost status dashboard (mission) [`f23b7e12`](https://github.com/jesusalcaladev/zode/commit/f23b7e12)
 - quiet mission footer segment (tui) [`5d6c9df7`](https://github.com/jesusalcaladev/zode/commit/5d6c9df7)
 - add NO_CACHE escape hatch for external-state checks (mission) [`bd193b2d`](https://github.com/jesusalcaladev/zode/commit/bd193b2d)
-- accept verified-shaped fact proposals from the agent (mission) [`063861ab`](https://github.com/jesusalcaladev/zode/commit/063861ab)
+- accept verified-shaped fact proposals from the agent (mission) [`4e3531d7`](https://github.com/jesusalcaladev/zode/commit/4e3531d7)
 
 ### Bug Fixes
 
@@ -59,6 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop inferring tool failures from the summary text (tui) [`b2e5c400`](https://github.com/jesusalcaladev/zode/commit/b2e5c400)
 - finish moving config feedback out of the transcript (tui) [`18f38529`](https://github.com/jesusalcaladev/zode/commit/18f38529)
 - bound worker concurrency (mission) [`bff212ae`](https://github.com/jesusalcaladev/zode/commit/bff212ae)
+- make autocomplete replacement one undo step (editor) [`f559c4ec`](https://github.com/jesusalcaladev/zode/commit/f559c4ec)
 
 ### Chores
 

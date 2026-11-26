@@ -201,6 +201,21 @@ pub const Editor = struct {
         self.recountLines();
     }
 
+    /// Replaces [start, end) with `s` in ONE undo step. Autocomplete used to
+    /// call `deleteRange` + `insert`, which left two snapshots: Ctrl+Z removed
+    /// the inserted text and a second Ctrl+Z was needed to get the token back.
+    pub fn replaceRange(self: *Editor, start: usize, end: usize, s: []const u8, cursor_after: usize) !void {
+        if (start > end or end > self.buf.items.len) return error.BadRange;
+        const final_len = self.buf.items.len - (end - start) + s.len;
+        if (final_len > max_bytes) return error.InputTooLong;
+        self.recordUndo(false, cursor_after);
+        try self.buf.replaceRange(self.gpa, start, end - start, s);
+        self.cursor = @min(cursor_after, self.buf.items.len);
+        self.hist_idx = -1;
+        self.draft.clearRetainingCapacity();
+        self.recountLines();
+    }
+
     /// Moves the cursor to a byte offset (clamped to the buffer).
     /// End offset of the grapheme starting at `from`. Exposed for vim's `x`,
     /// which deletes one grapheme, not one byte.
@@ -1073,6 +1088,19 @@ test "rowsInWindow returns the LAST rows when there are more than fit" {
     try std.testing.expectEqual(@as(usize, 2), w.len);
     // The window is the tail, which is where the cursor is.
     try std.testing.expectEqualStrings(w[w.len - 1].bytes, w[1].bytes);
+}
+
+test "undo/redo: a range replacement is one step (autocomplete case)" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+    try e.insert("see @src/a.z");
+    const before = e.undo_stack.items.len;
+    try e.replaceRange(4, e.text().len, "@src/ab.zig ", 16);
+    try std.testing.expectEqual(before + 1, e.undo_stack.items.len);
+    try std.testing.expect(e.undo());
+    try std.testing.expectEqualStrings("see @src/a.z", e.text());
+    try std.testing.expect(e.redo());
+    try std.testing.expectEqualStrings("see @src/ab.zig ", e.text());
 }
 
 test "undo/redo: a typed word is one step and the cursor returns with the text" {
