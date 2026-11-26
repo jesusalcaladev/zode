@@ -1138,26 +1138,32 @@ pub fn runChecks(gpa: std.mem.Allocator, io: std.Io, root: []const u8, checks: [
     if (checks.len == 0) return &.{};
     const fingerprint = try workspaceFingerprint(gpa, io, root, checks);
 
-    if (loadCheckCache(gpa, io, root)) |cache| {
-        defer freeCachedResults(gpa, cache.results);
-        if (cache.fingerprint == fingerprint and cacheMatches(cache.results, checks)) {
-            var hit = try gpa.alloc(mission.CheckResult, cache.results.len);
-            var filled: usize = 0;
-            errdefer {
-                for (hit[0..filled]) |r| {
-                    gpa.free(r.id);
-                    gpa.free(r.summary);
+    const no_cache_path: ?[]const u8 = pathFor(gpa, root, mission.no_cache_file) catch null;
+    defer if (no_cache_path) |p| gpa.free(p);
+    const force_fresh = if (no_cache_path) |p| exists(io, p) else false;
+
+    if (!force_fresh) {
+        if (loadCheckCache(gpa, io, root)) |cache| {
+            defer freeCachedResults(gpa, cache.results);
+            if (cache.fingerprint == fingerprint and cacheMatches(cache.results, checks)) {
+                var hit = try gpa.alloc(mission.CheckResult, cache.results.len);
+                var filled: usize = 0;
+                errdefer {
+                    for (hit[0..filled]) |r| {
+                        gpa.free(r.id);
+                        gpa.free(r.summary);
+                    }
+                    gpa.free(hit);
                 }
-                gpa.free(hit);
+                for (cache.results, 0..) |r, i| {
+                    const id = try gpa.dupe(u8, r.id);
+                    errdefer gpa.free(id);
+                    const summary = try gpa.dupe(u8, r.summary);
+                    hit[i] = .{ .id = id, .ok = r.ok, .summary = summary };
+                    filled += 1;
+                }
+                return hit;
             }
-            for (cache.results, 0..) |r, i| {
-                const id = try gpa.dupe(u8, r.id);
-                errdefer gpa.free(id);
-                const summary = try gpa.dupe(u8, r.summary);
-                hit[i] = .{ .id = id, .ok = r.ok, .summary = summary };
-                filled += 1;
-            }
-            return hit;
         }
     }
 
@@ -1546,6 +1552,14 @@ test "mission_io: unchanged checks are cached until the workspace or criteria ch
     const fourth = try runChecks(std.testing.allocator, io, root, &checks);
     defer freeCheckResults(std.testing.allocator, fourth);
     try std.testing.expectEqual(@as(usize, 6), try countLines(std.testing.allocator, io, counter));
+
+    // Checks that depend on the clock or the network cannot be modeled by a
+    // workspace fingerprint. `.mission/NO_CACHE` is an honest escape hatch.
+    const marker = try pathFor(a, root, mission.no_cache_file);
+    try dir.writeFile(io, .{ .sub_path = marker, .data = "" });
+    const fifth = try runChecks(std.testing.allocator, io, root, &checks);
+    defer freeCheckResults(std.testing.allocator, fifth);
+    try std.testing.expectEqual(@as(usize, 8), try countLines(std.testing.allocator, io, counter));
 }
 
 test "mission_io: durable facts replace by subject and survive a JSON round trip" {

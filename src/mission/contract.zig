@@ -28,6 +28,9 @@ pub const stop_file = "STOP";
 pub const extend_file = "EXTEND";
 pub const evidence_dir = "evidence";
 pub const checks_cache_file = "checks-cache.json";
+/// Presence of `.mission/NO_CACHE` forces a fresh suite: the workspace
+/// fingerprint cannot model network, clock or environment dependencies.
+pub const no_cache_file = "NO_CACHE";
 pub const charter_file = "charter.md";
 pub const memory_file = "memory.md";
 pub const summary_file = "summary.md";

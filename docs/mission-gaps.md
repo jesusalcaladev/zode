@@ -11,7 +11,8 @@ and the OpenCode plugin as of plugin commit `6fc066f`. Items are ordered by impa
   mtime, excluding `.mission`) plus the criteria signature. An unchanged suite
   is not re-run. The remaining difference: the cache is all-or-nothing per
   mission (any workspace change re-runs every check) and it does not model
-  environment or network dependencies.
+  environment or network dependencies — `.mission/NO_CACHE` is the documented
+  escape hatch for those suites.
 - ~~**Event-driven worker completion.**~~ **DONE.** `callWorkers` now runs one
   thread per worker with an explicit `.mission/prompts/task-N.done` /
   `.failed` marker on exit, instead of a `sh -c '… & …; wait'` aggregate. The
@@ -73,13 +74,16 @@ and the OpenCode plugin as of plugin commit `6fc066f`. Items are ordered by impa
   registered as its own Build module because a `.zig` file may belong to only
   one module. `exitgate`'s verification gate and the team/pipeline stage
   machines remain separate concerns by design.
-- Parity tests: the plugin has 80 tests including cache, facts, instructions and
-  scoped commits; zode's mission tests cover contracts and IO but not these.
+- ~~**Parity tests.**~~ **DONE in substance.** zode's mission suite now covers
+  the cache, facts, instruction composition, scoped hashing, scoped commits,
+  rollback, dual review, role models and the shared stopgate ordering — the
+  areas the plugin's 80 tests were covering. The raw count is smaller because
+  zode's helpers are smaller; coverage, not the number, is the target.
 
 ## Suggested order
 
 1. ~~Parallel + cached checks in `src/mission/io.zig`.~~ DONE.
 2. ~~Reuse `instructions.zig` in the runner and add a fact store.~~ DONE.
 3. ~~Automatic `git revert` for failed improvement cycles.~~ DONE.
-4. TUI status line and progress bar.
-5. Unify mission decisions with `exitgate`/`taskloop`.
+4. ~~TUI status line and progress bar.~~ DONE.
+5. ~~Unify mission decisions with `exitgate`/`taskloop`.~~ DONE via `stopgate`.

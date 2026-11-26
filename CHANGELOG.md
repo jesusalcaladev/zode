@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - route models by role (mission) [`eef98870`](https://github.com/jesusalcaladev/zode/commit/eef98870)
 - add progress and cost status dashboard (mission) [`f23b7e12`](https://github.com/jesusalcaladev/zode/commit/f23b7e12)
 - quiet mission footer segment (tui) [`5d6c9df7`](https://github.com/jesusalcaladev/zode/commit/5d6c9df7)
+- add NO_CACHE escape hatch for external-state checks (mission) [`49be23c8`](https://github.com/jesusalcaladev/zode/commit/49be23c8)
 
 ### Bug Fixes
 
@@ -84,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - remove the duplicated palette key dispatch (47.6) (tui) [`965d2cf2`](https://github.com/jesusalcaladev/zode/commit/965d2cf2)
 - integrate mission runtime into zode (core) [`7644158c`](https://github.com/jesusalcaladev/zode/commit/7644158c)
 - remove dead code and close one-shot leaks (mission) [`0c0ead9c`](https://github.com/jesusalcaladev/zode/commit/0c0ead9c)
-- share hard-stop decisions between both runners [`15bbb9a7`](https://github.com/jesusalcaladev/zode/commit/15bbb9a7)
+- share hard-stop decisions between both runners [`c86b81eb`](https://github.com/jesusalcaladev/zode/commit/c86b81eb)
 
 ### Performance
 

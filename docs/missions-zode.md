@@ -50,7 +50,9 @@ Criteria run in batches of up to three concurrent shells. Verdicts are cached in
 `.mission/checks-cache.json` under a workspace fingerprint (path + size + mtime,
 excluding `.mission`) plus the criteria signature, so an unchanged suite is not
 re-run. Any workspace change invalidates the whole suite; external state (clock,
-network, environment) is not modeled — delete the cache file to force a run.
+network, environment) is not modeled. For those checks, create
+`.mission/NO_CACHE` — the marker lives inside `.mission`, so it does not itself
+invalidate the fingerprint, and every suite runs fresh while it exists.
 
 ### Environment
 
@@ -147,6 +149,7 @@ restarts. The runner does not accept model-authored facts.
   journal.md        append-only memory
   evidence/*.txt    stdout, stderr, exit, expectation per check
   checks-cache.json fingerprint + cached check verdicts (safe to delete)
+  NO_CACHE          presence forces a fresh suite (outside the fingerprint)
   facts.json        structured harness-confirmed facts injected into prompts
   prompts/*.txt     worker prompts (when workers are enabled)
   prompts/*.done    per-worker completion marker, or *.failed on agent error
