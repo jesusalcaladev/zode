@@ -438,7 +438,12 @@ pub fn goalNote(
 /// project instructions at all. Which is the same bug class as the skills roots:
 /// the project lives in the root, and the root is what git already knows.
 pub fn systemPromptBase(gpa: std.mem.Allocator) []const u8 {
-    return prompt_system.systemPromptBase(gpa, io_global, environ_global, project_info.root());
+    // The cache is built once per process; fire only on that first build so a
+    // hook with `once: true` is not re-evaluated on every request.
+    const first_load = prompt_system.agents_md_cache == null;
+    const base = prompt_system.systemPromptBase(gpa, io_global, environ_global, project_info.root());
+    if (first_load) fireLifecycleHook(gpa, .InstructionsLoaded, "AGENTS.md hierarchy");
+    return base;
 }
 
 /// 50.8: `--append-system-prompt` goes through here; the text is stored for the
@@ -1151,7 +1156,7 @@ pub var hooks_set: hooks_mod.Set = .{};
 /// `once` flags in place, so calling this from a worker thread would race with
 /// a parallel tool's PreToolUse hook. Subagent events are therefore fired by
 /// `runTaskBatch` around its wave, never from `Runner.run`.
-fn fireLifecycleHook(gpa: std.mem.Allocator, event: hooks_mod.Event, subject: []const u8) void {
+pub fn fireLifecycleHook(gpa: std.mem.Allocator, event: hooks_mod.Event, subject: []const u8) void {
     const results = hooks_mod.fire(gpa, &hooks_set, .{
         .event = event,
         .subject = subject,

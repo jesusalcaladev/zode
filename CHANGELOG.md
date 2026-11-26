@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - regex transcript search and code-fence guides (tui) [`fcaa72a3`](https://github.com/jesusalcaladev/zode/commit/fcaa72a3)
 - collapsible reasoning and visible vim state (tui) [`6c36307f`](https://github.com/jesusalcaladev/zode/commit/6c36307f)
 - fire PreCompact and subagent lifecycle events (hooks) [`7fc97683`](https://github.com/jesusalcaladev/zode/commit/7fc97683)
+- fire the last four lifecycle events (hooks) [`51fccdf7`](https://github.com/jesusalcaladev/zode/commit/51fccdf7)
 
 ### Bug Fixes
 
@@ -63,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - finish moving config feedback out of the transcript (tui) [`18f38529`](https://github.com/jesusalcaladev/zode/commit/18f38529)
 - bound worker concurrency (mission) [`bff212ae`](https://github.com/jesusalcaladev/zode/commit/bff212ae)
 - make autocomplete replacement one undo step (editor) [`49e3de67`](https://github.com/jesusalcaladev/zode/commit/49e3de67)
-- rewind the live transcript on /undo yes (tui) [`cc8c1a84`](https://github.com/jesusalcaladev/zode/commit/cc8c1a84)
+- rewind the live transcript on /undo yes (tui) [`d936f6c8`](https://github.com/jesusalcaladev/zode/commit/d936f6c8)
 
 ### Chores
 

@@ -8234,6 +8234,11 @@ pub const Model = struct {
         n.frames = 240; // ~4s at 60fps
         self.notification_len += 1;
         self.requestRedraw();
+        // 54.1: Notification is the one hook event whose producer is the UI
+        // itself, so it is fired here. Only the first line is used as the
+        // subject: a hook should match on the headline, not a wrapped body.
+        const subject = if (std.mem.indexOfScalar(u8, text, '\n')) |nl| text[0..nl] else text;
+        agent.fireLifecycleHook(self.allocator, .Notification, subject[0..@min(subject.len, 160)]);
     }
 
     pub fn copySelectedText(self: *Model, ctx: *vxfw.EventContext) !void {

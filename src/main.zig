@@ -426,6 +426,9 @@ fn runTui(init: std.process.Init) !u8 {
 
     var model = tui.Model.init(gpa);
     defer model.deinit();
+    // Registered AFTER model.deinit so it runs BEFORE it: the hook may inject
+    // context into a notification queue that is still alive at this point.
+    defer agent.fireLifecycleHook(gpa, .SessionEnd, "tui");
     model.environ = init.environ_map;
     model.nerd_icons = lang_icons.nerdIconsEnabled(init.environ_map);
     agent.status_model_target = &model;

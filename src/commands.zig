@@ -364,6 +364,7 @@ pub fn cmdHooks(m: *tui.Model, arg: ?[]const u8) void {
         const sub = std.mem.trim(u8, a, " \t\r\n");
         if (std.ascii.eqlIgnoreCase(sub, "reload")) {
             agent.loadHooks();
+            agent.fireLifecycleHook(gpa, .ConfigChange, "hooks.json");
             m.pushFeedback("hooks: reloaded from disk");
             return;
         } else if (sub.len > 0) {
