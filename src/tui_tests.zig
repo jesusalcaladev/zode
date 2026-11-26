@@ -1887,6 +1887,30 @@ test "reasoning: a thinking block starts collapsed and alt+t reveals its body" {
     try std.testing.expect(found_hidden);
 }
 
+test "in-TUI file editor: the modal shows the path and the file body" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const path = "/tmp/zode-file-editor-draw.txt";
+    m.file_ed_path = try m.allocator.dupe(u8, path);
+    try m.file_ed.load("first line\nsecond line");
+    m.file_ed_active = true;
+
+    const s = try drawTest(&m, arena_state.allocator(), 100, 24);
+    var buf: [256]u8 = undefined;
+    var found_title = false;
+    var found_body = false;
+    var r: u16 = 0;
+    while (r < s.size.height) : (r += 1) {
+        const row = rowText(s, r, &buf);
+        if (std.mem.indexOf(u8, row, "FILE") != null) found_title = true;
+        if (std.mem.indexOf(u8, row, "second line") != null) found_body = true;
+    }
+    try std.testing.expect(found_title);
+    try std.testing.expect(found_body);
+}
+
 test "footer: vim mode and register are rendered as one short dim segment" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();

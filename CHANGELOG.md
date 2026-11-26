@@ -49,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - collapsible reasoning and visible vim state (tui) [`6c36307f`](https://github.com/jesusalcaladev/zode/commit/6c36307f)
 - fire PreCompact and subagent lifecycle events (hooks) [`7fc97683`](https://github.com/jesusalcaladev/zode/commit/7fc97683)
 - fire the last four lifecycle events (hooks) [`9c40372a`](https://github.com/jesusalcaladev/zode/commit/9c40372a)
+- open files in an in-TUI editor (tui) [`1dbe3f62`](https://github.com/jesusalcaladev/zode/commit/1dbe3f62)
 
 ### Bug Fixes
 
@@ -111,7 +112,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - wait for asserted screen state instead of fixed sleeps (47.5) (pty) [`d8a5eb1c`](https://github.com/jesusalcaladev/zode/commit/d8a5eb1c)
 - cover the last untested pure module (47.7) (envutil) [`c4425861`](https://github.com/jesusalcaladev/zode/commit/c4425861)
 - add parity cases for supervisor decisions (mission) [`9dfef4d9`](https://github.com/jesusalcaladev/zode/commit/9dfef4d9)
-- add a real headless tool-loop smoke (hooks) [`2091f880`](https://github.com/jesusalcaladev/zode/commit/2091f880)
+- add a real headless tool-loop smoke (hooks) [`423e774a`](https://github.com/jesusalcaladev/zode/commit/423e774a)
 
 ### Styles
 

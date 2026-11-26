@@ -532,6 +532,10 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
     if (self.settings_active) {
         tui.drawSettingsScreen(&p, self, width, height);
     }
+    // 51.9: the in-TUI file editor is topmost. It does not suspend the tty.
+    if (self.file_ed_active) {
+        tui.drawFileEditor(&p, width, height, self);
+    }
 
     return surface;
 }

@@ -180,6 +180,12 @@ Edit a file: `old_string` -> `new_string`.
 
 Show what the model has read and what it has changed in this session.
 
+### `/file open`
+
+Open the focused changed file in a small in-TUI editor: `Ctrl+S` saves it back,
+`Esc` closes. No external `$EDITOR` is spawned and the terminal is never
+suspended. Files above 4 MB are refused rather than partially loaded.
+
 ### `/glob <pattern>`
 
 Find files by pattern.

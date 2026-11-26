@@ -1486,6 +1486,12 @@ pub const Model = struct {
     /// Own input: `vxfw.TextField` is single-line and has no history, so the
     /// prompt is edited with `editor.Editor`.
     ed: ed.Editor,
+    /// 51.9: an in-TUI file editor. No external process and no terminal
+    /// suspend — that path needed SIGCONT/re-enter and was a crash risk.
+    file_ed: ed.Editor,
+    file_ed_active: bool = false,
+    file_ed_path: ?[]const u8 = null,
+    file_ed_dirty: bool = false,
 
     /// User keybindings (Phase 13.3), owned by the config arena. Resolved
     /// before the composer sees a key, so a binding can call any slash command.
@@ -2657,6 +2663,7 @@ pub const Model = struct {
             .pal = palette.Palette.init(allocator),
             .pal_inited = true,
             .ed = ed.Editor.init(allocator),
+            .file_ed = ed.Editor.init(allocator),
             .paras = .empty,
             .pending = .empty,
             .seg_cache = .empty,
@@ -2727,6 +2734,8 @@ pub const Model = struct {
         self.destroyPalette();
         if (self.pending_items) |items| palette.freeItems(self.allocator, items);
         self.ed.deinit();
+        self.file_ed.deinit();
+        if (self.file_ed_path) |p| self.allocator.free(p);
         if (self.stashed_text) |t| self.allocator.free(t);
         self.stashed_images.clear(self.allocator);
         for (self.extra_dirs.items) |d| self.allocator.free(d);
@@ -3327,12 +3336,18 @@ pub const Model = struct {
     /// keys (Ctrl+C especially) do not quit the app while a picker is open.
     pub fn anyModalActive(self: *Model) bool {
         return self.pal.active or self.pickerActive() or self.transcript_view_active or
-            self.search_bar_active or self.diff_viewer_active or self.settings_active;
+            self.search_bar_active or self.diff_viewer_active or self.settings_active or
+            self.file_ed_active;
     }
 
     /// Close the topmost modal. Returns false when there was none. The order
     /// is the reverse of the key handler's modal checks.
     pub fn closeTopModal(self: *Model, ctx: *vxfw.EventContext) !bool {
+        if (self.file_ed_active) {
+            self.closeFileEditor();
+            ctx.redraw = true;
+            return true;
+        }
         if (self.pal.active) {
             self.closePalette();
             ctx.redraw = true;
@@ -3375,6 +3390,117 @@ pub const Model = struct {
 
     pub fn settingsClose(self: *Model) void {
         self.settings_active = false;
+    }
+
+    /// 51.9: opens a file in an in-TUI editor. Nothing is spawned, no tty is
+    /// suspended: the previous implementation copied the path and told the
+    /// user to run `$EDITOR` outside, which was safe but not "open".
+    pub fn openFileEditor(self: *Model, path: []const u8) bool {
+        if (!self.io_ready) {
+            self.pushInfo("file: the in-TUI editor needs a live terminal IO");
+            return false;
+        }
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(4 * 1024 * 1024)) catch {
+            self.pushInfoFmt("file: could not read {s}", .{path});
+            return false;
+        };
+        defer self.allocator.free(data);
+        self.file_ed.load(data) catch {
+            self.pushInfo("file: too large for the in-TUI editor (4 MB cap)");
+            return false;
+        };
+        if (self.file_ed_path) |p| self.allocator.free(p);
+        self.file_ed_path = self.allocator.dupe(u8, path) catch null;
+        if (self.file_ed_path == null) {
+            self.file_ed.clear();
+            return false;
+        }
+        self.file_ed_active = true;
+        self.file_ed_dirty = false;
+        self.requestRedraw();
+        return true;
+    }
+
+    pub fn closeFileEditor(self: *Model) void {
+        self.file_ed_active = false;
+        self.file_ed_dirty = false;
+        self.requestRedraw();
+    }
+
+    pub fn fileEditorSave(self: *Model) void {
+        const path = self.file_ed_path orelse return;
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = self.file_ed.text() }) catch {
+            self.pushInfoFmt("file: could not save {s}", .{path});
+            return;
+        };
+        self.file_ed_dirty = false;
+        self.pushInfoFmt("file: saved {s}", .{path});
+    }
+
+    /// The file editor captures every key while open, like the picker.
+    /// Deliberately small: editing, navigation, Ctrl+S and Esc — no vim or
+    /// paste integration, so it cannot swallow a composition in progress.
+    pub fn fileEditorHandleKey(self: *Model, key: vaxis.Key) bool {
+        if (!self.file_ed_active) return false;
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.closeFileEditor();
+            return true;
+        }
+        if (key.matches('s', .{ .ctrl = true })) {
+            self.fileEditorSave();
+            self.requestRedraw();
+            return true;
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            self.file_ed.deleteBefore();
+            self.file_ed_dirty = true;
+            self.requestRedraw();
+            return true;
+        }
+        if (key.matches(vaxis.Key.delete, .{})) {
+            self.file_ed.deleteAfter();
+            self.file_ed_dirty = true;
+            self.requestRedraw();
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{})) {
+            self.file_ed.moveUp();
+            self.requestRedraw();
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{})) {
+            self.file_ed.moveDown();
+            self.requestRedraw();
+            return true;
+        }
+        if (key.matches(vaxis.Key.home, .{})) {
+            self.file_ed.moveHome();
+            self.requestRedraw();
+            return true;
+        }
+        if (key.matches(vaxis.Key.end, .{})) {
+            self.file_ed.moveEnd();
+            self.requestRedraw();
+            return true;
+        }
+        if (key.matches(vaxis.Key.left, .{})) {
+            self.file_ed.moveLeft();
+            self.requestRedraw();
+            return true;
+        }
+        if (key.matches(vaxis.Key.right, .{})) {
+            self.file_ed.moveRight();
+            self.requestRedraw();
+            return true;
+        }
+        if (key.codepoint > 0 and !key.mods.ctrl and !key.mods.alt) {
+            var buf: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(key.codepoint, &buf) catch return true;
+            self.file_ed.insert(buf[0..n]) catch {};
+            self.file_ed_dirty = true;
+            self.requestRedraw();
+        }
+        return true;
     }
 
     /// The Settings screen owns every key while it is open, like the picker.
@@ -11364,6 +11490,49 @@ fn graphemeStep(ctx: *const anyopaque, text: []const u8, i: usize) ed.Step {
 /// the throughput, then the context gauge, and the model last), because a
 /// half-drawn face is a drawing bug and a missing model is a command away
 /// (`/model`).
+/// A compact, borderless file editor modal. No external process, no terminal
+/// suspend: the file is loaded into a fixed-capacity buffer and written back
+/// on Ctrl+S. It is deliberately plain so it cannot be mistaken for the
+/// composer or for a diff.
+pub fn drawFileEditor(p: *Painter, width: u16, height: u16, self: *const Model) void {
+    if (!self.file_ed_active) return;
+    const bw: u16 = @min(width -| 8, 100);
+    const bh: u16 = @min(height -| 6, 22);
+    if (bw < 20 or bh < 6) return;
+    const x0: u16 = (width - bw) / 2;
+    const y0: u16 = (height - bh) / 2;
+
+    var row: u16 = 0;
+    while (row < bh) : (row += 1) {
+        p.fillRange(x0, x0 + bw, y0 + row, " ", theme.code_bg);
+    }
+    const title: []const u8 = if (self.file_ed_dirty) "FILE · UNSAVED" else "FILE";
+    _ = p.putText(x0 + 1, y0, title, if (self.file_ed_dirty) theme.warn else theme.code_lang);
+    if (self.file_ed_path) |path| {
+        _ = p.putClipped(x0 + 18, y0, path, bw -| 19, theme.ink);
+    }
+    _ = p.putText(x0 + 1, y0 + 1, "Ctrl+S save · Esc close", theme.hint);
+
+    const text = self.file_ed.text();
+    const cursor_line = self.file_ed.cursorLine();
+    const visible_lines: usize = bh - 3;
+    const first_line: usize = if (cursor_line > visible_lines / 2) cursor_line - visible_lines / 2 else 0;
+    var line_no: usize = 0;
+    var shown: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line_no < first_line) {
+            line_no += 1;
+            continue;
+        }
+        if (shown >= visible_lines) break;
+        const y = y0 + 3 + @as(u16, @intCast(shown));
+        _ = p.putClipped(x0 + 1, y, line, bw -| 2, theme.code_text);
+        shown += 1;
+        line_no += 1;
+    }
+}
+
 pub fn drawStateFooter(
     p: *Painter,
     row: u16,

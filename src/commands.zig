@@ -3257,9 +3257,10 @@ pub fn cmdFile(m: *tui.Model, arg: ?[]const u8) void {
         return;
     }
     if (std.mem.eql(u8, a, "open") or std.mem.eql(u8, a, "edit")) {
-        m.setCopyPending(path);
-        m.pushInfoFmt("file: {s}", .{path});
-        m.pushInfo("open: path copied to clipboard. Run $VISUAL/$EDITOR outside the TUI (in-TUI spawn is deferred).");
+        // 51.9: no external editor and no terminal suspend. The file opens in
+        // a small in-TUI buffer; Ctrl+S writes it back, Esc closes it.
+        if (!m.openFileEditor(path)) return;
+        m.pushInfoFmt("file: opened {s} in the TUI editor (Ctrl+S save, Esc close)", .{path});
         return;
     }
     if (a.len > 0) {
@@ -4666,6 +4667,31 @@ test "settings: a verify report feeds the three-way pill" {
     try std.testing.expectEqual(@as(usize, 1), m.verify_counts.verified);
     try std.testing.expectEqual(@as(usize, 1), m.verify_counts.refuted);
     try std.testing.expectEqual(@as(usize, 3), m.verify_counter.target);
+}
+
+test "/file open: the in-TUI editor loads and saves the file without a subprocess" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+    const path = "/tmp/zode-file-editor-test.txt";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "hello" });
+
+    var m = tui.Model.init(a);
+    defer m.deinit();
+    m.attachIo(io);
+    try std.testing.expect(m.openFileEditor(path));
+    try std.testing.expect(m.file_ed_active);
+    try std.testing.expectEqualStrings("hello", m.file_ed.text());
+
+    m.file_ed.moveToEnd();
+    try m.file_ed.insert("!");
+    m.fileEditorSave();
+    const saved = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1024));
+    try std.testing.expectEqualStrings("hello!", saved);
+    m.closeFileEditor();
+    try std.testing.expect(!m.file_ed_active);
 }
 
 test "undo: a rewound session rebuilds the live transcript, not only the disk" {

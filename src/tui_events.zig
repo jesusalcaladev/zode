@@ -100,6 +100,17 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                     return;
                 }
             }
+            // The in-TUI file editor owns every key while open (51.9). It is
+            // checked before global shortcuts so Ctrl+S saves the file instead
+            // of being swallowed by a picker or a composer binding.
+            if (self.file_ed_active) {
+                if (self.fileEditorHandleKey(key)) {
+                    self.flushCopyPending(ctx);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
             // Ctrl+, — the Settings screen (internal config). Distinct from
             // Ctrl+P/T so it cannot be mistaken for the model picker again.
             if (key.matches(',', .{ .ctrl = true })) {

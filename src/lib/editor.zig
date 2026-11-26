@@ -181,6 +181,19 @@ pub const Editor = struct {
         self.recountLines();
     }
 
+    /// Replaces the whole buffer with `s`, leaving the caret at the start.
+    /// Used by the in-TUI file editor: loading a file must not append to the
+    /// previous draft, and a too-large file must not half-load.
+    pub fn load(self: *Editor, s: []const u8) !void {
+        self.clear();
+        try self.insert(s);
+        self.cursor = 0;
+        for (self.undo_stack.items) |e| self.gpa.free(e.text);
+        self.undo_stack.clearRetainingCapacity();
+        for (self.redo_stack.items) |e| self.gpa.free(e.text);
+        self.redo_stack.clearRetainingCapacity();
+    }
+
     pub fn insertChar(self: *Editor, c: u8) !void {
         var one = [_]u8{c};
         try self.insert(&one);
@@ -1088,6 +1101,17 @@ test "rowsInWindow returns the LAST rows when there are more than fit" {
     try std.testing.expectEqual(@as(usize, 2), w.len);
     // The window is the tail, which is where the cursor is.
     try std.testing.expectEqualStrings(w[w.len - 1].bytes, w[1].bytes);
+}
+
+test "load replaces the buffer and starts with no undo history" {
+    var e = Editor.init(std.testing.allocator);
+    defer e.deinit();
+    try e.insert("old draft");
+    try e.load("line one\nline two");
+    try std.testing.expectEqualStrings("line one\nline two", e.text());
+    try std.testing.expectEqual(@as(usize, 0), e.cursor);
+    try std.testing.expectEqual(@as(usize, 0), e.undo_stack.items.len);
+    try std.testing.expectEqual(@as(usize, 0), e.redo_stack.items.len);
 }
 
 test "undo/redo: a range replacement is one step (autocomplete case)" {
