@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - quiet mission footer segment (tui) [`5d6c9df7`](https://github.com/jesusalcaladev/zode/commit/5d6c9df7)
 - add NO_CACHE escape hatch for external-state checks (mission) [`bd193b2d`](https://github.com/jesusalcaladev/zode/commit/bd193b2d)
 - accept verified-shaped fact proposals from the agent (mission) [`4e3531d7`](https://github.com/jesusalcaladev/zode/commit/4e3531d7)
-- regex transcript search and code-fence guides (tui) [`4e991e0b`](https://github.com/jesusalcaladev/zode/commit/4e991e0b)
+- regex transcript search and code-fence guides (tui) [`fcaa72a3`](https://github.com/jesusalcaladev/zode/commit/fcaa72a3)
+- collapsible reasoning and visible vim state (tui) [`198e0224`](https://github.com/jesusalcaladev/zode/commit/198e0224)
 
 ### Bug Fixes
 

@@ -313,6 +313,7 @@ Quit the application.
 | `?` | Shortcut list (empty input) |
 | `F2/F3/F4/F5` | Custom bindings: help / context / sessions / tasks |
 | `Ctrl+R` | Expand/collapse last tool result (or refresh the model palette) |
+| `Alt+T` | Expand/collapse thinking blocks in the transcript (collapsed by default) |
 | `Ctrl+O` | Transcript / history |
 | `Ctrl+F` | Search the transcript; prefix the query with `/` for a regex (`/foo|bar`) |
 | `↑` / `↓` | Navigate picker rows |

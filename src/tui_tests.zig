@@ -1851,6 +1851,61 @@ test "footer: cost is shown when published and dropped first on a narrow row" {
     try std.testing.expect(std.mem.indexOf(u8, narrow_row, "\u{fffd}") == null);
 }
 
+test "reasoning: a thinking block starts collapsed and alt+t reveals its body" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+
+    m.pushReasoning("◇ source line\nHIDDENBODY-42");
+    m.drainPending();
+    try std.testing.expectEqual(@as(usize, 1), m.paras.items.len);
+    try std.testing.expect(m.paras.items[0].reasoning);
+    try std.testing.expect(!m.paras.items[0].reasoning_expanded);
+    try std.testing.expect(m.toggleReasoning());
+    try std.testing.expect(m.paras.items[0].reasoning_expanded);
+    try std.testing.expect(m.toggleReasoning());
+
+    var buf: [256]u8 = undefined;
+    const collapsed = try drawTest(&m, arena_state.allocator(), 80, 16);
+    var found_hidden = false;
+    var r: u16 = 0;
+    while (r < collapsed.size.height) : (r += 1) {
+        const row = rowText(collapsed, r, &buf);
+        if (std.mem.indexOf(u8, row, "HIDDENBODY-42") != null) found_hidden = true;
+    }
+    try std.testing.expect(!found_hidden);
+
+    _ = m.toggleReasoning();
+    const expanded = try drawTest(&m, arena_state.allocator(), 80, 16);
+    found_hidden = false;
+    r = 0;
+    while (r < expanded.size.height) : (r += 1) {
+        const row = rowText(expanded, r, &buf);
+        if (std.mem.indexOf(u8, row, "HIDDENBODY-42") != null) found_hidden = true;
+    }
+    try std.testing.expect(found_hidden);
+}
+
+test "footer: vim mode and register are rendered as one short dim segment" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    var buf: [64]u8 = undefined;
+
+    try std.testing.expect(m.vimStatus(&buf) == null);
+    m.vim_mode = true;
+    try std.testing.expectEqualStrings("vim i", m.vimStatus(&buf).?);
+    m.vim_normal = true;
+    try std.testing.expectEqualStrings("vim N", m.vimStatus(&buf).?);
+    m.vim_visual = true;
+    try std.testing.expectEqualStrings("vim V", m.vimStatus(&buf).?);
+
+    const text = "hello\nworld";
+    @memcpy(m.vim_register[0..text.len], text);
+    m.vim_register_len = text.len;
+    try std.testing.expectEqualStrings("vim V @hello world", m.vimStatus(&buf).?);
+}
+
 test "footer: the optional mission line is dim and drops before the model" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

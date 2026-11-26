@@ -1302,7 +1302,14 @@ fn buildLinesBase(
     // sequence (parameters and tail), which the painter's control-byte
     // backstop cannot do.
     const clean_text = ansi.strip(pa, para.text) catch para.text;
-    const blocks = try md.parseLang(pa, para.kind, clean_text, para.base, para.mood, para.lang, .{
+    // Collapsed reasoning paints ONLY its header line. The paragraph still
+    // holds the full text, so alt+t can reveal it without touching the session
+    // or re-parsing a compressed cold paragraph.
+    const shown_text = if (para.reasoning and !para.reasoning_expanded)
+        clean_text[0 .. std.mem.indexOfScalar(u8, clean_text, '\n') orelse clean_text.len]
+    else
+        clean_text;
+    const blocks = try md.parseLang(pa, para.kind, shown_text, para.base, para.mood, para.lang, .{
         .word_diff = para.word_diff,
         .width = width -| 2,
     });
@@ -1685,6 +1692,9 @@ pub const Model = struct {
     /// the draw reads it: an atomic keeps the footer honest without letting the
     /// worker touch the paragraph tree (which would be a use-after-free).
     reason_live_chars: std.atomic.Value(usize) = .init(0),
+    /// Reasoning paragraphs start COLLAPSED: the header says a model thought,
+    /// the body is one alt+t away. Long reasoning used to bury the answer.
+    reasoning_expanded: bool = false,
 
     /// First history line on screen, in ABSOLUTE terms. This is an ANCHOR, not a
     /// distance from the bottom: that is the difference between being able to
@@ -2293,6 +2303,11 @@ pub const Model = struct {
 
     pub const Para = struct {
         kind: md.Kind,
+        /// Structured marker for a reasoning block. Never inferred from the
+        /// rendered `◇ Thinking` string (that would be parsing UI text).
+        reasoning: bool = false,
+        /// Whether the FULL reasoning text is shown for this paragraph.
+        reasoning_expanded: bool = false,
         /// The text, or the COMPRESSED text when the paragraph is cold.
         ///
         /// See `is_cold`. A cold paragraph keeps its bytes as `zjsonl`
@@ -2521,6 +2536,7 @@ pub const Model = struct {
 
     const Pending = struct {
         kind: md.Kind,
+        reasoning: bool = false,
         text: []const u8, // gpa copy, freed on drain
         /// Base style imposed on the paragraph. `null` = whatever `kind` says.
         base: ?md.Style = null,
@@ -5596,7 +5612,39 @@ pub const Model = struct {
             text[0..shown],
             if (text.len > shown) "…" else "",
         }) catch return;
-        self.pushKind(.info, block);
+        const copy = self.allocator.dupe(u8, block) catch return;
+        self.lock();
+        defer self.unlock();
+        self.pending.append(self.allocator, .{
+            .kind = .info,
+            .text = copy,
+            .reasoning = true,
+        }) catch {
+            self.allocator.free(copy);
+            return;
+        };
+        self.dirty = true;
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    /// alt+t: expand or collapse every reasoning block at once. The full text
+    /// is never deleted — only its painted form is hidden while collapsed.
+    pub fn toggleReasoning(self: *Model) bool {
+        var any = false;
+        self.lock();
+        const next = !self.reasoning_expanded;
+        self.reasoning_expanded = next;
+        for (self.paras.items) |*p| {
+            if (!p.reasoning) continue;
+            p.reasoning_expanded = next;
+            any = true;
+        }
+        for (self.pending.items) |*p| {
+            if (p.reasoning) any = true;
+        }
+        self.unlock();
+        if (any) self.clearSegCache();
+        return any;
     }
 
     pub fn pushInfo(self: *Model, text: []const u8) void {
@@ -5845,6 +5893,32 @@ pub const Model = struct {
         self.io = io;
         self.io_ready = true;
         self.refreshMotionEnv();
+    }
+
+    /// Compact vim state for the footer: mode plus the unnamed register when
+    /// it holds something. The register is sanitized to one line and capped —
+    /// a pasted paragraph must not take over the status row.
+    pub fn vimStatus(self: *const Model, buf: []u8) ?[]const u8 {
+        if (!self.vim_mode) return null;
+        const mode: []const u8 = if (self.vim_visual) "V" else if (self.vim_normal) "N" else "i";
+        const reg = self.vim_register[0..self.vim_register_len];
+        if (reg.len == 0) return std.mem.print(buf, "vim {s}", .{mode}) catch null;
+        var clean: [24]u8 = undefined;
+        var n: usize = 0;
+        for (reg) |c| {
+            if (c == '\n' or c == '\r' or c == '\t') {
+                if (n < clean.len) {
+                    clean[n] = ' ';
+                    n += 1;
+                }
+            } else if (n < clean.len) {
+                clean[n] = c;
+                n += 1;
+            }
+        }
+        const shown = std.mem.trim(u8, clean[0..n], " ");
+        if (shown.len == 0) return std.mem.print(buf, "vim {s}", .{mode}) catch null;
+        return std.mem.print(buf, "vim {s} @{s}", .{ mode, shown }) catch null;
     }
 
     /// Reads `ZODE_MISSION_WORKSPACE` once and caches one dim footer line.
@@ -7643,6 +7717,8 @@ pub const Model = struct {
         for (self.pending.items) |p| {
             self.paras.append(self.allocator, .{
                 .kind = p.kind,
+                .reasoning = p.reasoning,
+                .reasoning_expanded = self.reasoning_expanded,
                 .text = p.text,
                 .base = p.base,
                 .mood = p.mood,
@@ -11558,6 +11634,22 @@ pub fn drawStateFooter(
             }
             right[rn] = .{ .text = label, .style = theme.brand };
             latest_idx = rn;
+            rn += 1;
+        }
+    }
+
+    // Vim's unnamed register and current mode, when vim keys are enabled.
+    // It shares the dim role and is dropped on narrow rows like the mission
+    // segment; neither one is worth pushing the model off screen.
+    var vim_buf: [48]u8 = undefined;
+    if (self.vimStatus(&vim_buf)) |v| {
+        const owned = arena.dupe(u8, v) catch "";
+        if (owned.len > 0 and rn + 2 < right.len) {
+            if (rn > 0) {
+                right[rn] = .{ .text = " · ", .style = theme.line };
+                rn += 1;
+            }
+            right[rn] = .{ .text = owned, .style = theme.line };
             rn += 1;
         }
     }

@@ -204,6 +204,12 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 }
                 return;
             }
+            // alt+t: expand/collapse reasoning blocks. Off by default so a
+            // long thinking trace never buries the answer on first paint.
+            if (key.matches('t', .{ .alt = true }) and !self.pal.active) {
+                if (self.toggleReasoning()) ctx.redraw = true;
+                return;
+            }
             // Phase 3: hunk navigation on the last diff (alt+] next, alt+[ prev).
             if (key.matches(']', .{ .alt = true })) {
                 if (self.navigateLastDiffHunk(1)) ctx.redraw = true;
