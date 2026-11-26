@@ -73,6 +73,7 @@ pub const structured_run = @import("lib/structured_run.zig");
 pub const mission = @import("mission");
 pub const mission_io = @import("mission").io;
 pub const missionstatus = @import("lib/missionstatus.zig");
+pub const codeguides = @import("lib/codeguides.zig");
 pub const diag = @import("lib/diag.zig");
 pub const textcap = @import("lib/textcap.zig");
 pub const resultcap = @import("lib/resultcap.zig");

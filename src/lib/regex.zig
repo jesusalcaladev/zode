@@ -4,6 +4,11 @@ const std = @import("std");
 /// code: literals, `.`, `^`, `$`, classes `[a-z_]` `[^...]`, escapes
 /// `\w \d \s \.`, etc., quantifiers `* + ?`, and top-level alternation `a|b`.
 /// No groups with quantifiers (rare in code searches).
+pub const Match = struct {
+    start: usize,
+    end: usize,
+};
+
 pub const Regex = struct {
     pattern: []const u8,
 
@@ -13,21 +18,33 @@ pub const Regex = struct {
 
     /// Does it match at any position of `text`?
     pub fn matches(self: *const Regex, text: []const u8) bool {
-        // Top-level alternation: try each branch.
-        var it = BranchIter{ .p = self.pattern };
-        while (it.next()) |branch| {
-            if (matchBranch(branch, text)) return true;
-        }
-        return false;
+        return self.findFrom(text, 0) != null;
     }
 
-    /// Returns the end of the match that starts at `start` (for future use).
-    fn matchBranch(branch: []const u8, text: []const u8) bool {
-        var start: usize = 0;
+    /// First match with BYTE offsets, for UI highlighting. An empty pattern
+    /// matches nothing: highlighting every cell of a line is not useful.
+    pub fn find(self: *const Regex, text: []const u8) ?Match {
+        return self.findFrom(text, 0);
+    }
+
+    /// Like `find`, but starts searching at `from` (used to walk all hits in a
+    /// line without re-scanning from the beginning).
+    pub fn findFrom(self: *const Regex, text: []const u8, from: usize) ?Match {
+        if (self.pattern.len == 0 or from > text.len) return null;
+        var start = from;
         while (start <= text.len) : (start += 1) {
-            if (matchSeq(branch, 0, text, start) != null) return true;
+            var it = BranchIter{ .p = self.pattern };
+            while (it.next()) |branch| {
+                if (matchBranch(branch, text, start)) |end| {
+                    return .{ .start = start, .end = end };
+                }
+            }
         }
-        return false;
+        return null;
+    }
+
+    fn matchBranch(branch: []const u8, text: []const u8, start: usize) ?usize {
+        return matchSeq(branch, 0, text, start);
     }
 };
 
@@ -252,6 +269,22 @@ test "classes and quantifiers" {
     try std.testing.expect(!Regex.compile("a\\.c").matches("abc"));
     try std.testing.expect(Regex.compile("colou?r").matches("color"));
     try std.testing.expect(Regex.compile("colou?r").matches("colour"));
+}
+
+test "find returns byte offsets for every hit, including alternation" {
+    const re = Regex.compile("user_[0-9]+");
+    const text = "x user_42 y user_7";
+    const first = re.find(text).?;
+    try std.testing.expectEqualStrings("user_42", text[first.start..first.end]);
+    const second = re.findFrom(text, first.end).?;
+    try std.testing.expectEqualStrings("user_7", text[second.start..second.end]);
+    try std.testing.expect(re.findFrom(text, second.end) == null);
+
+    const alt = Regex.compile("cat|dog");
+    const hit = alt.find("xx dogyy").?;
+    try std.testing.expectEqual(@as(usize, 3), hit.start);
+    try std.testing.expectEqual(@as(usize, 6), hit.end);
+    try std.testing.expect(Regex.compile("").find("anything") == null);
 }
 
 test "alternation" {

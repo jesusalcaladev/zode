@@ -2999,6 +2999,28 @@ test "status: the token counters moved to /context and are off the row" {
     }
 }
 
+test "code fence: matching brackets share a colour, nesting changes it" {
+    const text = "f(a[0])";
+    const open = tui.bracketStyle(.{}, '(', text, 1);
+    const close = tui.bracketStyle(.{}, ')', text, 6);
+    try std.testing.expectEqual(open.fg, close.fg);
+    const inner = tui.bracketStyle(.{}, '[', text, 3);
+    try std.testing.expect(!std.meta.eql(inner.fg, open.fg));
+}
+
+test "search: a /regex query marks every branch with byte offsets" {
+    const text = "x foo_12 y bar_7 z";
+    try std.testing.expect(tui.searchIsRegex("/foo_[0-9]+|bar_[0-9]+"));
+    try std.testing.expect(!tui.searchIsRegex("foo"));
+    try std.testing.expect(tui.searchTextMatches(text, "/bar_[0-9]+"));
+    try std.testing.expect(!tui.searchTextMatches(text, "/nope_[0-9]+"));
+    try std.testing.expect(tui.searchHitAt(text, 2, "/foo_[0-9]+|bar_[0-9]+"));
+    try std.testing.expect(tui.searchHitAt(text, 12, "/foo_[0-9]+|bar_[0-9]+"));
+    try std.testing.expect(!tui.searchHitAt(text, 9, "/foo_[0-9]+|bar_[0-9]+"));
+    // Literal mode still works and is case-insensitive.
+    try std.testing.expect(tui.searchHitAt(text, 2, "FOO"));
+}
+
 test "search: Ctrl+F matches are marked on the transcript cells" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

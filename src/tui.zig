@@ -1,5 +1,7 @@
 const std = @import("std");
 const textcase = @import("lib/textcase.zig");
+const regex = @import("lib/regex.zig");
+const codeguides = @import("lib/codeguides.zig");
 const builtin = @import("builtin");
 
 const vaxis = @import("vaxis");
@@ -896,6 +898,8 @@ fn buildCodeBlockLines(
         // Display COLUMNS, not grapheme count: one full-width glyph used to
         // shift the whole right border a column left of where it is painted.
         var ln_w: usize = 0;
+        var leading_ws = true;
+        var indent_col: usize = 0;
         for (src) |seg| {
             const spans = detectLinks(pa, seg.text);
             var it = vaxis.unicode.graphemeIterator(seg.text);
@@ -904,10 +908,25 @@ fn buildCodeBlockLines(
                 const off: usize = @intFromPtr(b.ptr) - @intFromPtr(seg.text.ptr);
                 const uri = linkForOffset(spans, off);
                 const gw = theme.graphemeWidth(ctx, b);
+                var cell_text = b;
+                // Brackets share a colour with their pair; only the fg changes.
+                var cell_style = bracketStyle(seg.style, if (b.len > 0) b[0] else 0, seg.text, off);
+                // A guide every two columns of leading whitespace. The space
+                // is still there in the source paragraph; only its painted
+                // glyph changes, so copying the message keeps the real code.
+                if (leading_ws and b.len == 1 and (b[0] == ' ' or b[0] == '\t')) {
+                    if (b[0] == ' ' and indent_col > 0 and indent_col % 2 == 0) {
+                        cell_text = "│";
+                        cell_style = theme.code_gutter;
+                    }
+                    indent_col += gw;
+                } else {
+                    leading_ws = false;
+                }
                 try cells.append(pa, .{
-                    .text = b,
+                    .text = cell_text,
                     .w = gw,
-                    .style = seg.style,
+                    .style = cell_style,
                     .link = if (uri) |u| .{ .uri = u } else .{},
                     // Ctrl+F must find symbols where they actually live: code
                     // fences and diffs are the most searched text in a session.
@@ -1198,12 +1217,45 @@ fn buildDiffBlockLines(
 }
 
 /// `buildLines` with an imposed base style (see `md.parseBase`).
-/// Is the byte at `off` inside a case-insensitive occurrence of `query`?
+/// A query beginning with `/` is a regex; `/foo|bar` matches either branch.
+/// The leading slash is the mode marker, not part of the pattern.
+pub fn searchIsRegex(q: []const u8) bool {
+    return q.len > 1 and q[0] == '/';
+}
+
+pub fn searchPattern(q: []const u8) []const u8 {
+    return if (searchIsRegex(q)) q[1..] else q;
+}
+
+/// Does a paragraph match the active query? Used by Enter (navigation); the
+/// cell-level marks below use the same rule, so navigation and highlighting
+/// can never disagree.
+pub fn searchTextMatches(text: []const u8, query: []const u8) bool {
+    if (query.len == 0) return false;
+    if (searchIsRegex(query)) {
+        const re = regex.Regex.compile(searchPattern(query));
+        return re.find(text) != null;
+    }
+    return textcase.indexOf(text, query) != null;
+}
+
+/// Is the byte at `off` inside an occurrence of `query`?
 /// Layout-time only (never called from the paint loop); byte offsets into the
 /// segment are enough because cell graphemes keep their source offsets.
-fn searchHitAt(text: []const u8, off: usize, query: ?[]const u8) bool {
+pub fn searchHitAt(text: []const u8, off: usize, query: ?[]const u8) bool {
     const q = query orelse return false;
     if (q.len == 0) return false;
+    if (searchIsRegex(q)) {
+        const re = regex.Regex.compile(searchPattern(q));
+        var pos: usize = 0;
+        while (re.findFrom(text, pos)) |hit| {
+            if (hit.start == hit.end) return false; // never mark an empty span
+            if (off >= hit.start and off < hit.end) return true;
+            if (hit.start >= off) return false;
+            pos = hit.end;
+        }
+        return false;
+    }
     var pos: usize = 0;
     while (pos + q.len <= text.len) {
         const rel = textcase.indexOf(text[pos..], q) orelse return false;
@@ -1214,6 +1266,16 @@ fn searchHitAt(text: []const u8, off: usize, query: ?[]const u8) bool {
         pos = start + 1; // this hit ended before `off`; look at the next one
     }
     return false;
+}
+
+/// Matching brackets get the same foreground by nesting depth. Only `fg`
+/// changes — bold/italic from the language highlighter survive.
+pub fn bracketStyle(base: vaxis.Style, c: u8, text: []const u8, off: usize) vaxis.Style {
+    if (!codeguides.isBracket(c)) return base;
+    const bracket_palette = [_]vaxis.Style{ theme.code_kw, theme.code_type, theme.code_str, theme.code_num };
+    var st = base;
+    st.fg = bracket_palette[codeguides.bracketLevelAt(text, off) % bracket_palette.len].fg;
+    return st;
 }
 
 fn buildLinesBase(
@@ -3002,7 +3064,7 @@ pub const Model = struct {
         const q = self.search_query_buf[0..self.search_query_len];
         for (self.paras.items, 0..) |*p, i| {
             const text = p.textLive(self.allocator);
-            if (containsIgnoreCase(text, q)) {
+            if (searchTextMatches(text, q)) {
                 self.search_matches.append(self.allocator, i) catch {};
             }
         }
@@ -11687,14 +11749,15 @@ pub fn drawTranscriptSearchBar(p: *Painter, m: *const Model, width: u16, height:
     p.fillRange(x0, x0 + box_w, y0, " ", theme.selected);
     var buf: [192]u8 = undefined;
     const q = m.search_query_buf[0..m.search_query_len];
+    const mode: []const u8 = if (searchIsRegex(q)) "re " else "";
     const label = if (m.search_has_query and m.search_matches.items.len > 0)
-        std.mem.print(&buf, " / {s}_  {d}/{d}  (Enter search, Esc close)", .{
-            q,
+        std.mem.print(&buf, " /{s}{s}_  {d}/{d}  (Enter search, Esc close)", .{
+            mode, q,
             @min(m.search_current + 1, m.search_matches.items.len),
             m.search_matches.items.len,
         }) catch " / "
     else
-        std.mem.print(&buf, " / {s}_  (Enter search, Esc close)", .{q}) catch " / ";
+        std.mem.print(&buf, " /{s}{s}_  (Enter search, Esc close)", .{ mode, q }) catch " / ";
     _ = p.putClipped(x0 + 1, y0, label, box_w -| 2, theme.selected);
 }
 

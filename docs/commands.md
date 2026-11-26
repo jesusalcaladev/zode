@@ -314,6 +314,7 @@ Quit the application.
 | `F2/F3/F4/F5` | Custom bindings: help / context / sessions / tasks |
 | `Ctrl+R` | Expand/collapse last tool result (or refresh the model palette) |
 | `Ctrl+O` | Transcript / history |
+| `Ctrl+F` | Search the transcript; prefix the query with `/` for a regex (`/foo|bar`) |
 | `↑` / `↓` | Navigate picker rows |
 | `Enter` | Select / submit |
 | `Esc` | Cancel / close picker / dismiss filter |
