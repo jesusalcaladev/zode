@@ -37,8 +37,13 @@ and the OpenCode plugin as of plugin commit `6fc066f`. Items are ordered by impa
   `{kind, subject, text}` facts (`check`, `task`, `review`, `state`), keyed by
   kind+subject and capped at 64. They are harness-confirmed (check verdicts,
   task completion, review outcome), rendered into a 4 KB prompt block, and
-  survive compaction and restarts. zode does not expose an agent-writable
-  `mission_fact` call — model assertions are deliberately excluded.
+  survive compaction and restarts.
+- ~~**Agent-writable `mission_fact`.**~~ **DONE, safely.** The model appends
+  `{"kind":"fact|decision|blocker","subject","text"}` lines to
+  `.mission/fact-requests.jsonl`. The harness validates them, caps them at 16
+  per turn, refuses forged `check` verdicts, consumes the inbox once, and marks
+  accepted proposals with `proposed: true` (`fact? subject: text` in prompts).
+  A claim never becomes confirmed evidence without a harness check.
 
 ## 3. Reliability
 

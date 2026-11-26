@@ -43,7 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - route models by role (mission) [`eef98870`](https://github.com/jesusalcaladev/zode/commit/eef98870)
 - add progress and cost status dashboard (mission) [`f23b7e12`](https://github.com/jesusalcaladev/zode/commit/f23b7e12)
 - quiet mission footer segment (tui) [`5d6c9df7`](https://github.com/jesusalcaladev/zode/commit/5d6c9df7)
-- add NO_CACHE escape hatch for external-state checks (mission) [`49be23c8`](https://github.com/jesusalcaladev/zode/commit/49be23c8)
+- add NO_CACHE escape hatch for external-state checks (mission) [`bd193b2d`](https://github.com/jesusalcaladev/zode/commit/bd193b2d)
+- accept verified-shaped fact proposals from the agent (mission) [`063861ab`](https://github.com/jesusalcaladev/zode/commit/063861ab)
 
 ### Bug Fixes
 

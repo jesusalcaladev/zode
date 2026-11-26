@@ -692,7 +692,14 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
                 .kind = f.kind,
                 .subject = try gpa.dupe(u8, f.subject),
                 .text = try gpa.dupe(u8, f.text),
+                .proposed = f.proposed,
             });
+        }
+        const proposed_n = try mission_io.drainFactRequests(gpa, io, root, &facts_list);
+        if (proposed_n > 0) {
+            const note = try std.fmt.allocPrint(gpa, "accepted {d} unverified fact proposal(s)", .{proposed_n});
+            defer gpa.free(note);
+            try mission_io.appendJournal(gpa, io, root, note);
         }
         for (results) |r| try mission_io.putCheckFact(gpa, &facts_list, r.id, r.ok, r.summary);
         if (mission.allDone(tasks)) _ = try mission_io.putFact(gpa, &facts_list, .task, "tasks", "all tasks completed");

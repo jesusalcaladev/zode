@@ -116,7 +116,15 @@ project instructions from the `CLAUDE.local.md` / `AGENTS.md` / `CLAUDE.md`
 hierarchy (12 KB cap) and the durable facts from `.mission/facts.json` (4 KB
 cap). Facts are harness-confirmed — check verdicts, task completion and review
 outcome — keyed by kind+subject, capped at 64, and survive compaction and
-restarts. The runner does not accept model-authored facts.
+restarts.
+
+The model can propose facts by appending JSON lines to
+`.mission/fact-requests.jsonl` with `kind` (`fact`, `decision` or `blocker`),
+`subject` and `text`. The harness validates each line, refuses forged `check`
+verdicts, consumes the file once per turn, and stores accepted proposals with
+`proposed = true`; they appear in prompts as `fact? subject: text`, never as
+confirmed evidence. This is the same shape as the plugin's `mission_fact`
+without letting an assertion become truth.
 
 ## Recovery and integrity
 
@@ -150,7 +158,8 @@ restarts. The runner does not accept model-authored facts.
   evidence/*.txt    stdout, stderr, exit, expectation per check
   checks-cache.json fingerprint + cached check verdicts (safe to delete)
   NO_CACHE          presence forces a fresh suite (outside the fingerprint)
-  facts.json        structured harness-confirmed facts injected into prompts
+  facts.json        structured facts injected into prompts (proposed ones marked ?)
+  fact-requests.jsonl  agent proposal inbox; validated and consumed each turn
   prompts/*.txt     worker prompts (when workers are enabled)
   prompts/*.done    per-worker completion marker, or *.failed on agent error
   STOP              kill switch
