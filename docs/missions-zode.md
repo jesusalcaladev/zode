@@ -46,6 +46,12 @@ zode mission run    ./missions/<id>
 the journal → call the agent with a failure nudge. It stops on `complete`, a `STOP`
 file, the turn/cost ceiling, `max_failures`, or a `blocked` verdict.
 
+Criteria run in batches of up to three concurrent shells. Verdicts are cached in
+`.mission/checks-cache.json` under a workspace fingerprint (path + size + mtime,
+excluding `.mission`) plus the criteria signature, so an unchanged suite is not
+re-run. Any workspace change invalidates the whole suite; external state (clock,
+network, environment) is not modeled — delete the cache file to force a run.
+
 ### Environment
 
 | Variable | Default | Meaning |
@@ -56,8 +62,10 @@ file, the turn/cost ceiling, `max_failures`, or a `blocked` verdict.
 | `ZODE_MISSION_MODELS` | unset | Comma-separated model ids. On a failed turn the driver rotates to the next one by setting `ZODE_MODEL` for the child |
 
 With workers enabled the driver writes one prompt per task under
-`.mission/prompts/` and starts them in the same shell wave. The lead receives the
-failure summary afterwards. The harness still owns verification and completion.
+`.mission/prompts/` and starts one thread per task in the same wave. Each worker
+leaves an explicit `task-N.done` (or `task-N.failed`) marker; the lead receives
+the failure summary afterwards. The harness still owns verification and
+completion.
 
 ## Continuous improvement (on by default)
 
@@ -98,16 +106,29 @@ Role reports are written to `.mission/reports/<role>.txt` by the agent's own
 write tool; the harness parses them. Criteria, state and tasks remain
 harness-owned and should never be edited by an agent.
 
+Every prompt (lead, worker and role) also carries two bounded context blocks:
+project instructions from the `CLAUDE.local.md` / `AGENTS.md` / `CLAUDE.md`
+hierarchy (12 KB cap) and the durable facts from `.mission/facts.json` (4 KB
+cap). Facts are harness-confirmed — check verdicts, task completion and review
+outcome — keyed by kind+subject, capped at 64, and survive compaction and
+restarts. The runner does not accept model-authored facts.
+
 ## Recovery and integrity
 
 - A failed agent turn increments `failures`, backs off (2s, 4s, 8s… capped at 30s),
   rotates to the next model in `ZODE_MISSION_MODELS`, and retries. After
   `max_failures` the mission aborts with `repeated-execution-failure` instead of
   spinning.
-- Before each decision the driver hashes every test file in the workspace and
-  stores the baseline in `state.json` as decimal strings (64-bit FNV fits in a
-  string, not in a JSON `i64`). Editing or deleting a test that existed at the
-  start aborts with `test-erosion`. Adding tests is allowed.
+- Before each decision the driver hashes the test files under the `files`
+  declared by tasks and stores the baseline in `state.json` as decimal strings
+  (64-bit FNV fits in a string, not in a JSON `i64`). Editing or deleting an
+  owned test that existed at the start aborts with `test-erosion`; unrelated
+  edits are ignored. Missions with no declared files keep the strict whole-tree
+  baseline. Adding tests is allowed.
+- A continuous-improvement task records HEAD and the green count as its
+  baseline. If a later turn is less green, the harness reverts exactly the
+  improvement checkpoint and journals it. Review is two independent passes;
+  both reports gate completion.
 - `plan` with `ZODE_MISSION_PLANNER` asks the agent for a JSON plan and validates
   it: unsafe commands (`sudo`, `rm -rf /`, pipes to shell), bad ids, path
   traversal and missing `verify` checks are rejected before anything is written.
@@ -122,7 +143,10 @@ harness-owned and should never be edited by an agent.
   state.json        durable supervisor state
   journal.md        append-only memory
   evidence/*.txt    stdout, stderr, exit, expectation per check
+  checks-cache.json fingerprint + cached check verdicts (safe to delete)
+  facts.json        structured harness-confirmed facts injected into prompts
   prompts/*.txt     worker prompts (when workers are enabled)
+  prompts/*.done    per-worker completion marker, or *.failed on agent error
   STOP              kill switch
 ```
 
@@ -130,11 +154,13 @@ harness-owned and should never be edited by an agent.
 
 ## Code map
 
-- `src/lib/mission.zig` — pure contract: decision, criteria evaluation, task graph,
-  wave scheduling, heuristic planner. No IO, no model, no TUI.
-- `src/lib/mission_io.zig` — persistence, criteria runner (`std.process.run` with
-  `/bin/sh -c` and `cwd` = workspace), journal, git checkpoint.
-- `tools/mission.zig` — headless CLI (`plan`, `status`, `check`, `run`).
+- `src/mission/contract.zig` — pure contract: decision, criteria evaluation, task
+  graph, wave scheduling, heuristic planner. No IO, no model, no TUI.
+- `src/mission/io.zig` — persistence, criteria runner (batches of up to
+  `max_parallel_checks` = 3 using `std.process.run` with `/bin/sh -c` and `cwd` =
+  workspace), check cache, journal, git checkpoint.
+- `src/mission/runner.zig` — headless supervisor (`plan`, `status`, `check`, `run`)
+  compiled into the core binary as `zode mission ...`.
 
 ## Differences from zode's native loop
 
@@ -142,8 +168,8 @@ zode already has `/goal`, `taskloop.zig`, `exitgate.zig`, `taskstore.zig`,
 `team.zig`, `pipeline.zig`, `testguard.zig` and `checkpoint.zig`. This port adds the
 one thing those do not provide on their own: **criteria that the harness runs as
 shell commands**, with evidence on disk and a supervisor that survives process
-restarts. It is deliberately a separate executable so the TUI and the interactive
-agent loop are untouched.
+restarts. It lives in the core binary behind `zode mission ...` as a headless
+mode, so the TUI and the interactive agent loop are untouched.
 
 ## Safety
 

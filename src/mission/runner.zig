@@ -12,6 +12,7 @@
 const std = @import("std");
 const mission = @import("contract.zig");
 const mission_io = @import("io.zig");
+const instructions = @import("../lib/instructions.zig");
 
 const dir = std.Io.Dir.cwd();
 
@@ -45,6 +46,29 @@ fn usage() void {
 fn envGet(map: ?*const std.process.Environ.Map, key: []const u8) ?[]const u8 {
     const m = map orelse return null;
     return m.get(key);
+}
+
+/// Project rules (CLAUDE.local.md, AGENTS.md/CLAUDE.md hierarchy, user file)
+/// are injected into every mission prompt. The runner used to ignore them,
+/// even though the interactive agent loads them — a mission could widen its
+/// own rules without ever seeing the repo's. Bounded at 12 KB so the context
+/// cannot push the criteria out of a small model window.
+fn loadProjectInstructions(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const paths = try instructions.collect(a, io, env, root, null);
+    var entries = std.ArrayList(mission_io.InstructionEntry).empty;
+    defer entries.deinit(a);
+    for (paths) |path| {
+        const text = dir.readFileAlloc(io, path, a, .limited(64 * 1024)) catch continue;
+        try entries.append(a, .{ .path = path, .text = text });
+    }
+    return mission_io.composeInstructions(gpa, entries.items, 12 * 1024);
+}
+
+fn buildContext(gpa: std.mem.Allocator, project_instructions: []const u8, facts_text: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(gpa, "{s}{s}", .{ project_instructions, facts_text });
 }
 
 fn joinArgs(gpa: std.mem.Allocator, args: []const []const u8) ![]const u8 {
@@ -160,7 +184,7 @@ fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !u8 {
         return 2;
     }
     const results = try mission_io.runChecks(gpa, io, root, checks);
-    defer gpa.free(results);
+    defer mission_io.freeCheckResults(gpa, results);
     var green: usize = 0;
     for (results) |r| {
         if (r.ok) green += 1;
@@ -179,8 +203,7 @@ fn agentArgv(gpa: std.mem.Allocator, agent_command: []const u8, prompt: []const 
     return argv.toOwnedSlice(gpa);
 }
 
-fn callAgent(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, prompt: []const u8, model: ?[]const u8) bool {
-    const command = envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat";
+fn callAgent(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, prompt: []const u8, command: []const u8, model: ?[]const u8) bool {
     const argv = agentArgv(gpa, command, prompt) catch return false;
     defer gpa.free(argv);
     var child_env = std.process.Environ.Map.init(gpa);
@@ -212,7 +235,7 @@ fn callAgent(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     };
 }
 
-fn writeWorkerPrompts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, tasks: []const mission.Task, wave: mission.Wave) ![]const []const u8 {
+fn writeWorkerPrompts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, tasks: []const mission.Task, wave: mission.Wave, context: []const u8) ![]const []const u8 {
     var prompts = std.ArrayList([]const u8).empty;
     errdefer prompts.deinit(gpa);
     const prompts_dir = try std.fmt.allocPrint(gpa, "{s}/{s}/prompts", .{ root, mission.dir_name });
@@ -223,8 +246,8 @@ fn writeWorkerPrompts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, task
             if (task.id != id) continue;
             const path = try std.fmt.allocPrint(gpa, "{s}/task-{d}.txt", .{ prompts_dir, id });
             const text = try std.fmt.allocPrint(gpa,
-                "[MISSION WORKER] Workspace: {s}\nTask #{d}: {s}\nDo only this task. Use zode's write/edit tools. Do not run the global checks; the lead verifies them. When finished, create a note with mission_task_done in your final answer.\n",
-                .{ root, task.id, task.subject });
+                "{s}[MISSION WORKER] Workspace: {s}\nTask #{d}: {s}\nDo only this task. Use zode's write/edit tools. Do not run the global checks; the lead verifies them. When finished, create a note with mission_task_done in your final answer. The harness writes .mission/prompts/task-{d}.done when your process exits.\n",
+                .{ context, root, task.id, task.subject, task.id });
             try dir.writeFile(io, .{ .sub_path = path, .data = text });
             try prompts.append(gpa, path);
             break;
@@ -233,34 +256,59 @@ fn writeWorkerPrompts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, task
     return prompts.toOwnedSlice(gpa);
 }
 
-fn callWorkers(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, tasks: []const mission.Task, wave: mission.Wave, model: ?[]const u8) void {
-    const paths = writeWorkerPrompts(gpa, io, root, tasks, wave) catch return;
+const WorkerCtx = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    env: ?*const std.process.Environ.Map,
+    root: []const u8,
+    command: []const u8,
+    prompt_path: []const u8,
+    marker_path: []const u8,
+    model: ?[]const u8,
+    ok: bool = false,
+
+    fn run(self: *WorkerCtx) void {
+        const text = std.Io.Dir.cwd().readFileAlloc(self.io, self.prompt_path, self.gpa, .limited(1024 * 1024)) catch return;
+        defer self.gpa.free(text);
+        self.ok = callAgent(self.gpa, self.io, self.env, self.root, text, self.command, self.model);
+        dir.writeFile(self.io, .{ .sub_path = self.marker_path, .data = if (self.ok) "done\n" else "failed\n" }) catch {};
+    }
+};
+
+/// One thread per worker, one explicit completion marker per task. The old
+/// `sh -c 'for p ...; do (...) & done; wait'` had no way to tell which task
+/// failed — the lead only saw the aggregate exit of a shell.
+fn callWorkers(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, tasks: []const mission.Task, wave: mission.Wave, model: ?[]const u8, context: []const u8) void {
+    const paths = writeWorkerPrompts(gpa, io, root, tasks, wave, context) catch return;
     defer gpa.free(paths);
     const command = envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat";
-    var script = std.ArrayList(u8).empty;
-    defer script.deinit(gpa);
-    if (model) |m| {
-        const prefix = std.fmt.allocPrint(gpa, "export ZODE_MODEL='{s}'; ", .{m}) catch return;
-        defer gpa.free(prefix);
-        script.appendSlice(gpa, prefix) catch return;
+    const ctxs = gpa.alloc(WorkerCtx, paths.len) catch return;
+    defer gpa.free(ctxs);
+    for (paths, ctxs) |prompt_path, *ctx| {
+        const dot = std.mem.lastIndexOfScalar(u8, prompt_path, '.') orelse prompt_path.len;
+        const marker_path = std.fmt.allocPrint(gpa, "{s}.done", .{prompt_path[0..dot]}) catch return;
+        ctx.* = .{
+            .gpa = gpa, .io = io, .env = env, .root = root, .command = command,
+            .prompt_path = prompt_path, .marker_path = marker_path, .model = model,
+        };
     }
-    script.appendSlice(gpa, "for p in") catch return;
-    for (paths) |p| {
-        const piece = std.fmt.allocPrint(gpa, " '{s}'", .{p}) catch return;
-        defer gpa.free(piece);
-        script.appendSlice(gpa, piece) catch return;
+    defer for (ctxs) |ctx| gpa.free(ctx.marker_path);
+
+    const threads = gpa.alloc(?std.Thread, ctxs.len) catch return;
+    defer gpa.free(threads);
+    @memset(threads, null);
+    for (ctxs, threads) |*ctx, *slot| {
+        slot.* = std.Thread.spawn(.{}, WorkerCtx.run, .{ctx}) catch null;
+        if (slot.* == null) WorkerCtx.run(ctx);
     }
-    const tail = std.fmt.allocPrint(gpa, "; do ({s} \"$(cat \"$p\")\" >/dev/null 2>&1) & done; wait\n", .{command}) catch return;
-    defer gpa.free(tail);
-    script.appendSlice(gpa, tail) catch return;
-    const result = std.process.run(gpa, io, .{
-        .argv = &.{ "/bin/sh", "-c", script.items },
-        .cwd = .{ .path = root },
-        .stdout_limit = .limited(16 * 1024),
-        .stderr_limit = .limited(16 * 1024),
-    }) catch return;
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
+    for (threads) |slot| if (slot) |thread| thread.join();
+
+    for (ctxs) |ctx| {
+        if (ctx.ok) continue;
+        const note = std.fmt.allocPrint(gpa, "worker failed: {s}", .{std.fs.path.basename(ctx.prompt_path)}) catch continue;
+        defer gpa.free(note);
+        mission_io.appendJournal(gpa, io, root, note) catch {};
+    }
 }
 
 fn objectiveFrom(text: []const u8) []const u8 {
@@ -356,15 +404,15 @@ fn readReport(gpa: std.mem.Allocator, io: std.Io, root: []const u8, role: []cons
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 * 1024)) catch null;
 }
 
-fn callRole(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, role: []const u8, prompt: []const u8) ?[]const u8 {
+fn callRole(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, role: []const u8, prompt: []const u8, context: []const u8) ?[]const u8 {
     const report_path = std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ mission.dir_name, mission.reports_dir, role }) catch return null;
     defer gpa.free(report_path);
     const full_prompt = std.fmt.allocPrint(gpa,
-        "{s}\n\nWrite your final report to the file `{s}.txt` in the mission directory using your write tool. Keep it short and include SEVERITY lines when reviewing.",
-        .{ prompt, report_path },
+        "{s}{s}\n\nWrite your final report to the file `{s}.txt` in the mission directory using your write tool. Keep it short and include SEVERITY lines when reviewing.",
+        .{ context, prompt, report_path },
     ) catch return null;
     defer gpa.free(full_prompt);
-    _ = callAgent(gpa, io, env, root, full_prompt, null);
+    _ = callAgent(gpa, io, env, root, full_prompt, envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat", null);
     return readReport(gpa, io, root, role);
 }
 
@@ -420,11 +468,33 @@ fn chainNext(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Enviro
     return true;
 }
 
-fn improveCycle(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, state: *mission_io.State) !bool {
+/// If an improvement cycle made the suite less green than its baseline, undo
+/// exactly the checkpoint it created. The baseline SHA is never reverted.
+fn rollbackIfRegressed(gpa: std.mem.Allocator, io: std.Io, root: []const u8, state: *mission_io.State, green: usize) !void {
+    if (state.improve_revert_sha.len == 0 or green >= state.improve_baseline_green) return;
+    const head = mission_io.gitHead(gpa, io, root);
+    defer if (head) |sha| gpa.free(sha);
+    if (head) |sha| {
+        if (!std.mem.eql(u8, sha, state.improve_revert_sha)) {
+            const reverted = mission_io.gitRevert(gpa, io, root, sha);
+            const note = try std.fmt.allocPrint(gpa,
+                "improvement rollback {s}: green {d} below baseline {d}",
+                .{ if (reverted) "succeeded" else "failed", green, state.improve_baseline_green });
+            defer gpa.free(note);
+            try mission_io.appendJournal(gpa, io, root, note);
+        }
+    }
+    gpa.free(state.improve_revert_sha);
+    state.improve_revert_sha = "";
+    state.improve_baseline_green = 0;
+    try mission_io.saveState(gpa, io, root, state.*);
+}
+
+fn improveCycle(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, state: *mission_io.State, context: []const u8, green: usize) !bool {
     if (!state.continuous_improvement) return false;
     if (state.auditor_text.len == 0) {
         const report = callRole(gpa, io, env, root, "auditor",
-            "[MISSION AUDITOR] Read the workspace. Emit FINDING: impact=high|medium|low risk=low|medium|high files=a.zig,b.zig description. Write NO FINDINGS if nothing valuable.") orelse "NO FINDINGS";
+            "[MISSION AUDITOR] Read the workspace. Emit FINDING: impact=high|medium|low risk=low|medium|high files=a.zig,b.zig description. Write NO FINDINGS if nothing valuable.", context) orelse "NO FINDINGS";
         state.auditor_text = try gpa.dupe(u8, report);
         try mission_io.saveState(gpa, io, root, state.*);
         try mission_io.appendJournal(gpa, io, root, "improvement audit dispatched");
@@ -485,6 +555,9 @@ fn improveCycle(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Env
             state.clean_audit_rounds = 0;
             state.auditor_text = "";
             state.stage = "implement";
+            gpa.free(state.improve_revert_sha);
+            state.improve_revert_sha = mission_io.gitHead(gpa, io, root) orelse "";
+            state.improve_baseline_green = green;
             try mission_io.saveState(gpa, io, root, state.*);
 
             const line = try std.fmt.allocPrint(gpa, "- [ ] id: imp-{d} | impact: {s} | risk: {s} | files: {any} | {s}\n", .{
@@ -514,6 +587,8 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
     const mission_text = std.Io.Dir.cwd().readFileAlloc(io, mission_path, gpa, .limited(256 * 1024)) catch "";
     defer if (mission_text.len > 0) gpa.free(mission_text);
     const objective = objectiveFrom(mission_text);
+    const project_instructions = try loadProjectInstructions(gpa, io, env, root);
+    defer gpa.free(project_instructions);
     const worker_count_raw = envGet(env, "ZODE_MISSION_WORKERS") orelse "1";
     const workers = std.fmt.parseInt(usize, worker_count_raw, 10) catch 1;
     var models = std.ArrayList([]const u8).empty;
@@ -528,7 +603,12 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
     var model_index: usize = 0;
 
     while (state.status == .running) {
-        const current_hashes = try mission_io.hashTests(gpa, io, root);
+        const tasks = try mission_io.loadTasks(gpa, io, root);
+        defer gpa.free(tasks);
+        var owned_paths = std.ArrayList([]const u8).empty;
+        defer owned_paths.deinit(gpa);
+        for (tasks) |t| try owned_paths.appendSlice(gpa, t.files);
+        const current_hashes = try mission_io.hashTestsFor(gpa, io, root, owned_paths.items);
         defer gpa.free(current_hashes);
         if (state.test_hashes.len == 0) {
             state.test_hashes = try gpa.dupe(mission_io.TestHash, current_hashes);
@@ -570,13 +650,42 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
 
         const checks = try mission_io.loadCriteria(gpa, io, root);
         defer gpa.free(checks);
-        const tasks = try mission_io.loadTasks(gpa, io, root);
-        defer gpa.free(tasks);
         const results = try mission_io.runChecks(gpa, io, root, checks);
-        defer gpa.free(results);
+        defer mission_io.freeCheckResults(gpa, results);
+
+        // Harness-confirmed facts: check verdicts and task completion. Stored
+        // on disk so they survive compaction and process restarts, then injected
+        // into every prompt (lead, workers and roles) through `context`.
+        var facts_list = std.ArrayList(mission_io.Fact).empty;
+        defer {
+            for (facts_list.items) |f| {
+                gpa.free(f.subject);
+                gpa.free(f.text);
+            }
+            facts_list.deinit(gpa);
+        }
+        const stored_facts = try mission_io.loadFacts(gpa, io, root);
+        defer mission_io.freeFacts(gpa, stored_facts);
+        // Deep copy: appendSlice would share the string pointers and both
+        // defers would free them (a real double free on the second turn).
+        for (stored_facts) |f| {
+            try facts_list.append(gpa, .{
+                .kind = f.kind,
+                .subject = try gpa.dupe(u8, f.subject),
+                .text = try gpa.dupe(u8, f.text),
+            });
+        }
+        for (results) |r| try mission_io.putCheckFact(gpa, &facts_list, r.id, r.ok, r.summary);
+        if (mission.allDone(tasks)) _ = try mission_io.putFact(gpa, &facts_list, .task, "tasks", "all tasks completed");
+        try mission_io.saveFacts(gpa, io, root, facts_list.items);
+        const facts_text = try mission_io.renderFacts(gpa, facts_list.items, 4096);
+        defer gpa.free(facts_text);
+        const context = try buildContext(gpa, project_instructions, facts_text);
+        defer gpa.free(context);
 
         if (mission.applyTaskResults(tasks, results)) try mission_io.saveTasks(gpa, io, root, tasks);
         const green = mission.countGreen(results);
+        try rollbackIfRegressed(gpa, io, root, &state, green);
         const all_done = mission.allDone(tasks);
         state.turn += 1;
         const progress = green > state.best_green or (all_done and state.tasks_done < tasks.len);
@@ -645,7 +754,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
                 }
             }
             if (std.mem.eql(u8, state.stage, "investigate")) {
-                const report = callRole(gpa, io, env, root, "investigator", try std.fmt.allocPrint(gpa, "[MISSION INVESTIGATOR] Objective: {s}\nRead the workspace. Do not edit files.", .{objective}));
+                const report = callRole(gpa, io, env, root, "investigator", try std.fmt.allocPrint(gpa, "[MISSION INVESTIGATOR] Objective: {s}\nRead the workspace. Do not edit files.", .{objective}), context);
                 if (report) |text| state.research_text = try gpa.dupe(u8, text);
                 state.stage = "implement";
                 try mission_io.saveState(gpa, io, root, state);
@@ -659,12 +768,17 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
                 state.review_attempts,
             );
             if (stage_info.stage == .review and state.review_text.len == 0) {
-                _ = callRole(gpa, io, env, root, "reviewer", try std.fmt.allocPrint(gpa, "[MISSION REVIEWER] Objective: {s}\nReview files and write SEVERITY findings. Do not edit files.", .{objective}));
-                if (readReport(gpa, io, root, "reviewer")) |text| {
-                    state.review_text = try gpa.dupe(u8, text);
-                } else {
-                    state.review_text = "SEVERITY: low — no review report produced";
-                }
+                // Two independent reviewers: a single high finding used to
+                // reopen work on a false positive. Both reports gate the stage.
+                _ = callRole(gpa, io, env, root, "reviewer", try std.fmt.allocPrint(gpa, "[MISSION REVIEWER] Objective: {s}\nReview files and write SEVERITY findings. Do not edit files.", .{objective}), context);
+                _ = callRole(gpa, io, env, root, "reviewer2", try std.fmt.allocPrint(gpa, "[MISSION SECOND REVIEWER] Objective: {s}\nReview the SAME work independently for correctness, regressions and unfinished criteria. Ignore any other review. Write SEVERITY findings. Do not edit files.", .{objective}), context);
+                const first_review = readReport(gpa, io, root, "reviewer") orelse "SEVERITY: low — no review report produced";
+                defer gpa.free(first_review);
+                const second_review = readReport(gpa, io, root, "reviewer2") orelse "";
+                defer gpa.free(second_review);
+                state.review_text = try std.fmt.allocPrint(gpa, "{s}\n[SECOND OPINION]\n{s}", .{ first_review, second_review });
+                _ = try mission_io.putFact(gpa, &facts_list, .review, "stage", first_review[0..@min(first_review.len, 240)]);
+                try mission_io.saveFacts(gpa, io, root, facts_list.items);
                 state.stage = "review";
                 try mission_io.saveState(gpa, io, root, state);
                 try mission_io.appendJournal(gpa, io, root, "reviewer dispatched; completion held until review is clean");
@@ -697,7 +811,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
 
         switch (decision) {
             .complete => {
-                if (try improveCycle(gpa, io, env, root, &state)) continue;
+                if (try improveCycle(gpa, io, env, root, &state, context, green)) continue;
                 const chained = try chainNext(gpa, io, env, root, &state);
                 state.status = if (chained) .running else .complete;
                 try mission_io.saveState(gpa, io, root, state);
@@ -738,9 +852,9 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
                     }
                 }
                 try mission_io.appendJournal(gpa, io, root, "dispatching parallel workers");
-                for (waves) |wave| callWorkers(gpa, io, env, root, tasks, wave, if (models.items.len > 0) models.items[model_index] else null);
+                for (waves) |wave| callWorkers(gpa, io, env, root, tasks, wave, if (models.items.len > 0) models.items[model_index] else null, context);
                 const after = try mission_io.runChecks(gpa, io, root, checks);
-                defer gpa.free(after);
+                defer mission_io.freeCheckResults(gpa, after);
                 if (mission.allGreen(after)) {
                     for (worker_leases) |*l| {
                         if (l.status == .in_progress) _ = mission.lease.release(worker_leases, l.id, .completed);
@@ -755,6 +869,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
 
         var prompt = std.ArrayList(u8).empty;
         defer prompt.deinit(gpa);
+        prompt.appendSlice(gpa, context) catch return 1;
         const header = std.fmt.allocPrint(gpa, "[MISSION SUPERVISOR · turn {d}/{d}] Harness re-ran the criteria: {d}/{d} green. Failing: ", .{
             state.turn, state.max_turns, green, results.len,
         }) catch return 1;
@@ -770,7 +885,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
         if (state.strategy_tier >= 2) prompt.appendSlice(gpa, "Strategy tier 2: change the approach, do not repeat the same edit. ") catch return 1;
         prompt.appendSlice(gpa, "Keep working until every check is green. Do not declare done; the harness decides completion.") catch return 1;
         const model = if (models.items.len > 0) models.items[model_index] else null;
-        const ok = callAgent(gpa, io, env, root, prompt.items, model);
+        const ok = callAgent(gpa, io, env, root, prompt.items, envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat", model);
         if (ok) {
             state.failures = 0;
             state.writes += 1;

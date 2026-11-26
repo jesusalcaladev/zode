@@ -5,32 +5,49 @@ and the OpenCode plugin as of plugin commit `6fc066f`. Items are ordered by impa
 
 ## 1. Speed
 
-- **Parallel cached checks.** The plugin runs criteria with bounded parallelism
-  (`maxParallel`, default 3) and skips unchanged suites using a workspace
-  fingerprint (paths + mtime + size) plus a criteria signature. zode's
-  `mission_io.runChecks` is still sequential and re-runs everything every turn.
-- **Event-driven worker completion.** The plugin finishes workers through the
-  `mission_task_done` tool; zode still uses a fixed timeout wait.
+- ~~**Parallel cached checks.**~~ **DONE.** `src/mission/io.zig` now runs up to
+  `max_parallel_checks` (3) criteria in each batch and caches verdicts in
+  `.mission/checks-cache.json`, keyed by a workspace fingerprint (path + size +
+  mtime, excluding `.mission`) plus the criteria signature. An unchanged suite
+  is not re-run. The remaining difference: the cache is all-or-nothing per
+  mission (any workspace change re-runs every check) and it does not model
+  environment or network dependencies.
+- ~~**Event-driven worker completion.**~~ **DONE.** `callWorkers` now runs one
+  thread per worker with an explicit `.mission/prompts/task-N.done` /
+  `.failed` marker on exit, instead of a `sh -c '… & …; wait'` aggregate. The
+  remaining difference: zode does not expose a `mission_task_done` tool call —
+  workers announce completion in their final answer and the harness records
+  the marker.
 
 ## 2. Intelligence
 
 - **Model per role.** Plugin: `fastModel` for read-only roles, `model` for
   implementers, `modelsByRole` overrides. zode uses one agent command/model.
-- **Project instructions.** Plugin injects the `AGENTS.md` / `CLAUDE.md`
-  hierarchy into every brief. zode's mission runner does not load them, even
-  though `src/lib/instructions.zig` already exists and could be reused.
-- **Durable fact store.** Plugin has `mission_fact(kind, subject, text)` with
-  structured facts that survive compaction. zode keeps only distilled text.
+- ~~**Project instructions.**~~ **DONE.** `src/mission/runner.zig` reuses
+  `src/lib/instructions.zig` and injects the `CLAUDE.local.md` / `AGENTS.md` /
+  `CLAUDE.md` hierarchy (plus the user-level file) into lead, worker and role
+  prompts, capped at 12 KB. Remaining difference: the plugin may re-read rules
+  per brief; zode loads them once per `mission run`.
+- ~~**Durable fact store.**~~ **DONE.** `.mission/facts.json` holds structured
+  `{kind, subject, text}` facts (`check`, `task`, `review`, `state`), keyed by
+  kind+subject and capped at 64. They are harness-confirmed (check verdicts,
+  task completion, review outcome), rendered into a 4 KB prompt block, and
+  survive compaction and restarts. zode does not expose an agent-writable
+  `mission_fact` call — model assertions are deliberately excluded.
 
 ## 3. Reliability
 
-- **Automatic improvement rollback.** Plugin reverts the checkpoint when an
-  improvement cycle breaks verification (`gitRevert`). zode journals the
-  failure but does not revert.
-- **Second-opinion review.** Both use a single reviewer; a second independent
-  review would reduce false positives on `SEVERITY: high`.
-- **Test guard scope.** zode hashes every test file in the workspace; unrelated
-  edits can trigger `test-erosion`. It should hash only `files` owned by tasks.
+- ~~**Automatic improvement rollback.**~~ **DONE.** Before an improvement
+  task the runner records HEAD and the green count in `state.json`. If a later
+  turn is less green, it reverts exactly the checkpoint the improvement
+  created (never the baseline) and journals the outcome.
+- ~~**Second-opinion review.**~~ **DONE.** Two independent reviewers write
+  `.mission/reports/reviewer.txt` and `reviewer2.txt`; both reports gate the
+  review stage, so one false `SEVERITY: high` no longer reopens the work alone.
+- ~~**Test guard scope.**~~ **DONE.** `hashTestsFor` hashes only test files under
+  the `files` declared by tasks; unrelated edits no longer trigger
+  `test-erosion`. Missions with no declared files keep the strict whole-tree
+  baseline.
 
 ## 4. UX
 
@@ -50,8 +67,8 @@ and the OpenCode plugin as of plugin commit `6fc066f`. Items are ordered by impa
 
 ## Suggested order
 
-1. Parallel + cached checks in `mission_io.zig`.
-2. Reuse `instructions.zig` in the runner and add a fact store.
-3. Automatic `git revert` for failed improvement cycles.
+1. ~~Parallel + cached checks in `src/mission/io.zig`.~~ DONE.
+2. ~~Reuse `instructions.zig` in the runner and add a fact store.~~ DONE.
+3. ~~Automatic `git revert` for failed improvement cycles.~~ DONE.
 4. TUI status line and progress bar.
 5. Unify mission decisions with `exitgate`/`taskloop`.

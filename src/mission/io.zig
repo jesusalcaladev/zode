@@ -1,7 +1,7 @@
 //! Mission contract — the IO half.
 //!
 //! Persistence, criteria execution, journal and git checkpoints. The decisions
-//! stay in `lib/mission.zig`; this module only reads/writes and runs commands.
+//! stay in `contract.zig`; this module only reads/writes and runs commands.
 //! All model-facing text is English. No TUI, no network, no provider calls here.
 
 const std = @import("std");
@@ -80,6 +80,10 @@ pub const State = struct {
     clean_audit_rounds: usize = 0,
     max_clean_audit_rounds: usize = 2,
     auditor_text: []const u8 = "",
+    /// Checkpoint SHA captured before an improvement cycle. Empty when none.
+    improve_revert_sha: []const u8 = "",
+    /// Green count at that checkpoint; a lower count triggers the revert.
+    improve_baseline_green: usize = 0,
 };
 
 fn pathFor(gpa: std.mem.Allocator, root: []const u8, name: []const u8) ![]const u8 {
@@ -116,9 +120,415 @@ fn skipDir(name: []const u8) bool {
     return false;
 }
 
+/// Bounded parallelism for criteria: enough to overlap a few suites without
+/// turning a mission into a fork bomb on a small machine.
+pub const max_parallel_checks: usize = 3;
+
+fn fnvUpdate(h: u64, bytes: []const u8) u64 {
+    var out = h;
+    for (bytes) |b| {
+        out ^= b;
+        out *%= 0x100000001b3;
+    }
+    return out;
+}
+
+const FsStamp = struct {
+    path: []const u8,
+    size: u64,
+    mtime_ns: i96,
+};
+
+/// Fingerprint of the workspace (path + size + mtime) plus the criteria
+/// signature. A check is a black box — it may read any file in the workspace —
+/// so ANY workspace change invalidates the whole suite. `.mission` is skipped:
+/// evidence and the cache itself must not invalidate the cache.
+fn workspaceFingerprint(gpa: std.mem.Allocator, io: std.Io, root: []const u8, checks: []const mission.Check) !u64 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var stamps = std.ArrayList(FsStamp).empty;
+    var stack = std.ArrayList([]const u8).empty;
+    try stack.append(a, "");
+    while (stack.items.len > 0) {
+        const rel = stack.pop().?;
+        const full = if (rel.len == 0) try a.dupe(u8, root) else try std.fmt.allocPrint(a, "{s}/{s}", .{ root, rel });
+        var sub = dir.openDir(io, full, .{ .iterate = true }) catch continue;
+        defer sub.close(io);
+        var it = sub.iterate();
+        while (it.next(io) catch null) |entry| {
+            const child_rel = if (rel.len == 0)
+                try a.dupe(u8, entry.name)
+            else
+                try std.fmt.allocPrint(a, "{s}/{s}", .{ rel, entry.name });
+            if (entry.kind == .directory) {
+                if (!skipDir(entry.name)) try stack.append(a, child_rel);
+                continue;
+            }
+            if (entry.kind != .file) continue;
+            const child_full = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, child_rel });
+            const st = dir.statFile(io, child_full, .{}) catch continue;
+            try stamps.append(a, .{ .path = child_rel, .size = st.size, .mtime_ns = st.mtime.nanoseconds });
+        }
+    }
+    std.mem.sort(FsStamp, stamps.items, {}, struct {
+        fn lessThan(_: void, x: FsStamp, y: FsStamp) bool {
+            return std.mem.lessThan(u8, x.path, y.path);
+        }
+    }.lessThan);
+
+    var h = fnvUpdate(0xcbf29ce484222325, "zode-mission-checks-v1");
+    for (stamps.items) |s| {
+        h = fnvUpdate(h, s.path);
+        h = fnvUpdate(h, std.mem.asBytes(&s.size));
+        h = fnvUpdate(h, std.mem.asBytes(&s.mtime_ns));
+    }
+    for (checks) |c| {
+        h = fnvUpdate(h, c.id);
+        h = fnvUpdate(h, c.cmd);
+        h = fnvUpdate(h, c.expect);
+        h = fnvUpdate(h, std.mem.asBytes(&c.timeout_ms));
+    }
+    return h;
+}
+
+const CheckCache = struct {
+    fingerprint: u64,
+    results: []mission.CheckResult,
+};
+
+fn freeCachedResults(gpa: std.mem.Allocator, results: []mission.CheckResult) void {
+    for (results) |r| {
+        if (r.id.len > 0) gpa.free(r.id);
+        if (r.summary.len > 0) gpa.free(r.summary);
+    }
+    gpa.free(results);
+}
+
+fn loadCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?CheckCache {
+    const path = pathFor(gpa, root, mission.checks_cache_file) catch return null;
+    defer gpa.free(path);
+    const data = dir.readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch return null;
+    defer gpa.free(data);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), data, .{}) catch return null;
+    if (parsed != .object) return null;
+    const fp_s = objStr(parsed.object, "fingerprint") orelse return null;
+    const fingerprint = std.fmt.parseInt(u64, fp_s, 10) catch return null;
+    const arr_v = parsed.object.get("results") orelse return null;
+    if (arr_v != .array) return null;
+    var out = std.ArrayList(mission.CheckResult).empty;
+    errdefer {
+        for (out.items) |r| {
+            if (r.id.len > 0) gpa.free(r.id);
+            if (r.summary.len > 0) gpa.free(r.summary);
+        }
+        out.deinit(gpa);
+    }
+    for (arr_v.array.items) |item| {
+        if (item != .object) continue;
+        const id = objStr(item.object, "id") orelse continue;
+        out.append(gpa, .{
+            .id = gpa.dupe(u8, id) catch return null,
+            .ok = objBool(item.object, "ok", false),
+            .summary = gpa.dupe(u8, objStr(item.object, "summary") orelse "") catch return null,
+        }) catch return null;
+    }
+    return .{ .fingerprint = fingerprint, .results = out.toOwnedSlice(gpa) catch return null };
+}
+
+fn saveCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8, fingerprint: u64, results: []const mission.CheckResult) void {
+    const meta = pathFor(gpa, root, mission.dir_name) catch return;
+    defer gpa.free(meta);
+    dir.createDirPath(io, meta) catch return;
+    const path = pathFor(gpa, root, mission.checks_cache_file) catch return;
+    defer gpa.free(path);
+
+    var buf: [256 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    w.print("{{\"version\":1,\"fingerprint\":\"{d}\",\"results\":[", .{fingerprint}) catch return;
+    for (results, 0..) |r, i| {
+        if (i > 0) w.writeByte(',') catch return;
+        w.writeAll("{\"id\":") catch return;
+        writeString(&w, r.id) catch return;
+        w.writeAll(",\"ok\":") catch return;
+        w.writeAll(if (r.ok) "true" else "false") catch return;
+        w.writeAll(",\"summary\":") catch return;
+        writeString(&w, r.summary) catch return;
+        w.writeByte('}') catch return;
+    }
+    w.writeAll("]}\n") catch return;
+    writeAtomic(io, path, w.buffered()) catch {};
+}
+
+fn cacheMatches(results: []const mission.CheckResult, checks: []const mission.Check) bool {
+    if (results.len != checks.len) return false;
+    for (results, checks) |r, c| {
+        if (!std.mem.eql(u8, r.id, c.id)) return false;
+    }
+    return true;
+}
+
+/// Callers own the result slice AND its strings.
+pub fn freeCheckResults(gpa: std.mem.Allocator, results: []mission.CheckResult) void {
+    freeCachedResults(gpa, results);
+}
+
+// ── Durable facts and project instructions ────────────────────────────────
+//
+// The plugin's `mission_fact` is structured and survives compaction; zode's
+// mission runner kept only distilled prose. These facts are HARNESS-confirmed
+// (check verdicts, review outcome, task completion), never model assertions.
+
+pub const FactKind = enum { check, task, review, state };
+
+pub const Fact = struct {
+    kind: FactKind,
+    subject: []const u8,
+    text: []const u8,
+};
+
+pub const facts_file = "facts.json";
+pub const max_facts: usize = 64;
+
+fn oneLine(gpa: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    for (text) |c| {
+        if (c == '\n' or c == '\r' or c == '\t') {
+            try out.append(gpa, ' ');
+        } else {
+            try out.append(gpa, c);
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Adds or replaces a fact by (kind, subject). Evicts the oldest at the cap.
+/// Returns true when the store changed.
+pub fn putFact(gpa: std.mem.Allocator, facts: *std.ArrayList(Fact), kind: FactKind, subject: []const u8, text: []const u8) !bool {
+    const clean_subject = std.mem.trim(u8, subject, " \t\r\n");
+    if (clean_subject.len == 0) return false;
+    const clean_text = try oneLine(gpa, std.mem.trim(u8, text, " \t\r\n"));
+    defer gpa.free(clean_text);
+    if (clean_text.len == 0) return false;
+    const short_text = clean_text[0..@min(clean_text.len, 240)];
+    const short_subject = clean_subject[0..@min(clean_subject.len, 80)];
+
+    for (facts.items) |*f| {
+        if (f.kind == kind and std.mem.eql(u8, f.subject, short_subject)) {
+            if (std.mem.eql(u8, f.text, short_text)) return false;
+            gpa.free(f.text);
+            f.text = try gpa.dupe(u8, short_text);
+            return true;
+        }
+    }
+    if (facts.items.len >= max_facts) {
+        const oldest = facts.orderedRemove(0);
+        gpa.free(oldest.subject);
+        gpa.free(oldest.text);
+    }
+    try facts.append(gpa, .{
+        .kind = kind,
+        .subject = try gpa.dupe(u8, short_subject),
+        .text = try gpa.dupe(u8, short_text),
+    });
+    return true;
+}
+
+pub fn putCheckFact(gpa: std.mem.Allocator, facts: *std.ArrayList(Fact), id: []const u8, ok: bool, summary: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const subject = try std.fmt.allocPrint(a, "check:{s}", .{id});
+    const text = if (ok) "PASS" else try std.fmt.allocPrint(a, "FAIL: {s}", .{summary});
+    _ = try putFact(gpa, facts, .check, subject, text);
+}
+
+pub fn freeFacts(gpa: std.mem.Allocator, facts: []Fact) void {
+    for (facts) |f| {
+        gpa.free(f.subject);
+        gpa.free(f.text);
+    }
+    gpa.free(facts);
+}
+
+/// Stable, bounded prompt block. Deterministic order: the order facts were
+/// recorded, newest last. No fact beyond `budget` bytes is emitted.
+pub fn renderFacts(gpa: std.mem.Allocator, facts: []const Fact, budget: usize) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    if (facts.len == 0) return out.toOwnedSlice(gpa);
+    try out.appendSlice(gpa, "[MISSION FACTS]\n");
+    for (facts) |f| {
+        var line_buf: [420]u8 = undefined;
+        const line = std.mem.print(&line_buf, "- {s} {s}: {s}\n", .{ @tagName(f.kind), f.subject, f.text }) catch break;
+        if (out.items.len + line.len > budget) break;
+        try out.appendSlice(gpa, line);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+pub fn loadFacts(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]Fact {
+    const path = try pathFor(gpa, root, facts_file);
+    defer gpa.free(path);
+    const data = dir.readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch return &.{};
+    defer gpa.free(data);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), data, .{}) catch return &.{};
+    if (parsed != .object) return &.{};
+    const arr_v = parsed.object.get("facts") orelse return &.{};
+    if (arr_v != .array) return &.{};
+    var out = std.ArrayList(Fact).empty;
+    errdefer {
+        freeFacts(gpa, out.items);
+    }
+    for (arr_v.array.items) |item| {
+        if (item != .object) continue;
+        const kind_s = objStr(item.object, "kind") orelse continue;
+        const kind = std.meta.stringToEnum(FactKind, kind_s) orelse continue;
+        const subject = objStr(item.object, "subject") orelse continue;
+        const text = objStr(item.object, "text") orelse continue;
+        try out.append(gpa, .{
+            .kind = kind,
+            .subject = try gpa.dupe(u8, subject),
+            .text = try gpa.dupe(u8, text),
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+pub fn saveFacts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, facts: []const Fact) !void {
+    const meta = pathFor(gpa, root, mission.dir_name) catch return;
+    defer gpa.free(meta);
+    try dir.createDirPath(io, meta);
+    const path = pathFor(gpa, root, facts_file) catch return;
+    defer gpa.free(path);
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("{\"version\":1,\"facts\":[");
+    for (facts, 0..) |f, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"kind\":");
+        try writeString(&w, @tagName(f.kind));
+        try w.writeAll(",\"subject\":");
+        try writeString(&w, f.subject);
+        try w.writeAll(",\"text\":");
+        try writeString(&w, f.text);
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}\n");
+    try writeAtomic(io, path, w.buffered());
+}
+
+pub const InstructionEntry = struct {
+    path: []const u8,
+    text: []const u8,
+};
+
+/// Joins the project's instruction files into one bounded prompt block.
+/// `entries` arrive highest priority first; a truncated file is still shown
+/// with its path so the agent knows the rest was omitted.
+pub fn composeInstructions(gpa: std.mem.Allocator, entries: []const InstructionEntry, budget: usize) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    if (entries.len == 0) return out.toOwnedSlice(gpa);
+    try out.appendSlice(gpa, "[PROJECT INSTRUCTIONS]\n");
+    for (entries) |entry| {
+        if (out.items.len >= budget) break;
+        var head_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+        const head = std.mem.print(&head_buf, "--- {s} ---\n", .{entry.path}) catch break;
+        if (out.items.len + head.len >= budget) break;
+        try out.appendSlice(gpa, head);
+        const room = budget - out.items.len;
+        const slice = entry.text[0..@min(entry.text.len, room)];
+        try out.appendSlice(gpa, slice);
+        if (slice.len < entry.text.len) try out.appendSlice(gpa, "\n[truncated]\n");
+        try out.append(gpa, '\n');
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+const CheckJob = struct {
+    check: mission.Check,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    result: mission.CheckResult,
+
+    fn run(self: *CheckJob) void {
+        const gpa = self.gpa;
+        const timeout_ms: i64 = @intCast(@min(self.check.timeout_ms, 600000));
+        const result = std.process.run(gpa, self.io, .{
+            .argv = &.{ "/bin/sh", "-c", self.check.cmd },
+            .cwd = .{ .path = self.root },
+            .stdout_limit = .limited(64 * 1024),
+            .stderr_limit = .limited(64 * 1024),
+            .timeout = .{ .duration = .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake } },
+        }) catch {
+            self.result = .{
+                .id = gpa.dupe(u8, self.check.id) catch "",
+                .ok = false,
+                .summary = gpa.dupe(u8, "spawn failed") catch "",
+            };
+            return;
+        };
+        defer gpa.free(result.stdout);
+        defer gpa.free(result.stderr);
+
+        const code = exitCode(result.term);
+        const ok = mission.evaluateExpect(self.check.expect, code, result.stdout);
+        const summary = std.mem.trim(u8, result.stdout, " \t\r\n");
+        const head = summary[0..@min(summary.len, 200)];
+
+        var evidence_buf: [512]u8 = undefined;
+        const evidence_path = std.fmt.bufPrint(&evidence_buf, "{s}/{s}/{s}.txt", .{ self.root, mission.dir_name, self.check.id }) catch "";
+        if (evidence_path.len > 0) {
+            const data = std.fmt.allocPrint(gpa,
+                "[check] {s}\n[cmd] {s}\n[exit] {d}\n[expect] {s}\n[ok] {s}\n\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n",
+                .{ self.check.id, self.check.cmd, code, self.check.expect, if (ok) "true" else "false", result.stdout, result.stderr }) catch "";
+            defer if (data.len > 0) gpa.free(data);
+            if (data.len > 0) writeAtomic(self.io, evidence_path, data) catch {};
+        }
+        self.result = .{
+            .id = gpa.dupe(u8, self.check.id) catch "",
+            .ok = ok,
+            .summary = gpa.dupe(u8, if (head.len > 0) head else "exit") catch "",
+        };
+    }
+};
+
+/// True when `path` is `prefix` itself or lives under it. Both are relative
+/// workspace paths; a file prefix matches only that file.
+pub fn pathUnder(path: []const u8, prefix: []const u8) bool {
+    var p = prefix;
+    while (std.mem.startsWith(u8, p, "./")) p = p[2..];
+    var path_p = path;
+    while (std.mem.startsWith(u8, path_p, "./")) path_p = path_p[2..];
+    if (p.len == 0) return true;
+    if (std.mem.eql(u8, path_p, p)) return true;
+    if (std.mem.endsWith(u8, p, "/")) return std.mem.startsWith(u8, path_p, p);
+    return std.mem.startsWith(u8, path_p, p) and path_p.len > p.len and path_p[p.len] == '/';
+}
+
+fn ownedBy(path: []const u8, owned: []const []const u8) bool {
+    for (owned) |prefix| if (pathUnder(path, prefix)) return true;
+    return false;
+}
+
 /// Hash every test file under `root`. Adding a test is fine; editing or
 /// deleting an existing one is refused by `checkTestIntegrity`.
 pub fn hashTests(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]TestHash {
+    return hashTestsFor(gpa, io, root, &.{});
+}
+
+/// Same as `hashTests`, but only for files owned by a task. An empty `owned`
+/// set means every test file, which keeps the baseline strict for missions
+/// whose tasks do not declare files.
+pub fn hashTestsFor(gpa: std.mem.Allocator, io: std.Io, root: []const u8, owned: []const []const u8) ![]TestHash {
     var out = std.ArrayList(TestHash).empty;
     errdefer out.deinit(gpa);
     var stack = std.ArrayList([]const u8).empty;
@@ -140,7 +550,7 @@ pub fn hashTests(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]TestHa
                 if (!skipDir(entry.name)) try stack.append(gpa, child_rel) else gpa.free(child_rel);
                 continue;
             }
-            if (entry.kind != .file or !isTestFile(child_rel)) {
+            if (entry.kind != .file or !isTestFile(child_rel) or (owned.len > 0 and !ownedBy(child_rel, owned))) {
                 gpa.free(child_rel);
                 continue;
             }
@@ -481,6 +891,8 @@ pub fn loadState(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !State {
         .clean_audit_rounds = @intCast(@max(0, objInt(o, "clean_audit_rounds", 0))),
         .max_clean_audit_rounds = @intCast(@max(1, objInt(o, "max_clean_audit_rounds", 2))),
         .auditor_text = try gpa.dupe(u8, objStr(o, "auditor_text") orelse ""),
+        .improve_revert_sha = try gpa.dupe(u8, objStr(o, "improve_revert_sha") orelse ""),
+        .improve_baseline_green = @intCast(@max(0, objInt(o, "improve_baseline_green", 0))),
     };
 }
 
@@ -533,6 +945,9 @@ pub fn saveState(gpa: std.mem.Allocator, io: std.Io, root: []const u8, state: St
     try writeString(&w, state.min_impact);
     try w.print(",\"clean_audit_rounds\":{d},\"max_clean_audit_rounds\":{d},\"auditor_text\":", .{ state.clean_audit_rounds, state.max_clean_audit_rounds });
     try writeString(&w, state.auditor_text);
+    try w.writeAll(",\"improve_revert_sha\":");
+    try writeString(&w, state.improve_revert_sha);
+    try w.print(",\"improve_baseline_green\":{d}", .{state.improve_baseline_green});
     try w.writeAll("}\n");
     try writeAtomic(io, path, w.buffered());
 }
@@ -626,42 +1041,72 @@ fn exitCode(term: std.process.Child.Term) u8 {
     };
 }
 
+/// Runs the criteria in batches of at most `max_parallel_checks`, then caches
+/// the verdicts under `.mission/checks-cache.json`. An unchanged workspace and
+/// criteria signature reuse the cached verdicts without spawning a shell.
+/// `gpa` must be thread-safe (the runner passes `Init.gpa`; tests pass
+/// `std.testing.allocator`). Caller owns the slice and its strings: see
+/// `freeCheckResults`.
 pub fn runChecks(gpa: std.mem.Allocator, io: std.Io, root: []const u8, checks: []const mission.Check) ![]mission.CheckResult {
-    var out = std.ArrayList(mission.CheckResult).empty;
-    errdefer out.deinit(gpa);
-    var evidence_buf: [512]u8 = undefined;
-    for (checks) |check| {
-        const timeout_ms: i64 = @intCast(@min(check.timeout_ms, 600000));
-        const result = std.process.run(gpa, io, .{
-            .argv = &.{ "/bin/sh", "-c", check.cmd },
-            .cwd = .{ .path = root },
-            .stdout_limit = .limited(64 * 1024),
-            .stderr_limit = .limited(64 * 1024),
-            .timeout = .{ .duration = .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake } },
-        }) catch {
-            try out.append(gpa, .{ .id = check.id, .ok = false, .summary = "spawn failed" });
-            continue;
-        };
-        defer gpa.free(result.stderr);
-        const code = exitCode(result.term);
-        const ok = mission.evaluateExpect(check.expect, code, result.stdout);
-        const summary = std.mem.trim(u8, result.stdout, " \t\r\n");
-        const evidence_path = std.fmt.bufPrint(&evidence_buf, "{s}/{s}/{s}.txt", .{ root, mission.dir_name, check.id }) catch "";
-        if (evidence_path.len > 0) {
-            const data = std.fmt.allocPrint(gpa,
-                "[check] {s}\n[cmd] {s}\n[exit] {d}\n[expect] {s}\n[ok] {s}\n\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n",
-                .{ check.id, check.cmd, code, check.expect, if (ok) "true" else "false", result.stdout, result.stderr }) catch "";
-            defer if (data.len > 0) gpa.free(data);
-            if (data.len > 0) writeAtomic(io,evidence_path, data) catch {};
+    if (checks.len == 0) return &.{};
+    const fingerprint = try workspaceFingerprint(gpa, io, root, checks);
+
+    if (loadCheckCache(gpa, io, root)) |cache| {
+        defer freeCachedResults(gpa, cache.results);
+        if (cache.fingerprint == fingerprint and cacheMatches(cache.results, checks)) {
+            var hit = try gpa.alloc(mission.CheckResult, cache.results.len);
+            var filled: usize = 0;
+            errdefer {
+                for (hit[0..filled]) |r| {
+                    gpa.free(r.id);
+                    gpa.free(r.summary);
+                }
+                gpa.free(hit);
+            }
+            for (cache.results, 0..) |r, i| {
+                const id = try gpa.dupe(u8, r.id);
+                errdefer gpa.free(id);
+                const summary = try gpa.dupe(u8, r.summary);
+                hit[i] = .{ .id = id, .ok = r.ok, .summary = summary };
+                filled += 1;
+            }
+            return hit;
         }
-        try out.append(gpa, .{
-            .id = check.id,
-            .ok = ok,
-            .summary = try gpa.dupe(u8, if (summary.len > 0) summary[0..@min(summary.len, 200)] else "exit"),
-        });
-        gpa.free(result.stdout);
     }
-    return out.toOwnedSlice(gpa);
+
+    const jobs = try gpa.alloc(CheckJob, checks.len);
+    defer gpa.free(jobs);
+    for (checks, jobs) |check, *job| {
+        job.* = .{ .check = check, .gpa = gpa, .io = io, .root = root, .result = .{ .id = "", .ok = false } };
+    }
+    var results_owned = false;
+    errdefer if (!results_owned) {
+        for (jobs) |job| {
+            if (job.result.id.len > 0) gpa.free(job.result.id);
+            if (job.result.summary.len > 0) gpa.free(job.result.summary);
+        }
+    };
+
+    var next: usize = 0;
+    while (next < jobs.len) {
+        const n = @min(max_parallel_checks, jobs.len - next);
+        var threads = @as([max_parallel_checks]?std.Thread, @splat(null));
+        for (0..n) |k| {
+            const job = &jobs[next + k];
+            threads[k] = std.Thread.spawn(.{}, CheckJob.run, .{job}) catch null;
+            if (threads[k] == null) CheckJob.run(job);
+        }
+        for (threads[0..n]) |maybe_thread| {
+            if (maybe_thread) |thread| thread.join();
+        }
+        next += n;
+    }
+
+    var out = try gpa.alloc(mission.CheckResult, jobs.len);
+    results_owned = true;
+    for (jobs, 0..) |job, i| out[i] = job.result;
+    saveCheckCache(gpa, io, root, fingerprint, out);
+    return out;
 }
 
 pub fn gitCommit(gpa: std.mem.Allocator, io: std.Io, root: []const u8, message: []const u8, paths: []const []const u8) !bool {
@@ -684,7 +1129,7 @@ pub fn gitCommit(gpa: std.mem.Allocator, io: std.Io, root: []const u8, message: 
     if (exitCode(add.term) != 0) return false;
 
     const commit = std.process.run(gpa, io, .{
-        .argv = &.{ "git", "commit", "--no-gpg-sign", "-m", message },
+        .argv = &.{ "git", "-c", "user.name=zode", "-c", "user.email=zode@local", "commit", "--no-gpg-sign", "-m", message },
         .cwd = .{ .path = root },
         .stdout_limit = .limited(64 * 1024),
         .stderr_limit = .limited(64 * 1024),
@@ -697,12 +1142,59 @@ pub fn gitCommit(gpa: std.mem.Allocator, io: std.Io, root: []const u8, message: 
         std.mem.indexOf(u8, commit.stderr, "nothing to commit") != null;
 }
 
+/// HEAD at this moment, owned by the caller. Null when the workspace is not
+/// a git repository or has no commit yet.
+pub fn gitHead(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?[]const u8 {
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "git", "rev-parse", "HEAD" },
+        .cwd = .{ .path = root },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    }) catch return null;
+    defer gpa.free(result.stderr);
+    if (exitCode(result.term) != 0) {
+        gpa.free(result.stdout);
+        return null;
+    }
+    const sha = std.mem.trim(u8, result.stdout, " \t\r\n");
+    const owned = if (sha.len > 0) gpa.dupe(u8, sha) catch null else null;
+    gpa.free(result.stdout);
+    return owned;
+}
+
+/// Undoes exactly one checkpoint commit. Never touches unrelated work: a
+/// failed revert is reported to the journal instead of forcing a reset.
+pub fn gitRevert(gpa: std.mem.Allocator, io: std.Io, root: []const u8, sha: []const u8) bool {
+    if (sha.len == 0) return false;
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ "git", "-c", "user.name=zode", "-c", "user.email=zode@local", "revert", "--no-edit", sha },
+        .cwd = .{ .path = root },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(64 * 1024),
+    }) catch return false;
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    return exitCode(result.term) == 0;
+}
+
 fn testRoot(a: std.mem.Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "/tmp/zode-mission-{s}", .{name});
 }
 
 fn cleanRoot(io: std.Io, root: []const u8) void {
     dir.deleteTree(io, root) catch {};
+}
+
+fn runGit(gpa: std.mem.Allocator, io: std.Io, root: []const u8, argv: []const []const u8) !void {
+    const result = try std.process.run(gpa, io, .{
+        .argv = argv,
+        .cwd = .{ .path = root },
+        .stdout_limit = .limited(16 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    if (exitCode(result.term) != 0) return error.GitFailed;
 }
 
 test "mission_io: heuristic plan round-trips through criteria and tasks files" {
@@ -734,7 +1226,7 @@ test "mission_io: state survives a JSON round trip" {
     try dir.createDirPath(io, meta);
 
     const hashes = [_]TestHash{.{ .path = "cli.test.js", .hash = 17_192_427_771_940_152_780 }};
-    const first = State{ .turn = 4, .status = .blocked, .max_turns = 9, .cost_usd = 1.25, .test_hashes = &hashes };
+    var first = State{ .turn = 4, .status = .blocked, .max_turns = 9, .cost_usd = 1.25, .test_hashes = &hashes };
     try saveState(a, io, root, first);
     const loaded = try loadState(a, io, root);
     try std.testing.expectEqual(@as(usize, 1), loaded.test_hashes.len);
@@ -743,6 +1235,39 @@ test "mission_io: state survives a JSON round trip" {
     try std.testing.expectEqual(mission.Status.blocked, loaded.status);
     try std.testing.expectEqual(@as(usize, 9), loaded.max_turns);
     try std.testing.expect(@abs(loaded.cost_usd - 1.25) < 0.0001);
+
+    first.improve_revert_sha = "0123456789abcdef";
+    first.improve_baseline_green = 3;
+    try saveState(a, io, root, first);
+    const reloaded = try loadState(a, io, root);
+    try std.testing.expectEqualStrings("0123456789abcdef", reloaded.improve_revert_sha);
+    try std.testing.expectEqual(@as(usize, 3), reloaded.improve_baseline_green);
+}
+
+test "mission_io: a checkpoint revert undoes an improvement, not the baseline" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const root = try testRoot(a, "revert");
+    defer cleanRoot(io, root);
+    try dir.createDirPath(io, root);
+    try runGit(a, io, root, &.{ "git", "init", "-q" });
+
+    const file = try std.fmt.allocPrint(a, "{s}/note.txt", .{root});
+    try dir.writeFile(io, .{ .sub_path = file, .data = "baseline\n" });
+    try runGit(a, io, root, &.{ "git", "add", "note.txt" });
+    try runGit(a, io, root, &.{ "git", "-c", "user.name=zode", "-c", "user.email=zode@local", "commit", "-q", "-m", "base" });
+    const baseline = gitHead(a, io, root) orelse return error.NoHead;
+
+    try dir.writeFile(io, .{ .sub_path = file, .data = "improved\n" });
+    try std.testing.expect(try gitCommit(a, io, root, "mission: improvement", &.{"note.txt"}));
+    const current = gitHead(a, io, root) orelse return error.NoHead;
+    try std.testing.expect(!std.mem.eql(u8, baseline, current));
+    try std.testing.expect(try gitRevert(a, io, root, current));
+
+    const restored = try dir.readFileAlloc(io, file, a, .limited(1024));
+    try std.testing.expectEqualStrings("baseline\n", restored);
 }
 
 test "mission_io: STOP is detected from disk" {
@@ -781,6 +1306,41 @@ test "mission_io: test erosion is detected by hash and count" {
     try std.testing.expect(checkTestIntegrity(baseline, changed) != null);
 }
 
+test "mission_io: pathUnder matches files and directories but not siblings" {
+    try std.testing.expect(pathUnder("src/foo.test.zig", "src"));
+    try std.testing.expect(pathUnder("src/foo.test.zig", "./src/"));
+    try std.testing.expect(pathUnder("src/foo.test.zig", "src/foo.test.zig"));
+    try std.testing.expect(!pathUnder("src/other.test.zig", "src/foo.test.zig"));
+    try std.testing.expect(!pathUnder("other/foo.test.zig", "src"));
+    try std.testing.expect(!pathUnder("srcx/foo.test.zig", "src"));
+}
+
+test "mission_io: scoped hashing ignores tests outside task-owned paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const root = try testRoot(a, "scoped-hash");
+    defer cleanRoot(io, root);
+
+    const owned = try std.fmt.allocPrint(a, "{s}/src/owned.test.zig", .{root});
+    const foreign = try std.fmt.allocPrint(a, "{s}/other/foreign.test.zig", .{root});
+    for ([_][]const u8{ owned, foreign }) |path| {
+        const slash = std.mem.lastIndexOfScalar(u8, path, '/').?;
+        try dir.createDirPath(io, path[0..slash]);
+        try dir.writeFile(io, .{ .sub_path = path, .data = "test {}\n" });
+    }
+
+    const scoped = try hashTestsFor(a, io, root, &.{"src"});
+    defer a.free(scoped);
+    try std.testing.expectEqual(@as(usize, 1), scoped.len);
+    try std.testing.expectEqualStrings("src/owned.test.zig", scoped[0].path);
+
+    const all = try hashTestsFor(a, io, root, &.{});
+    defer a.free(all);
+    try std.testing.expectEqual(@as(usize, 2), all.len);
+}
+
 test "mission_io: checks run and write evidence" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -795,8 +1355,165 @@ test "mission_io: checks run and write evidence" {
         .{ .id = "pass", .cmd = "printf 1.0.0", .expect = "contains:1.0.0" },
         .{ .id = "fail", .cmd = "exit 1", .expect = "exit0" },
     };
-    const results = try runChecks(a, io, root, &checks);
+    const results = try runChecks(std.testing.allocator, io, root, &checks);
+    defer freeCheckResults(std.testing.allocator, results);
     try std.testing.expectEqual(@as(usize, 2), results.len);
     try std.testing.expect(results[0].ok);
     try std.testing.expect(!results[1].ok);
+}
+
+fn countLines(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !usize {
+    const data = try dir.readFileAlloc(io, path, gpa, .limited(1024 * 1024));
+    defer gpa.free(data);
+    var n: usize = 0;
+    for (data) |c| if (c == '\n') {
+        n += 1;
+    };
+    return n;
+}
+
+test "mission_io: checks run in parallel up to the concurrency bound" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const root = try testRoot(a, "parallel");
+    defer cleanRoot(io, root);
+    try dir.createDirPath(io, root);
+    const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
+    try dir.createDirPath(io, meta);
+
+    // Deterministic barrier: every check appends a line, then waits until all
+    // three lines exist. A serial runner cannot satisfy it and all checks time
+    // out; a parallel runner passes in one tick.
+    const marks = "/tmp/zode-mission-parallel-marks";
+    defer dir.deleteFile(io, marks) catch {};
+    try dir.writeFile(io, .{ .sub_path = marks, .data = "" });
+    const barrier = try std.fmt.allocPrint(a,
+        "i=0; while [ \"$(wc -l < {s})\" -lt 3 ]; do i=$((i+1)); [ \"$i\" -ge 40 ] && exit 1; sleep 0.05; done",
+        .{marks});
+
+    const checks = [_]mission.Check{
+        .{ .id = "a", .cmd = try std.fmt.allocPrint(a, "echo a >> {s}; {s}", .{ marks, barrier }), .timeout_ms = 5000 },
+        .{ .id = "b", .cmd = try std.fmt.allocPrint(a, "echo b >> {s}; {s}", .{ marks, barrier }), .timeout_ms = 5000 },
+        .{ .id = "c", .cmd = try std.fmt.allocPrint(a, "echo c >> {s}; {s}", .{ marks, barrier }), .timeout_ms = 5000 },
+    };
+    const results = try runChecks(std.testing.allocator, io, root, &checks);
+    defer freeCheckResults(std.testing.allocator, results);
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    for (results) |r| try std.testing.expect(r.ok);
+}
+
+test "mission_io: unchanged checks are cached until the workspace or criteria change" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const root = try testRoot(a, "cache");
+    defer cleanRoot(io, root);
+    try dir.createDirPath(io, root);
+    const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
+    try dir.createDirPath(io, meta);
+
+    // The counter lives OUTSIDE the workspace so the checks themselves do not
+    // invalidate the fingerprint; it only records how often a shell ran.
+    const counter = "/tmp/zode-mission-cache-counter";
+    defer dir.deleteFile(io, counter) catch {};
+    try dir.writeFile(io, .{ .sub_path = counter, .data = "" });
+
+    var checks = [_]mission.Check{
+        .{ .id = "pass", .cmd = try std.fmt.allocPrint(a, "echo x >> {s}", .{counter}) },
+        .{ .id = "fail", .cmd = try std.fmt.allocPrint(a, "echo y >> {s}; exit 1", .{counter}) },
+    };
+
+    const first = try runChecks(std.testing.allocator, io, root, &checks);
+    defer freeCheckResults(std.testing.allocator, first);
+    try std.testing.expect(first[0].ok);
+    try std.testing.expect(!first[1].ok);
+    try std.testing.expectEqual(@as(usize, 2), try countLines(std.testing.allocator, io, counter));
+
+    const cache_path = try pathFor(a, root, mission.checks_cache_file);
+    try std.testing.expect(exists(io, cache_path));
+
+    const second = try runChecks(std.testing.allocator, io, root, &checks);
+    defer freeCheckResults(std.testing.allocator, second);
+    try std.testing.expectEqual(@as(usize, 2), second.len);
+    try std.testing.expect(second[0].ok);
+    try std.testing.expect(!second[1].ok);
+    try std.testing.expectEqual(@as(usize, 2), try countLines(std.testing.allocator, io, counter));
+
+    const source = try std.fmt.allocPrint(a, "{s}/source.txt", .{root});
+    try dir.writeFile(io, .{ .sub_path = source, .data = "changed\n" });
+    const third = try runChecks(std.testing.allocator, io, root, &checks);
+    defer freeCheckResults(std.testing.allocator, third);
+    try std.testing.expectEqual(@as(usize, 4), try countLines(std.testing.allocator, io, counter));
+
+    checks[0].cmd = try std.fmt.allocPrint(a, "echo x >> {s}; true", .{counter});
+    const fourth = try runChecks(std.testing.allocator, io, root, &checks);
+    defer freeCheckResults(std.testing.allocator, fourth);
+    try std.testing.expectEqual(@as(usize, 6), try countLines(std.testing.allocator, io, counter));
+}
+
+test "mission_io: durable facts replace by subject and survive a JSON round trip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const root = try testRoot(a, "facts");
+    defer cleanRoot(io, root);
+    try dir.createDirPath(io, root);
+    const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
+    try dir.createDirPath(io, meta);
+
+    var facts = std.ArrayList(Fact).empty;
+    defer {
+        for (facts.items) |f| {
+            a.free(f.subject);
+            a.free(f.text);
+        }
+        facts.deinit(a);
+    }
+    try std.testing.expect(try putFact(a, &facts, .check, "build", "FAIL: exit 1"));
+    try std.testing.expect(!try putFact(a, &facts, .check, "build", "FAIL: exit 1"));
+    try std.testing.expect(try putFact(a, &facts, .check, "build", "PASS"));
+    try std.testing.expectEqual(@as(usize, 1), facts.items.len);
+    try std.testing.expectEqualStrings("PASS", facts.items[0].text);
+    try std.testing.expect(try putFact(a, &facts, .review, "stage", "SEVERITY: low"));
+
+    try saveFacts(a, io, root, facts.items);
+    const loaded = try loadFacts(a, io, root);
+    defer freeFacts(a, loaded);
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+    try std.testing.expectEqual(FactKind.check, loaded[0].kind);
+    try std.testing.expectEqualStrings("build", loaded[0].subject);
+    try std.testing.expectEqualStrings("PASS", loaded[0].text);
+    try std.testing.expectEqual(FactKind.review, loaded[1].kind);
+
+    const rendered = try renderFacts(a, loaded, 4096);
+    defer a.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[MISSION FACTS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "check build: PASS") != null);
+}
+
+test "mission_io: instruction files are composed in order and capped" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const full = try composeInstructions(a, &.{
+        .{ .path = "AGENTS.md", .text = "first rule\n" },
+        .{ .path = "CLAUDE.md", .text = "second rule\n" },
+    }, 4096);
+    defer a.free(full);
+    try std.testing.expect(std.mem.indexOf(u8, full, "[PROJECT INSTRUCTIONS]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "--- AGENTS.md ---\nfirst rule") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "--- CLAUDE.md ---\nsecond rule") != null);
+
+    const capped = try composeInstructions(a, &.{
+        .{ .path = "AGENTS.md", .text = "0123456789" },
+        .{ .path = "CLAUDE.md", .text = "should not appear" },
+    }, 24);
+    defer a.free(capped);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "AGENTS.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped, "should not appear") == null);
 }

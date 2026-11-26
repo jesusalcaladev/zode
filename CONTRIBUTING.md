@@ -47,7 +47,8 @@ Phase 13 modules have reference harnesses in `tools/`: `remote_server.py` for
   keychain backend are POSIX-only. Use WSL or a Linux VM if you need zode on
   Windows; a native port would be a redesign, not a patch.
 - End-to-end verification against a real Anthropic key (`zig build test -De2e`).
-- The remaining parity tickets in `TASKS.md` (Phases 49–51).
+- The remaining mission-runtime gaps in [`docs/mission-gaps.md`](docs/mission-gaps.md).
+  The `TASKS.md` quality backlog (Phases 40–51) is fully closed.
 
 Checksum verification and the generated command reference are DONE (Phases 45.2
 and 45.6); they are no longer open areas.

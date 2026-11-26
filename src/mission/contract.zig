@@ -3,7 +3,7 @@
 //! A mission is a set of executable checks plus a task graph. The model proposes
 //! work and verdicts; the HARNESS owns completion. Everything in this file is
 //! decided from data only: no filesystem, no model, no TUI, no network. The IO
-//! half lives in `lib/mission_io.zig` and the headless driver in `tools/mission.zig`.
+//! half lives in `io.zig` and the headless driver in `runner.zig`.
 //!
 //! Same contract as the OpenCode plugin (`opencode-mission`), so a mission
 //! directory can move between the two harnesses without a format translation.
@@ -26,6 +26,7 @@ pub const journal_file = "journal.md";
 pub const stop_file = "STOP";
 pub const extend_file = "EXTEND";
 pub const evidence_dir = "evidence";
+pub const checks_cache_file = "checks-cache.json";
 pub const charter_file = "charter.md";
 pub const memory_file = "memory.md";
 pub const summary_file = "summary.md";
