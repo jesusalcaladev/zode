@@ -58,8 +58,10 @@ and the OpenCode plugin as of plugin commit `6fc066f`. Items are ordered by impa
 - **TUI part.** Neither harness exposes mission progress in the terminal UI.
   OpenCode plugins support a `./tui` part; zode could add a status line driven by
   `.mission/state.json`.
-- **Progress ETA / cost dashboard.** Plugin now prints a progress bar and
-  improvement cycles in `/mission status`; zode's `mission status` is plain text.
+- ~~**Progress / cost dashboard.**~~ **DONE.** `zode mission status` now prints
+  ASCII progress bars for checks and tasks, cost spend vs budget with a
+  percentage, improvement cycles, clean audits and failures. No ETA is shown:
+  elapsed-per-turn history is not recorded, so guessing one would invent data.
 
 ## 5. Code quality
 

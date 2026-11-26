@@ -40,7 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - full contract parity with the OpenCode plugin (mission) [`e4a539c8`](https://github.com/jesusalcaladev/zode/commit/e4a539c8)
 - continuous improvement loop for missions (core) [`da601944`](https://github.com/jesusalcaladev/zode/commit/da601944)
 - close autonomy gaps vs the OpenCode plugin (mission) [`bccfd226`](https://github.com/jesusalcaladev/zode/commit/bccfd226)
-- route models by role (mission) [`9621ac63`](https://github.com/jesusalcaladev/zode/commit/9621ac63)
+- route models by role (mission) [`eef98870`](https://github.com/jesusalcaladev/zode/commit/eef98870)
+- add progress and cost status dashboard (mission) [`e0524866`](https://github.com/jesusalcaladev/zode/commit/e0524866)
 
 ### Bug Fixes
 

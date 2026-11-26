@@ -338,6 +338,42 @@ pub fn putFact(gpa: std.mem.Allocator, facts: *std.ArrayList(Fact), kind: FactKi
     return true;
 }
 
+/// Plain-text progress and cost dashboard for `mission status`. Deterministic
+/// and terminal-safe: ASCII only, no colour, no ANSI, no invented numbers.
+pub fn renderStatus(gpa: std.mem.Allocator, state: State, task_count: usize, check_count: usize) ![]const u8 {
+    const checks_total = @max(check_count, 1);
+    const green = @min(state.best_green, checks_total);
+    const done = @min(state.tasks_done, @max(task_count, 1));
+    const width: usize = 20;
+    const check_filled = green * width / checks_total;
+    const task_filled = done * width / @max(task_count, 1);
+    const budget_pct = if (state.budget_usd > 0) @min(@as(u64, @intFromFloat(state.cost_usd / state.budget_usd * 100)), 100) else 0;
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(gpa);
+    const head = try std.fmt.allocPrint(gpa,
+        "Status: {s} · turn {d}/{d} · stage {s} · tier {d}\nChecks: [",
+        .{ state.status.name(), state.turn, state.max_turns, state.stage, state.strategy_tier });
+    defer gpa.free(head);
+    try out.appendSlice(gpa, head);
+    for (0..width) |i| try out.append(gpa, if (i < check_filled) '=' else '-');
+    const mid = try std.fmt.allocPrint(gpa, "] {d}/{d} green\nTasks:  [", .{ green, check_count });
+    defer gpa.free(mid);
+    try out.appendSlice(gpa, mid);
+    for (0..width) |i| try out.append(gpa, if (i < task_filled) '=' else '-');
+    const tail = try std.fmt.allocPrint(gpa,
+        "] {d}/{d} done\nCost:   ${d:.2} / ${d:.2} ({d}%)\n" ++
+            "Improvement: cycle {d}/{d} · clean audits {d}/{d} · failures {d}/{d}\n",
+        .{
+            done, task_count, state.cost_usd, state.budget_usd, budget_pct,
+            state.improve_cycles, state.max_improve_cycles, state.clean_audit_rounds,
+            state.max_clean_audit_rounds, state.failures, state.max_failures,
+        });
+    defer gpa.free(tail);
+    try out.appendSlice(gpa, tail);
+    return out.toOwnedSlice(gpa);
+}
+
 pub fn putCheckFact(gpa: std.mem.Allocator, facts: *std.ArrayList(Fact), id: []const u8, ok: bool, summary: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1542,6 +1578,21 @@ test "mission_io: durable facts replace by subject and survive a JSON round trip
     defer a.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MISSION FACTS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "check build: PASS") != null);
+}
+
+test "mission_io: status dashboard shows bounded progress and cost" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try renderStatus(a, .{
+        .status = .running, .turn = 4, .max_turns = 16, .stage = "implement",
+        .best_green = 3, .tasks_done = 1, .cost_usd = 1.25, .budget_usd = 5,
+    }, 2, 4);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Status: running · turn 4/16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "] 3/4 green") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "] 1/2 done") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Cost:   $1.25 / $5.00 (25%)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Improvement: cycle 0/5") != null);
 }
 
 test "mission_io: model-per-role overrides parse and match case-insensitively" {

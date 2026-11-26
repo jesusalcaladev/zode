@@ -176,12 +176,12 @@ fn cmdPlan(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
 fn printStatus(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !u8 {
     const state = try mission_io.loadState(gpa, io, root);
     const tasks = try mission_io.loadTasks(gpa, io, root);
+    defer gpa.free(tasks);
     const results = try mission_io.loadCriteria(gpa, io, root);
-    const green = state.best_green;
-    std.debug.print(
-        "Mission: {s}\nStatus: {s} · turn {d}/{d} · failures {d}/{d}\nChecks: {d} green · tasks: {d}/{d} done\nStrategy tier: {d}\n",
-        .{ root, state.status.name(), state.turn, state.max_turns, state.failures, state.max_failures, green, state.tasks_done, tasks.len, state.strategy_tier },
-    );
+    defer gpa.free(results);
+    const dashboard = try mission_io.renderStatus(gpa, state, tasks.len, results.len);
+    defer gpa.free(dashboard);
+    std.debug.print("Mission: {s}\n{s}", .{ root, dashboard });
     for (tasks) |t| {
         std.debug.print("  #{d} [{s}] {s}\n", .{ t.id, t.status.name(), t.subject });
     }
