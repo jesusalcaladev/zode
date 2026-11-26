@@ -3821,6 +3821,14 @@ pub fn cmdUndo(m: *tui.Model, arg: ?[]const u8) void {
                 failed += 1;
                 out.print("  conversation: could not rewind to {d} message(s)\n", .{cp.msg_count}) catch {};
             };
+            // 50.5: the disk transcript is not the one the user is looking at.
+            // Rebuild the in-memory paragraphs from the rewound session in the
+            // SAME command, so the removed turn disappears without a restart.
+            // `clearHistory` leaves the session file alone (the rewind already
+            // persisted it) and drops the stale paragraph/segment caches.
+            m.clearHistory();
+            agent.replaySessionMessages(m, s);
+            out.writeAll("  conversation: live transcript rewound\n") catch {};
         }
     }
 
@@ -4657,6 +4665,32 @@ test "settings: a verify report feeds the three-way pill" {
     try std.testing.expectEqual(@as(usize, 1), m.verify_counts.verified);
     try std.testing.expectEqual(@as(usize, 1), m.verify_counts.refuted);
     try std.testing.expectEqual(@as(usize, 3), m.verify_counter.target);
+}
+
+test "undo: a rewound session rebuilds the live transcript, not only the disk" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+    const s = try session_mod.Session.create(a, io);
+    defer a.destroy(s);
+    defer s.deinit();
+    const path = try a.dupe(u8, s.path.?);
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try s.append(.user, "first turn");
+    try s.append(.assistant, "second turn");
+    try s.rewindMessagesTo(1);
+
+    var m = tui.Model.init(a);
+    defer m.deinit();
+    m.clearHistory();
+    agent.replaySessionMessages(&m, s);
+
+    try std.testing.expectEqual(@as(usize, 1), m.paras.items.len);
+    const text = m.paras.items[0].text;
+    try std.testing.expect(std.mem.indexOf(u8, text, "first turn") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "second turn") == null);
 }
 
 test "cache: /cache reports detected prefix breaks" {
