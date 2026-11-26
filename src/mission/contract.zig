@@ -523,6 +523,25 @@ test "decide: STOP, blocked and budgets terminate; green work completes" {
     try std.testing.expectEqual(Decision.work, decide(base));
 }
 
+test "decide: hard stops beat a green, complete mission" {
+    const done = DecideArgs{ .all_checks_green = true, .all_tasks_done = true };
+    try std.testing.expectEqual(Decision{ .stop = .stop_file }, decide(.{ .stop_file = true, .all_checks_green = true, .all_tasks_done = true }));
+    try std.testing.expectEqual(Decision{ .stop = .blocked }, decide(.{ .verdict_blocked = true, .all_checks_green = true, .all_tasks_done = true }));
+    try std.testing.expectEqual(Decision.complete, decide(done));
+
+    // Cost is checked before the turn ceiling: an over-budget mission must
+    // report the reason the operator can act on (money), not a turn number.
+    try std.testing.expectEqual(Decision{ .stop = .budget }, decide(.{
+        .cost_usd = 5, .budget_usd = 5, .turn = 99, .max_turns = 16,
+    }));
+    // A deadline outranks budget.
+    try std.testing.expectEqual(Decision{ .stop = .deadline }, decide(.{
+        .deadline_exceeded = true, .cost_usd = 5, .budget_usd = 5, .turn = 99, .max_turns = 16,
+    }));
+    // Zero budget means unlimited, not "stop immediately".
+    try std.testing.expectEqual(Decision.work, decide(.{ .budget_usd = 0, .cost_usd = 1000 }));
+}
+
 test "evaluateExpect: exit0 and contains" {
     try std.testing.expect(evaluateExpect("exit0", 0, ""));
     try std.testing.expect(!evaluateExpect("exit0", 1, ""));

@@ -95,6 +95,20 @@ pub fn distill(gpa: std.mem.Allocator, journal: []const u8, memory: []const u8, 
     return .{ .memory = try gpa.dupe(u8, text), .summary = summary };
 }
 
+test "memory: distilled output never exceeds its character budget" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var journal = std.ArrayList(u8).empty;
+    for (0..40) |i| {
+        const line = try std.fmt.allocPrint(a, "[2026-01-01] decision: rebuild step {d} passed with 3 green checks\n", .{i});
+        try journal.appendSlice(a, line);
+    }
+    const out = try distill(a, journal.items, "", 240);
+    try std.testing.expect(out.memory.len <= 240);
+    try std.testing.expect(out.summary.len > 0);
+}
+
 test "memory: distill keeps decisions and drops the rest" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

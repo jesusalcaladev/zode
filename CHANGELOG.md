@@ -56,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop ending turns at 12 iterations and explain gate refusals (agent) [`76e1f0bc`](https://github.com/jesusalcaladev/zode/commit/76e1f0bc)
 - stop inferring tool failures from the summary text (tui) [`b2e5c400`](https://github.com/jesusalcaladev/zode/commit/b2e5c400)
 - finish moving config feedback out of the transcript (tui) [`18f38529`](https://github.com/jesusalcaladev/zode/commit/18f38529)
-- bound worker concurrency (mission) [`445498b1`](https://github.com/jesusalcaladev/zode/commit/445498b1)
+- bound worker concurrency (mission) [`bff212ae`](https://github.com/jesusalcaladev/zode/commit/bff212ae)
 
 ### Chores
 
@@ -101,6 +101,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - end-to-end smoke for --chat (43.7) (headless) [`4bf7827b`](https://github.com/jesusalcaladev/zode/commit/4bf7827b)
 - wait for asserted screen state instead of fixed sleeps (47.5) (pty) [`d8a5eb1c`](https://github.com/jesusalcaladev/zode/commit/d8a5eb1c)
 - cover the last untested pure module (47.7) (envutil) [`c4425861`](https://github.com/jesusalcaladev/zode/commit/c4425861)
+- add parity cases for supervisor decisions (mission) [`01ad08a0`](https://github.com/jesusalcaladev/zode/commit/01ad08a0)
 
 ### Styles
 

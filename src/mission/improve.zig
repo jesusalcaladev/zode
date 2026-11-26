@@ -104,6 +104,23 @@ test "improve: findings are parsed and ranked above the threshold" {
     try std.testing.expectEqual(@as(std.meta.Tag(Action), .implement), std.meta.activeTag(action));
 }
 
+test "improve: NO FINDINGS and high-risk findings never create work" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const none = try parseFindings(a, "NO FINDINGS\nnothing to report");
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+    try std.testing.expectEqual(@as(std.meta.Tag(Action), .audit), std.meta.activeTag(decide(.{ .findings = none })));
+
+    const risky = try parseFindings(a, "FINDING: impact=high risk=high files=a.zig rewrite the parser");
+    try std.testing.expectEqual(@as(usize, 1), risky.len);
+    try std.testing.expectEqual(@as(std.meta.Tag(Action), .audit), std.meta.activeTag(decide(.{ .findings = risky })));
+
+    const low = try parseFindings(a, "finding: impact=medium risk=low files=b.zig tighten a check");
+    try std.testing.expectEqual(@as(std.meta.Tag(Action), .implement), std.meta.activeTag(decide(.{ .findings = low })));
+}
+
 test "improve: stops on threshold, cycles and budget" {
     try std.testing.expectEqualStrings("no-high-value-improvements", decide(.{ .clean_rounds = 2 }).stop);
     try std.testing.expectEqualStrings("improve-cycle-limit", decide(.{ .improve_cycles = 5 }).stop);

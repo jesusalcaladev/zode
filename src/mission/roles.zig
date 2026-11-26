@@ -68,6 +68,19 @@ pub fn stageFor(stage: Stage, tasks_done: bool, review: Review, review_attempts:
     return .{ .stage = .review, .decision = .blocked };
 }
 
+test "roles: two independent reviews are merged before the gate" {
+    const first = "SEVERITY: high — wrong file touched";
+    const second = "[SECOND OPINION]\nSEVERITY: low — naming";
+    const combined = parseReview(first ++ "\n" ++ second);
+    try std.testing.expectEqual(@as(usize, 1), combined.high);
+    try std.testing.expectEqual(@as(usize, 1), combined.low);
+    try std.testing.expect(!combined.ok());
+
+    const clean = parseReview("SEVERITY: low — fine\n[SECOND OPINION]\nSEVERITY: low — fine too");
+    try std.testing.expect(clean.ok());
+    try std.testing.expectEqual(@as(usize, 0), clean.high);
+}
+
 test "roles: only implementers write" {
     try std.testing.expect(canWrite(.implementer));
     try std.testing.expect(!canWrite(.investigator));
