@@ -21,8 +21,12 @@ and the OpenCode plugin as of plugin commit `6fc066f`. Items are ordered by impa
 
 ## 2. Intelligence
 
-- **Model per role.** Plugin: `fastModel` for read-only roles, `model` for
-  implementers, `modelsByRole` overrides. zode uses one agent command/model.
+- ~~**Model per role.**~~ **DONE.** `ZODE_MISSION_FAST_MODEL` serves read-only
+  roles (investigator, reviewer, auditor, tester); implementers and workers
+  keep the lead model from `ZODE_MISSION_MODELS`. `ZODE_MISSION_MODELS_BY_ROLE`
+  accepts `role=model,…` overrides (case-insensitive role, last wins).
+  Remaining difference: the plugin can change models per brief; zode resolves
+  them once per turn.
 - ~~**Project instructions.**~~ **DONE.** `src/mission/runner.zig` reuses
   `src/lib/instructions.zig` and injects the `CLAUDE.local.md` / `AGENTS.md` /
   `CLAUDE.md` hierarchy (plus the user-level file) into lead, worker and role

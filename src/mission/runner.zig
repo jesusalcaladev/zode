@@ -71,6 +71,19 @@ fn buildContext(gpa: std.mem.Allocator, project_instructions: []const u8, facts_
     return std.fmt.allocPrint(gpa, "{s}{s}", .{ project_instructions, facts_text });
 }
 
+const RoleModels = struct {
+    fast: ?[]const u8 = null,
+    overrides: []mission_io.RoleModel = &.{},
+
+    /// Explicit `role=model` first, then the fast model for read-only roles,
+    /// then the lead/worker model for implementers.
+    fn modelFor(self: RoleModels, role: []const u8, lead: ?[]const u8) ?[]const u8 {
+        if (mission_io.roleModelOverride(self.overrides, role)) |m| return m;
+        if (mission_io.isReadOnlyRole(role)) return self.fast orelse lead;
+        return lead;
+    }
+};
+
 fn joinArgs(gpa: std.mem.Allocator, args: []const []const u8) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(gpa);
@@ -404,7 +417,7 @@ fn readReport(gpa: std.mem.Allocator, io: std.Io, root: []const u8, role: []cons
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(256 * 1024)) catch null;
 }
 
-fn callRole(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, role: []const u8, prompt: []const u8, context: []const u8) ?[]const u8 {
+fn callRole(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, role: []const u8, prompt: []const u8, context: []const u8, model: ?[]const u8) ?[]const u8 {
     const report_path = std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ mission.dir_name, mission.reports_dir, role }) catch return null;
     defer gpa.free(report_path);
     const full_prompt = std.fmt.allocPrint(gpa,
@@ -412,7 +425,7 @@ fn callRole(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ
         .{ context, prompt, report_path },
     ) catch return null;
     defer gpa.free(full_prompt);
-    _ = callAgent(gpa, io, env, root, full_prompt, envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat", null);
+    _ = callAgent(gpa, io, env, root, full_prompt, envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat", model);
     return readReport(gpa, io, root, role);
 }
 
@@ -490,11 +503,11 @@ fn rollbackIfRegressed(gpa: std.mem.Allocator, io: std.Io, root: []const u8, sta
     try mission_io.saveState(gpa, io, root, state.*);
 }
 
-fn improveCycle(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, state: *mission_io.State, context: []const u8, green: usize) !bool {
+fn improveCycle(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, root: []const u8, state: *mission_io.State, context: []const u8, green: usize, auditor_model: ?[]const u8) !bool {
     if (!state.continuous_improvement) return false;
     if (state.auditor_text.len == 0) {
         const report = callRole(gpa, io, env, root, "auditor",
-            "[MISSION AUDITOR] Read the workspace. Emit FINDING: impact=high|medium|low risk=low|medium|high files=a.zig,b.zig description. Write NO FINDINGS if nothing valuable.", context) orelse "NO FINDINGS";
+            "[MISSION AUDITOR] Read the workspace. Emit FINDING: impact=high|medium|low risk=low|medium|high files=a.zig,b.zig description. Write NO FINDINGS if nothing valuable.", context, auditor_model) orelse "NO FINDINGS";
         state.auditor_text = try gpa.dupe(u8, report);
         try mission_io.saveState(gpa, io, root, state.*);
         try mission_io.appendJournal(gpa, io, root, "improvement audit dispatched");
@@ -591,6 +604,11 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
     defer gpa.free(project_instructions);
     const worker_count_raw = envGet(env, "ZODE_MISSION_WORKERS") orelse "1";
     const workers = std.fmt.parseInt(usize, worker_count_raw, 10) catch 1;
+    var role_models = RoleModels{ .fast = envGet(env, "ZODE_MISSION_FAST_MODEL") };
+    if (envGet(env, "ZODE_MISSION_MODELS_BY_ROLE")) |raw| {
+        role_models.overrides = try mission_io.parseRoleModels(gpa, raw);
+    }
+    defer if (role_models.overrides.len > 0) mission_io.freeRoleModels(gpa, role_models.overrides);
     var models = std.ArrayList([]const u8).empty;
     defer models.deinit(gpa);
     if (envGet(env, "ZODE_MISSION_MODELS")) |raw| {
@@ -685,6 +703,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
 
         if (mission.applyTaskResults(tasks, results)) try mission_io.saveTasks(gpa, io, root, tasks);
         const green = mission.countGreen(results);
+        const lead_model: ?[]const u8 = if (models.items.len > 0) models.items[model_index] else null;
         try rollbackIfRegressed(gpa, io, root, &state, green);
         const all_done = mission.allDone(tasks);
         state.turn += 1;
@@ -754,7 +773,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
                 }
             }
             if (std.mem.eql(u8, state.stage, "investigate")) {
-                const report = callRole(gpa, io, env, root, "investigator", try std.fmt.allocPrint(gpa, "[MISSION INVESTIGATOR] Objective: {s}\nRead the workspace. Do not edit files.", .{objective}), context);
+                const report = callRole(gpa, io, env, root, "investigator", try std.fmt.allocPrint(gpa, "[MISSION INVESTIGATOR] Objective: {s}\nRead the workspace. Do not edit files.", .{objective}), context, role_models.modelFor("investigator", lead_model));
                 if (report) |text| state.research_text = try gpa.dupe(u8, text);
                 state.stage = "implement";
                 try mission_io.saveState(gpa, io, root, state);
@@ -770,8 +789,8 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
             if (stage_info.stage == .review and state.review_text.len == 0) {
                 // Two independent reviewers: a single high finding used to
                 // reopen work on a false positive. Both reports gate the stage.
-                _ = callRole(gpa, io, env, root, "reviewer", try std.fmt.allocPrint(gpa, "[MISSION REVIEWER] Objective: {s}\nReview files and write SEVERITY findings. Do not edit files.", .{objective}), context);
-                _ = callRole(gpa, io, env, root, "reviewer2", try std.fmt.allocPrint(gpa, "[MISSION SECOND REVIEWER] Objective: {s}\nReview the SAME work independently for correctness, regressions and unfinished criteria. Ignore any other review. Write SEVERITY findings. Do not edit files.", .{objective}), context);
+                _ = callRole(gpa, io, env, root, "reviewer", try std.fmt.allocPrint(gpa, "[MISSION REVIEWER] Objective: {s}\nReview files and write SEVERITY findings. Do not edit files.", .{objective}), context, role_models.modelFor("reviewer", lead_model));
+                _ = callRole(gpa, io, env, root, "reviewer2", try std.fmt.allocPrint(gpa, "[MISSION SECOND REVIEWER] Objective: {s}\nReview the SAME work independently for correctness, regressions and unfinished criteria. Ignore any other review. Write SEVERITY findings. Do not edit files.", .{objective}), context, role_models.modelFor("reviewer2", lead_model));
                 const first_review = readReport(gpa, io, root, "reviewer") orelse "SEVERITY: low — no review report produced";
                 defer gpa.free(first_review);
                 const second_review = readReport(gpa, io, root, "reviewer2") orelse "";
@@ -811,7 +830,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
 
         switch (decision) {
             .complete => {
-                if (try improveCycle(gpa, io, env, root, &state, context, green)) continue;
+                if (try improveCycle(gpa, io, env, root, &state, context, green, role_models.modelFor("auditor", lead_model))) continue;
                 const chained = try chainNext(gpa, io, env, root, &state);
                 state.status = if (chained) .running else .complete;
                 try mission_io.saveState(gpa, io, root, state);
@@ -852,7 +871,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
                     }
                 }
                 try mission_io.appendJournal(gpa, io, root, "dispatching parallel workers");
-                for (waves) |wave| callWorkers(gpa, io, env, root, tasks, wave, if (models.items.len > 0) models.items[model_index] else null, context);
+                for (waves) |wave| callWorkers(gpa, io, env, root, tasks, wave, role_models.modelFor("worker", lead_model), context);
                 const after = try mission_io.runChecks(gpa, io, root, checks);
                 defer mission_io.freeCheckResults(gpa, after);
                 if (mission.allGreen(after)) {
@@ -884,8 +903,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
         }
         if (state.strategy_tier >= 2) prompt.appendSlice(gpa, "Strategy tier 2: change the approach, do not repeat the same edit. ") catch return 1;
         prompt.appendSlice(gpa, "Keep working until every check is green. Do not declare done; the harness decides completion.") catch return 1;
-        const model = if (models.items.len > 0) models.items[model_index] else null;
-        const ok = callAgent(gpa, io, env, root, prompt.items, envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat", model);
+        const ok = callAgent(gpa, io, env, root, prompt.items, envGet(env, "ZODE_MISSION_AGENT") orelse "zode --chat", lead_model);
         if (ok) {
             state.failures = 0;
             state.writes += 1;

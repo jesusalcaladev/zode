@@ -60,6 +60,8 @@ network, environment) is not modeled — delete the cache file to force a run.
 | `ZODE_MISSION_WORKERS` | `1` | Parallel workers per wave. `>1` spawns one background agent per ready task, grouped by disjoint `files` |
 | `ZODE_MISSION_PLANNER` | unset | Set to any value to ask the agent for a JSON plan; falls back to the heuristic plan on error |
 | `ZODE_MISSION_MODELS` | unset | Comma-separated model ids. On a failed turn the driver rotates to the next one by setting `ZODE_MODEL` for the child |
+| `ZODE_MISSION_FAST_MODEL` | unset | Model for read-only roles (investigator, reviewer, second reviewer, auditor). Falls back to the lead model |
+| `ZODE_MISSION_MODELS_BY_ROLE` | unset | `role=model,…` overrides, e.g. `reviewer=fast-1,implementer=big-1`. Case-insensitive role; last match wins |
 
 With workers enabled the driver writes one prompt per task under
 `.mission/prompts/` and starts one thread per task in the same wave. Each worker

@@ -424,6 +424,55 @@ pub fn saveFacts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, facts: []
     try writeAtomic(io, path, w.buffered());
 }
 
+// ── Model per role ─────────────────────────────────────────────────────────
+//
+// Read-only roles (investigator, reviewer, auditor, tester) can use a cheaper
+// model; implementers keep the lead model. `role=model` overrides win.
+
+pub const RoleModel = struct {
+    role: []const u8,
+    model: []const u8,
+};
+
+pub fn parseRoleModels(gpa: std.mem.Allocator, raw: []const u8) ![]RoleModel {
+    var out = std.ArrayList(RoleModel).empty;
+    errdefer out.deinit(gpa);
+    var it = std.mem.tokenizeScalar(u8, raw, ',');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const role = std.mem.trim(u8, pair[0..eq], " \t");
+        const model = std.mem.trim(u8, pair[eq + 1 ..], " \t");
+        if (role.len == 0 or model.len == 0) continue;
+        try out.append(gpa, .{
+            .role = try gpa.dupe(u8, role),
+            .model = try gpa.dupe(u8, model),
+        });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+pub fn freeRoleModels(gpa: std.mem.Allocator, entries: []RoleModel) void {
+    for (entries) |e| {
+        gpa.free(e.role);
+        gpa.free(e.model);
+    }
+    gpa.free(entries);
+}
+
+/// Explicit overrides are matched case-insensitively; the last one wins.
+pub fn roleModelOverride(entries: []const RoleModel, role: []const u8) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (entries) |e| {
+        if (std.ascii.eqlIgnoreCase(e.role, role)) found = e.model;
+    }
+    return found;
+}
+
+pub fn isReadOnlyRole(role: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(role, "implementer") or std.ascii.eqlIgnoreCase(role, "worker")) return false;
+    return true;
+}
+
 pub const InstructionEntry = struct {
     path: []const u8,
     text: []const u8,
@@ -1493,6 +1542,22 @@ test "mission_io: durable facts replace by subject and survive a JSON round trip
     defer a.free(rendered);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "[MISSION FACTS]") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "check build: PASS") != null);
+}
+
+test "mission_io: model-per-role overrides parse and match case-insensitively" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const entries = try parseRoleModels(a, " reviewer =fast-1 ,IMPLEMENTER=big-1, broken, =invalid, reviewer=fast-2 ");
+    defer freeRoleModels(a, entries);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expectEqualStrings("fast-2", roleModelOverride(entries, "Reviewer").?);
+    try std.testing.expectEqualStrings("big-1", roleModelOverride(entries, "implementer").?);
+    try std.testing.expect(roleModelOverride(entries, "auditor") == null);
+    try std.testing.expect(isReadOnlyRole("reviewer"));
+    try std.testing.expect(isReadOnlyRole("AUDITOR"));
+    try std.testing.expect(!isReadOnlyRole("implementer"));
+    try std.testing.expect(!isReadOnlyRole("worker"));
 }
 
 test "mission_io: instruction files are composed in order and capped" {

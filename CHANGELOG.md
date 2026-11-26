@@ -39,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add recovery, model rotation, test guard and model planner (mission) [`dfba48c8`](https://github.com/jesusalcaladev/zode/commit/dfba48c8)
 - full contract parity with the OpenCode plugin (mission) [`e4a539c8`](https://github.com/jesusalcaladev/zode/commit/e4a539c8)
 - continuous improvement loop for missions (core) [`da601944`](https://github.com/jesusalcaladev/zode/commit/da601944)
-- close autonomy gaps vs the OpenCode plugin (mission) [`401b1dd6`](https://github.com/jesusalcaladev/zode/commit/401b1dd6)
+- close autonomy gaps vs the OpenCode plugin (mission) [`bccfd226`](https://github.com/jesusalcaladev/zode/commit/bccfd226)
+- route models by role (mission) [`9621ac63`](https://github.com/jesusalcaladev/zode/commit/9621ac63)
 
 ### Bug Fixes
 
