@@ -604,7 +604,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.M
     const project_instructions = try loadProjectInstructions(gpa, io, env, root);
     defer gpa.free(project_instructions);
     const worker_count_raw = envGet(env, "ZODE_MISSION_WORKERS") orelse "1";
-    const workers = std.fmt.parseInt(usize, worker_count_raw, 10) catch 1;
+    const workers = mission_io.clampWorkers(worker_count_raw, 1);
     var role_models = RoleModels{ .fast = envGet(env, "ZODE_MISSION_FAST_MODEL") };
     if (envGet(env, "ZODE_MISSION_MODELS_BY_ROLE")) |raw| {
         role_models.overrides = try mission_io.parseRoleModels(gpa, raw);

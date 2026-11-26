@@ -56,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop ending turns at 12 iterations and explain gate refusals (agent) [`76e1f0bc`](https://github.com/jesusalcaladev/zode/commit/76e1f0bc)
 - stop inferring tool failures from the summary text (tui) [`b2e5c400`](https://github.com/jesusalcaladev/zode/commit/b2e5c400)
 - finish moving config feedback out of the transcript (tui) [`18f38529`](https://github.com/jesusalcaladev/zode/commit/18f38529)
+- bound worker concurrency (mission) [`445498b1`](https://github.com/jesusalcaladev/zode/commit/445498b1)
 
 ### Chores
 
@@ -82,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - pass the autocomplete count into drawAutocomplete (tui) [`9ace7f27`](https://github.com/jesusalcaladev/zode/commit/9ace7f27)
 - remove the duplicated palette key dispatch (47.6) (tui) [`965d2cf2`](https://github.com/jesusalcaladev/zode/commit/965d2cf2)
 - integrate mission runtime into zode (core) [`7644158c`](https://github.com/jesusalcaladev/zode/commit/7644158c)
-- remove dead code and close one-shot leaks (mission) [`f84f2104`](https://github.com/jesusalcaladev/zode/commit/f84f2104)
+- remove dead code and close one-shot leaks (mission) [`0c0ead9c`](https://github.com/jesusalcaladev/zode/commit/0c0ead9c)
 
 ### Performance
 

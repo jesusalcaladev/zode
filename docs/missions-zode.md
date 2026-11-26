@@ -57,7 +57,7 @@ network, environment) is not modeled — delete the cache file to force a run.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ZODE_MISSION_AGENT` | `zode --chat` | Command used for each lead/worker turn; the prompt is appended as the last argument |
-| `ZODE_MISSION_WORKERS` | `1` | Parallel workers per wave. `>1` spawns one background agent per ready task, grouped by disjoint `files` |
+| `ZODE_MISSION_WORKERS` | `1` | Parallel workers per wave, capped at 8. `>1` spawns one agent thread per ready task, grouped by disjoint `files`; invalid or zero values fall back to 1 |
 | `ZODE_MISSION_WORKSPACE` | unset | When set to a mission workspace, zode's TUI adds one dim footer segment (`mission N/M checks · A/B tasks`), read once at startup |
 | `ZODE_MISSION_PLANNER` | unset | Set to any value to ask the agent for a JSON plan; falls back to the heuristic plan on error |
 | `ZODE_MISSION_MODELS` | unset | Comma-separated model ids. On a failed turn the driver rotates to the next one by setting `ZODE_MODEL` for the child |

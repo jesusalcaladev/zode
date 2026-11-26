@@ -123,6 +123,17 @@ fn skipDir(name: []const u8) bool {
 /// Bounded parallelism for criteria: enough to overlap a few suites without
 /// turning a mission into a fork bomb on a small machine.
 pub const max_parallel_checks: usize = 3;
+/// Same bound for worker agents. Each worker is a separate agent process, so
+/// this is deliberately lower than what a shell loop could spawn.
+pub const max_parallel_workers: usize = 8;
+
+/// Parses `ZODE_MISSION_WORKERS` without ever trusting the raw value. Bad and
+/// zero values fall back to the serial default; large values are clamped.
+pub fn clampWorkers(raw: []const u8, fallback: usize) usize {
+    const n = std.fmt.parseInt(usize, raw, 10) catch return fallback;
+    if (n == 0) return fallback;
+    return @min(n, max_parallel_workers);
+}
 
 fn fnvUpdate(h: u64, bytes: []const u8) u64 {
     var out = h;
@@ -1446,6 +1457,13 @@ fn countLines(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !usize {
         n += 1;
     };
     return n;
+}
+
+test "mission_io: worker count is parsed safely and clamped" {
+    try std.testing.expectEqual(@as(usize, 1), clampWorkers("garbage", 1));
+    try std.testing.expectEqual(@as(usize, 1), clampWorkers("0", 1));
+    try std.testing.expectEqual(@as(usize, 3), clampWorkers("3", 1));
+    try std.testing.expectEqual(@as(usize, 8), clampWorkers("9999", 1));
 }
 
 test "mission_io: checks run in parallel up to the concurrency bound" {
