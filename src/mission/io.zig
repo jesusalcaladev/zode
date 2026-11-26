@@ -710,14 +710,6 @@ fn parseStatus(s: []const u8) mission.Status {
     return .running;
 }
 
-fn writeJson(gpa: std.mem.Allocator, io: std.Io, path: []const u8, comptime fmt: []const u8, args: anytype) !void {
-    var buf: [64 * 1024]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    try w.print(fmt, args);
-    try writeAtomic(io,path, w.buffered());
-    _ = gpa;
-}
-
 pub fn writePlanFiles(gpa: std.mem.Allocator, io: std.Io, root: []const u8, plan: mission.Plan) !void {
     const meta_dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, mission.dir_name });
     defer gpa.free(meta_dir);
@@ -729,8 +721,10 @@ pub fn writePlanFiles(gpa: std.mem.Allocator, io: std.Io, root: []const u8, plan
     const mission_path = try pathFor(gpa, root, mission.mission_file);
     defer gpa.free(mission_path);
     if (!exists(io, mission_path)) {
-        try writeAtomic(io,mission_path, try std.fmt.allocPrint(gpa,
-            "---\nid: mission\nmax_turns: 16\nbudget_usd: 5\n---\n{s}\n", .{plan.objective}));
+        const doc = try std.fmt.allocPrint(gpa,
+            "---\nid: mission\nmax_turns: 16\nbudget_usd: 5\n---\n{s}\n", .{plan.objective});
+        defer gpa.free(doc);
+        try writeAtomic(io, mission_path, doc);
     }
 
     const criteria_path = try pathFor(gpa, root, mission.criteria_file);
@@ -1073,9 +1067,6 @@ pub fn readMemory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]const
 }
 pub fn writeMemory(gpa: std.mem.Allocator, io: std.Io, root: []const u8, text: []const u8) !void {
     try writeNamed(gpa, io, root, mission.memory_file, text);
-}
-pub fn readSummary(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]const u8 {
-    return readNamed(gpa, io, root, mission.summary_file);
 }
 pub fn writeSummary(gpa: std.mem.Allocator, io: std.Io, root: []const u8, text: []const u8) !void {
     try writeNamed(gpa, io, root, mission.summary_file, text);

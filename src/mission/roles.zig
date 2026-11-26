@@ -68,15 +68,6 @@ pub fn stageFor(stage: Stage, tasks_done: bool, review: Review, review_attempts:
     return .{ .stage = .review, .decision = .blocked };
 }
 
-pub fn roleForStage(stage: Stage) Role {
-    return switch (stage) {
-        .investigate => .investigator,
-        .review => .reviewer,
-        .verify => .tester,
-        else => .implementer,
-    };
-}
-
 test "roles: only implementers write" {
     try std.testing.expect(canWrite(.implementer));
     try std.testing.expect(!canWrite(.investigator));

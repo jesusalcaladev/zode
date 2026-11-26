@@ -84,16 +84,6 @@ const RoleModels = struct {
     }
 };
 
-fn joinArgs(gpa: std.mem.Allocator, args: []const []const u8) ![]const u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(gpa);
-    for (args, 0..) |a, i| {
-        if (i > 0) try out.append(gpa, ' ');
-        try out.appendSlice(gpa, a);
-    }
-    return out.toOwnedSlice(gpa);
-}
-
 fn slugify(gpa: std.mem.Allocator, objective: []const u8) ![]const u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(gpa);
@@ -110,6 +100,10 @@ fn slugify(gpa: std.mem.Allocator, objective: []const u8) ![]const u8 {
     return out.toOwnedSlice(gpa);
 }
 
+/// Planner and re-plan turns are one-shot: a hung model must not pin the
+/// supervisor forever. The lead turn keeps its own provider timeout.
+const agent_capture_timeout_ms: i64 = 5 * 60 * 1000;
+
 fn callAgentCapture(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.Map, command: []const u8, prompt: []const u8) ?[]const u8 {
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(gpa);
@@ -121,6 +115,7 @@ fn callAgentCapture(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process
         .environ_map = env,
         .stdout_limit = .limited(256 * 1024),
         .stderr_limit = .limited(64 * 1024),
+        .timeout = .{ .duration = .{ .raw = .fromMilliseconds(agent_capture_timeout_ms), .clock = .awake } },
     }) catch return null;
     defer gpa.free(result.stderr);
     if (switch (result.term) {
@@ -150,23 +145,27 @@ fn cmdPlan(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
         std.debug.print("an objective of at least 3 characters is required\n", .{});
         return 2;
     }
-    const slug = try slugify(gpa, objective);
-    defer gpa.free(slug);
+    // A plan is a one-shot allocation graph: objective, ids, commands and
+    // subject strings. An arena frees all of it at once — the old code leaked
+    // the whole heuristic plan on every `mission plan`, which the debug
+    // allocator reported at exit.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const slug = try slugify(a, objective);
     const secs = std.Io.Timestamp.now(io, .real).toSeconds();
-    const root = try std.fmt.allocPrint(gpa, "./missions/{s}-{d}", .{ slug, @as(u64, @intCast(@max(0, secs))) });
-    defer gpa.free(root);
-    const heuristic = try mission.planFromObjective(gpa, objective);
-    var plan = heuristic;
+    const root = try std.fmt.allocPrint(a, "./missions/{s}-{d}", .{ slug, @as(u64, @intCast(@max(0, secs))) });
+    var plan = try mission.planFromObjective(a, objective);
     var source: []const u8 = "heuristic";
     if (envGet(env, "ZODE_MISSION_PLANNER") != null) {
-        if (planWithModel(gpa, io, env, objective)) |model_plan| {
+        if (planWithModel(a, io, env, objective)) |model_plan| {
             plan = model_plan;
             source = "model";
         } else {
             std.debug.print("model planner unavailable; using heuristic plan\n", .{});
         }
     }
-    try mission_io.writePlanFiles(gpa, io, root, plan);
+    try mission_io.writePlanFiles(a, io, root, plan);
     std.debug.print("mission created: {s} (plan: {s})\n  checks: {d}\n  tasks: {d}\nnext: zode mission run {s}\n", .{
         root, source, plan.checks.len, plan.tasks.len, root,
     });
@@ -174,13 +173,13 @@ fn cmdPlan(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.process.Environ.
 }
 
 fn printStatus(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !u8 {
-    const state = try mission_io.loadState(gpa, io, root);
-    const tasks = try mission_io.loadTasks(gpa, io, root);
-    defer gpa.free(tasks);
-    const results = try mission_io.loadCriteria(gpa, io, root);
-    defer gpa.free(results);
-    const dashboard = try mission_io.renderStatus(gpa, state, tasks.len, results.len);
-    defer gpa.free(dashboard);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const state = try mission_io.loadState(a, io, root);
+    const tasks = try mission_io.loadTasks(a, io, root);
+    const results = try mission_io.loadCriteria(a, io, root);
+    const dashboard = try mission_io.renderStatus(a, state, tasks.len, results.len);
     std.debug.print("Mission: {s}\n{s}", .{ root, dashboard });
     for (tasks) |t| {
         std.debug.print("  #{d} [{s}] {s}\n", .{ t.id, t.status.name(), t.subject });
@@ -190,8 +189,10 @@ fn printStatus(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !u8 {
 }
 
 fn cmdCheck(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !u8 {
-    const checks = try mission_io.loadCriteria(gpa, io, root);
-    defer gpa.free(checks);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const checks = try mission_io.loadCriteria(a, io, root);
     if (checks.len == 0) {
         std.debug.print("no checks in {s}/{s}\n", .{ root, mission.criteria_file });
         return 2;
