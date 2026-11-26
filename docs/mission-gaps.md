@@ -55,9 +55,10 @@ and the OpenCode plugin as of plugin commit `6fc066f`. Items are ordered by impa
 
 ## 4. UX
 
-- **TUI part.** Neither harness exposes mission progress in the terminal UI.
-  OpenCode plugins support a `./tui` part; zode could add a status line driven by
-  `.mission/state.json`.
+- ~~**TUI part.**~~ **DONE, deliberately quiet.** Setting
+  `ZODE_MISSION_WORKSPACE` adds one dim `mission N/M checks · A/B tasks` segment
+  to the existing footer, read once at startup and dropped before the session
+  numbers on a narrow terminal. No new row, panel, colour or animation.
 - ~~**Progress / cost dashboard.**~~ **DONE.** `zode mission status` now prints
   ASCII progress bars for checks and tasks, cost spend vs budget with a
   percentage, improvement cycles, clean audits and failures. No ETA is shown:

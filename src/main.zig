@@ -436,6 +436,7 @@ fn runTui(init: std.process.Init) !u8 {
         model.bg.child_env = &child_env_static;
     } else |_| {}
     model.attachIo(io); // for the activity strip clock
+    model.refreshMissionStatus(); // one cached, dim footer segment; no draw-path I/O
     model.loadPromptHistory(); // ↑ still works after a restart
     model.attach();
 

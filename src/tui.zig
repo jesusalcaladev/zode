@@ -11,6 +11,7 @@ const chat = @import("chat.zig");
 const md = @import("lib/markdown.zig");
 const ansi = @import("lib/ansi.zig");
 const theme = @import("lib/theme.zig");
+const missionstatus = @import("lib/missionstatus.zig");
 const lang_icons = @import("lib/lang_icons.zig");
 const filechange = @import("lib/filechange.zig");
 const diffhunks = @import("lib/diffhunks.zig");
@@ -2157,6 +2158,10 @@ pub const Model = struct {
     /// tracker that the worker is still writing.
     status_cost_len: usize = 0,
     status_cost_buf: [24]u8 = undefined,
+    /// Optional mission line for the footer. Filled ONCE at startup from
+    /// `ZODE_MISSION_WORKSPACE`; the paint path only copies these bytes.
+    status_mission_len: usize = 0,
+    status_mission_buf: [64]u8 = undefined,
     /// The lazy resolve ran once already. Without it, every frame of a session
     /// with no catalogue on disk would open, parse and free a JSON file that is
     /// not there — a stat and two open attempts per frame, forever, for a value
@@ -5778,6 +5783,24 @@ pub const Model = struct {
         self.io = io;
         self.io_ready = true;
         self.refreshMotionEnv();
+    }
+
+    /// Reads `ZODE_MISSION_WORKSPACE` once and caches one dim footer line.
+    /// No file I/O on the paint path, no animation, no new row: the text is a
+    /// low-priority segment in the existing footer and disappears on a narrow
+    /// terminal before the session numbers do.
+    pub fn refreshMissionStatus(self: *Model) void {
+        self.status_mission_len = 0;
+        const env = self.environ orelse return;
+        const root = env.get("ZODE_MISSION_WORKSPACE") orelse return;
+        if (root.len == 0 or !self.io_ready) return;
+        const info = missionstatus.load(self.allocator, self.io, root) orelse return;
+        if (!info.hasData()) return;
+        const text = missionstatus.compact(self.allocator, info) catch return;
+        defer self.allocator.free(text);
+        const n = @min(text.len, self.status_mission_buf.len);
+        @memcpy(self.status_mission_buf[0..n], text[0..n]);
+        self.status_mission_len = n;
     }
 
     /// Reads motion preferences from the environment. Safe to call repeatedly.
@@ -11475,6 +11498,21 @@ pub fn drawStateFooter(
             }
             right[rn] = .{ .text = label, .style = theme.brand };
             latest_idx = rn;
+            rn += 1;
+        }
+    }
+
+    // Optional mission line, just before cost. It is dim (`theme.line`), one
+    // short phrase, and the FIRST thing to go on a narrow terminal after cost:
+    // no new row, no animation, no state invented by the renderer.
+    if (self.status_mission_len > 0 and rn + 2 < right.len) {
+        const owned = arena.dupe(u8, self.status_mission_buf[0..self.status_mission_len]) catch "";
+        if (owned.len > 0) {
+            if (rn > 0) {
+                right[rn] = .{ .text = " · ", .style = theme.line };
+                rn += 1;
+            }
+            right[rn] = .{ .text = owned, .style = theme.line };
             rn += 1;
         }
     }

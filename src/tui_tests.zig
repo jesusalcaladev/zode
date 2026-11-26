@@ -1851,6 +1851,33 @@ test "footer: cost is shown when published and dropped first on a narrow row" {
     try std.testing.expect(std.mem.indexOf(u8, narrow_row, "\u{fffd}") == null);
 }
 
+test "footer: the optional mission line is dim and drops before the model" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    agent.setAnswering("");
+    agent.cur_model = "";
+    defer m.deinit();
+    const model_name = "kimi-k2.6";
+    @memcpy(m.status_model_buf[0..model_name.len], model_name);
+    m.status_model_len = model_name.len;
+    m.status_model_tried = true;
+    const mission = "mission 2/4 checks · 1/2 tasks";
+    @memcpy(m.status_mission_buf[0..mission.len], mission);
+    m.status_mission_len = mission.len;
+
+    var buf: [512]u8 = undefined;
+    const wide = try drawTest(&m, arena_state.allocator(), 120, 16);
+    const wide_row = rowText(wide, 15, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, wide_row, mission) != null);
+
+    const narrow = try drawTest(&m, arena_state.allocator(), 30, 16);
+    const narrow_row = rowText(narrow, 15, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_row, "mission ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_row, model_name) != null);
+    try std.testing.expect(std.mem.indexOf(u8, narrow_row, "\u{fffd}") == null);
+}
+
 test "status: ctxColor changes at the compaction thresholds" {
     // The intent, not the palette: below the budget a gauge should NOT shout,
     // near it it warns, past it it is an error. The old version pinned "green"
