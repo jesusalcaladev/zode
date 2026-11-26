@@ -9,6 +9,7 @@ Every script is standalone. Run from the repo root unless noted.
 | `zig build test` | All pure and integration tests | `zig build test` (filter: `-Dtest-filter=name`) |
 | `pty_smoke.py` | Real 200x50 pty: startup, banner, input, palette, scroll, `!cmd`, no panic | `python3 tools/pty_smoke.py` |
 | `copy_smoke.py` | `/copy` flow in a real pty | `python3 tools/copy_smoke.py` |
+| `hooks_smoke.py` | Real PostToolUse hook in the headless tool loop, no key needed | `zig build hooks-check` |
 | `segv_probe.py` | SIGSEGV: terminal restored, `pc:` line in `/tmp/zode-crash.log` | `python3 tools/segv_probe.py` |
 | `zig build ui-frame` | Renders scenes with real draw functions | `zig build ui-frame` |
 | `zig build memaudit` | Static audit for the two crash classes | `zig build memaudit` |

@@ -91,6 +91,13 @@ SCENARIOS = {
         {"tools": [{"name": "read", "args": {"path": "AGENTS.md"}}]},
         {"tools": [{"name": "send_user_message", "args": {"message": "headless headlesssmoke scenario finished. done!"}}]},
     ],
+    # Phase 43.7: run a REAL tool through the headless loop while a project
+    # hook is loaded, so the smoke can assert the hook fired on disk.
+    "hooksmoke": [
+        {"tools": [{"name": "bash", "args": {"command": "echo hooksmoke"}}]},
+        {"tools": [{"name": "send_user_message", "args": {"message": "hooksmoke scenario finished"}}]},
+        {"text": "hooksmoke done"},
+    ],
     "repeat": [
         {"tools": [{"name": "read", "args": {"path": "AGENTS.md"}}]},
         {"tools": [{"name": "read", "args": {"path": "AGENTS.md"}}]},

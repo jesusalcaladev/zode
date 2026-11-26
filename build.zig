@@ -420,6 +420,16 @@ pub fn build(b: *std.Build) void {
     run_copy.step.dependOn(&run_scroll.step);
     run_key.step.dependOn(&run_copy.step);
     pty_check.dependOn(&run_key.step);
+    // 43.7: a hook in a REAL headless tool loop. Same fake provider as
+    // headless_smoke. It gets its OWN step: pty-check bundles the pty scripts
+    // and one of them (scroll_repro) can fail for terminal-size reasons on a
+    // headless runner, which must not hide this gate's result.
+    const hooks_check = b.step("hooks-check", "Build and verify hooks in the real headless tool loop");
+    hooks_check.dependOn(b.getInstallStep());
+    const run_hooks = b.addSystemCommand(&.{ "python3", "tools/hooks_smoke.py" });
+    run_hooks.setName("hooks_smoke");
+    run_hooks.has_side_effects = true;
+    hooks_check.dependOn(&run_hooks.step);
 
     // Phase 37: `zig build diag` — one-shot internal diagnostics. Doesn't
     // touch the network or the real HOME: --diag only reads /proc/self/status.
