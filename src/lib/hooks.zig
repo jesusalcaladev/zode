@@ -709,3 +709,25 @@ test "hooks 34.14: PermissionRequest event parses and matches" {
     try t.expect(matches(h, .{ .event = .PermissionRequest, .tool = "bash" }));
     try t.expect(!matches(h, .{ .event = .PermissionRequest, .tool = "write" }));
 }
+
+test "hooks 50.2: every lifecycle event fires through the shared matcher" {
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const events = [_]Event{
+        .SessionStart, .SessionEnd, .PreCompact, .Notification,
+        .SubagentStart, .SubagentStop, .PostToolUseFailure,
+        .ConfigChange, .InstructionsLoaded,
+    };
+    for (events) |event| {
+        var hooks = [_]Hook{.{ .event = event, .kind = .prompt, .command = "remember this" }};
+        var set = Set{ .hooks = &hooks };
+        const results = try fire(a, &set, .{ .event = event, .subject = "subject" }, null);
+        defer freeResults(a, results);
+        try t.expectEqual(@as(usize, 1), results.len);
+        try t.expect(results[0].ran);
+        try t.expectEqualStrings("remember this", results[0].additional_context);
+        // No command ran for a `prompt` hook: it is DATA, never a shell.
+        try t.expectEqual(@as(u8, 0), results[0].exit_code);
+    }
+}

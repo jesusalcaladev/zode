@@ -1146,6 +1146,18 @@ pub fn resolvedProjectHooksPath(buf: []u8) []const u8 {
 
 /// Project-level hooks (Phase 5).
 pub var hooks_set: hooks_mod.Set = .{};
+
+/// Fires a lifecycle hook from the TURN thread only. `Set.fire` mutates the
+/// `once` flags in place, so calling this from a worker thread would race with
+/// a parallel tool's PreToolUse hook. Subagent events are therefore fired by
+/// `runTaskBatch` around its wave, never from `Runner.run`.
+fn fireLifecycleHook(gpa: std.mem.Allocator, event: hooks_mod.Event, subject: []const u8) void {
+    const results = hooks_mod.fire(gpa, &hooks_set, .{
+        .event = event,
+        .subject = subject,
+    }, io_global) catch return;
+    defer if (results.len > 0) hooks_mod.freeResults(gpa, results);
+}
 var hooks_arena: ?std.heap.ArenaAllocator = null;
 
 pub fn loadHooks() void {
@@ -6342,6 +6354,8 @@ fn applyTier2CompactionSummary(
     }
     if (upto <= sum_from + 1) return;
 
+    fireLifecycleHook(gpa, .PreCompact, "tier-2 summary");
+
     cache_stats.session.markCompacted();
     m.pushInfo("\u{b7} context full: summarizing the older turns with the model\u{2026}");
     var sum_http = http_client.Http.init(gpa, io_global);
@@ -8533,6 +8547,14 @@ fn runTaskBatch(
         ctxs[k] = .{ .call = call, .out = &results[k], .m = m, .task = parsed };
     }
 
+    // Lifecycle hooks are fired HERE, on the turn thread. `fire` mutates the
+    // shared `once` flags, so doing it inside Runner.run would race with every
+    // parallel tool's PreToolUse hook.
+    for (ctxs) |ctx| {
+        if (ctx.task.description.len == 0) continue;
+        fireLifecycleHook(m.allocator, .SubagentStart, ctx.task.description);
+    }
+
     const Runner = struct {
         fn run(ctx: *Ctx) void {
             // The turn is not over until these are, and `app.deinit()` destroys
@@ -8598,6 +8620,11 @@ fn runTaskBatch(
             napMs(wait_ms);
             wait_ms = @min(wait_ms * 2, 20);
         }
+    }
+
+    for (ctxs) |ctx| {
+        if (ctx.task.description.len == 0) continue;
+        fireLifecycleHook(m.allocator, .SubagentStop, ctx.task.description);
     }
 
     var ok: usize = 0;
