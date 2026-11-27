@@ -532,6 +532,11 @@ pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator
     if (self.settings_active) {
         tui.drawSettingsScreen(&p, self, width, height);
     }
+    // The file-intelligence board and the review editor are full-surface
+    // views: opening one closes the other, so the order here is just a guard.
+    if (self.file_board_active) {
+        tui.drawFileBoard(&p, width, height, self);
+    }
     // 51.9: the in-TUI file editor is topmost. It does not suspend the tty.
     if (self.file_ed_active) {
         tui.drawFileEditor(&p, width, height, self);

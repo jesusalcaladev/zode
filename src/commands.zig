@@ -2781,6 +2781,8 @@ pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
         return;
     }
     if (std.mem.eql(u8, a, "view") or std.mem.eql(u8, a, "viewer") or std.mem.eql(u8, a, "modal")) {
+        // Explicit request: diffs are the answer here, never execution noise.
+        m.showQuietDiffs();
         if (!m.openDiffViewer()) m.pushInfo("diff: no changed-file diffs to view in this session");
         return;
     }
@@ -2813,6 +2815,7 @@ pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
     if (runGitCapture(arena, &.{ "git", "--no-optional-locks", "-c", "core.quotepath=false", "diff", "--no-color", "-U3", "HEAD" }, 512 * 1024)) |diff| {
         const trimmed = std.mem.trim(u8, diff, " \t\r\n");
         if (trimmed.len > 0) {
+            m.showQuietDiffs();
             m.pushInfo("uncommitted (vs HEAD):");
             m.pushKind(md.Kind.diff, trimmed);
         }
@@ -2827,6 +2830,7 @@ pub fn cmdDiff(m: *tui.Model, arg: ?[]const u8) void {
         if (runGitCapture(arena, argv.items, 512 * 1024)) |tdiff| {
             const ttrim = std.mem.trim(u8, tdiff, " \t\r\n");
             if (ttrim.len > 0) {
+                m.showQuietDiffs();
                 m.pushInfoFmt("files  ·  this turn vs HEAD  ·  {d} file(s)", .{turn_files.len});
                 m.pushKind(md.Kind.diff, ttrim);
             } else {
@@ -3269,8 +3273,12 @@ pub fn cmdFile(m: *tui.Model, arg: ?[]const u8) void {
         m.pushInfoFmt("file: opened {s} in the TUI editor (Ctrl+S save, Esc close)", .{path});
         return;
     }
+    if (std.mem.eql(u8, a, "board") or std.mem.eql(u8, a, "cards")) {
+        if (!m.openFileBoard()) m.pushInfo("file: no changed files to put on the board");
+        return;
+    }
     if (a.len > 0) {
-        m.pushInfo("usage: /file [list|show|next|prev|copy|path|open]");
+        m.pushInfo("usage: /file [list|show|next|prev|copy|path|open|board]");
         return;
     }
     // Show/jump to focused file intelligence entry when available.

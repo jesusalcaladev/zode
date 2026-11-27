@@ -110,7 +110,7 @@ src/lib/ pure/testable modules (no TUI, no network): readcache, project,
          prompt, sleep, skills, skillstore, mentions, markdown, highlight,
          lang_icons, web, models, providers, provider, http_client, subagent, ask,
          plan, checkpoint, editor, bench, clean, regex, mascot, theme,
-         facts, filewatch,
+         facts, filewatch, filerange, fileview,
          zjsonl, verify, exitgate, cost, review, diffview, repeat,
          outputstyles, outputstyle_store, bundled_outputstyles
 ```

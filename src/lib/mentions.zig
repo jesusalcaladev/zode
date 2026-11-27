@@ -1,6 +1,7 @@
 const std = @import("std");
 const images = @import("images.zig");
 const fuzzy = @import("fuzzy.zig");
+const filerange = @import("filerange.zig");
 
 pub const max_files = 4;
 pub const file_max = 32 * 1024;
@@ -10,6 +11,10 @@ pub const scanned_max = 8;
 pub const Mention = struct {
     path: [path_max]u8 = undefined,
     len: u8 = 0,
+    /// Optional `:40-120` suffix. `pathOf` stays a real file path so existing
+    /// callers (images, file watcher) keep working unchanged.
+    range: ?filerange.Range = null,
+
     pub fn pathOf(self: *const Mention) []const u8 { return self.path[0..self.len]; }
 };
 
@@ -57,6 +62,9 @@ pub fn scan(text: []const u8) !ScanResult {
         while (j < text.len) : (j += 1) {
             const c = text[j];
             if (std.ascii.isAlphanumeric(c) or c >= 0x80 or c == '_' or c == '/' or c == '-' or c == '.') continue;
+            // A colon is part of a mention only when it introduces a line
+            // number (`@src/a.zig:40-120`), never for a URL's `://`.
+            if (c == ':' and j + 1 < text.len and std.ascii.isDigit(text[j + 1])) continue;
             break;
         }
         var end = j;
@@ -65,17 +73,34 @@ pub fn scan(text: []const u8) !ScanResult {
         }
         if (end <= start) { i += 1; continue; }
         if (end < text.len and text[end] == '@') { i = end + 1; continue; }
-        const path = text[start..end];
+        const token = text[start..end];
+        var path = token;
+        var range: ?filerange.Range = null;
+        if (std.mem.lastIndexOfScalar(u8, token, ':')) |colon| {
+            if (filerange.parse(token[colon + 1 ..])) |spec| {
+                const candidate = token[0..colon];
+                if (looksLikePath(candidate)) {
+                    path = candidate;
+                    range = spec.asRange();
+                }
+            }
+        }
         if (!looksLikePath(path)) { i = end; continue; }
         if (n >= scanned_max) { i = end; continue; }
         var dup = false;
         for (0..n) |prev| {
-            if (std.mem.eql(u8, mentions[prev].path[0..mentions[prev].len], path)) dup = true;
+            const p = &mentions[prev];
+            const same_range = if (p.range) |pr|
+                if (range) |r| pr.first == r.first and pr.last == r.last else false
+            else
+                range == null;
+            if (same_range and std.mem.eql(u8, p.pathOf(), path)) dup = true;
         }
         if (!dup) {
-            if (path.len <= path_max) {
+            if (token.len <= path_max) {
                 mentions[n].len = @intCast(path.len);
                 @memcpy(mentions[n].path[0..path.len], path);
+                mentions[n].range = range;
                 n += 1;
             }
         }
@@ -102,6 +127,44 @@ pub const Expansion = struct {
 };
 
 pub const expansion_cap = 256 * 1024;
+/// A selected range is capped harder than a whole-file mention: it is a
+/// deliberate cursor into a file, not a dump of it.
+pub const range_cap = 16 * 1024;
+
+/// Emits only the selected lines, numbered with real 1-based line numbers.
+/// The model can then refer to `path:line` without re-reading the whole file.
+fn appendRange(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    path: []const u8,
+    r: filerange.Range,
+    content: []const u8,
+) !void {
+    var head_buf: [path_max + 96]u8 = undefined;
+    const head = std.fmt.bufPrint(&head_buf, "[file: {s}, lines {d}-{d} of {d}]\n", .{
+        path, r.first, r.last, filerange.lineCount(content),
+    }) catch return;
+    try out.appendSlice(alloc, head);
+
+    var num_buf: [64]u8 = undefined;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    var n: usize = 1;
+    while (it.next()) |raw| : (n += 1) {
+        if (n < r.first) continue;
+        if (n > r.last) break;
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        const prefix = std.fmt.bufPrint(&num_buf, "{d: >4} | ", .{n}) catch continue;
+        if (out.items.len + prefix.len + line.len + 1 > expansion_cap or
+            out.items.len + prefix.len + line.len + 1 > range_cap + head.len)
+        {
+            try out.appendSlice(alloc, "... [range truncated] ...\n");
+            return;
+        }
+        try out.appendSlice(alloc, prefix);
+        try out.appendSlice(alloc, line);
+        try out.append(alloc, '\n');
+    }
+}
 
 pub fn expand(alloc: std.mem.Allocator, io: std.Io, text: []const u8) !Expansion {
     const scan_result = try scan(text);
@@ -144,15 +207,23 @@ pub fn expand(alloc: std.mem.Allocator, io: std.Io, text: []const u8) !Expansion
     var mention_idx: usize = 0;
     while (li < text.len) {
         if (mention_idx < scan_result.count) {
-            const mention_path = scan_result.mentions[mention_idx].pathOf();
-            if (li + mention_path.len <= text.len and
-                std.mem.eql(u8, text[li .. li + mention_path.len], mention_path))
+            const mention = &scan_result.mentions[mention_idx];
+            const mention_path = mention.pathOf();
+            var token_buf: [path_max + 64]u8 = undefined;
+            const token: []const u8 = if (mention.range) |r|
+                filerange.format(&token_buf, mention_path, r) catch mention_path
+            else
+                mention_path;
+            if (li + token.len <= text.len and
+                std.mem.eql(u8, text[li .. li + token.len], token))
             {
                 if (mention_idx < loaded_idx_for_mention.len and
                     loaded_idx_for_mention[mention_idx] != 255)
                 {
                     const content = loaded_contents.items[loaded_idx_for_mention[mention_idx]];
-                    if (out.items.len + content.len <= expansion_cap) {
+                    if (mention.range) |r| {
+                        try appendRange(alloc, &out, mention_path, r, content);
+                    } else if (out.items.len + content.len <= expansion_cap) {
                         try out.appendSlice(alloc, content);
                     } else {
                         const marker = "\n... [mention truncated] ...";
@@ -162,7 +233,7 @@ pub fn expand(alloc: std.mem.Allocator, io: std.Io, text: []const u8) !Expansion
                         try out.appendSlice(alloc, marker);
                     }
                 }
-                li += mention_path.len;
+                li += token.len;
                 mention_idx += 1;
                 continue;
             }
@@ -273,4 +344,48 @@ test "looksLikePath: an image filename is a mention path" {
     try std.testing.expect(looksLikePath("shot.png"));
     try std.testing.expect(looksLikePath("dir/photo.jpg"));
     try std.testing.expect(!looksLikePath("hello"));
+}
+
+test "scan: a line range keeps a real path and a separate range" {
+    const result = try scan("mira @src/a.zig:40-120 y @b.txt:7");
+    try std.testing.expectEqual(@as(u8, 2), result.count);
+    try std.testing.expectEqualStrings("src/a.zig", result.mentions[0].pathOf());
+    try std.testing.expectEqual(@as(usize, 40), result.mentions[0].range.?.first);
+    try std.testing.expectEqual(@as(usize, 120), result.mentions[0].range.?.last);
+    try std.testing.expectEqualStrings("b.txt", result.mentions[1].pathOf());
+    try std.testing.expectEqual(@as(usize, 7), result.mentions[1].range.?.first);
+    try std.testing.expectEqual(@as(usize, 7), result.mentions[1].range.?.last);
+}
+
+test "scan: a colon that is not a line number does not split the path" {
+    const result = try scan("mira @http://example.com/x y @a.zig:12");
+    try std.testing.expectEqual(@as(u8, 1), result.count);
+    try std.testing.expectEqualStrings("a.zig", result.mentions[0].pathOf());
+    try std.testing.expectEqual(@as(usize, 12), result.mentions[0].range.?.first);
+}
+
+test "scan: two ranges of the same file are both kept" {
+    const result = try scan("@a.zig:1-5 y @a.zig:10-15");
+    try std.testing.expectEqual(@as(u8, 2), result.count);
+    try std.testing.expectEqual(@as(usize, 1), result.mentions[0].range.?.first);
+    try std.testing.expectEqual(@as(usize, 10), result.mentions[1].range.?.first);
+}
+
+test "expand: a ranged mention inlines only the selected numbered lines" {
+    const path = "zode-mentions-range-test.txt";
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    for (1..13) |n| try body.print(std.testing.allocator, "line {d}\n", .{n});
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = body.items });
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const expanded = try expand(arena_state.allocator(), std.testing.io, "revisa @" ++ path ++ ":3-5");
+    try std.testing.expectEqual(@as(u8, 1), expanded.files);
+    try std.testing.expect(std.mem.indexOf(u8, expanded.text, "lines 3-5 of 12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded.text, "   3 | line 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded.text, "   5 | line 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded.text, "line 6") == null);
+    try std.testing.expect(std.mem.indexOf(u8, expanded.text, "line 1\n") == null);
 }

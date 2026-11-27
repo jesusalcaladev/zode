@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Bug Fixes
+### Features
 
-- make the /diff test independent of git availability (commands) [`b3d16707`](https://github.com/jesusalcaladev/zode/commit/b3d16707)
+- clean transcript by default with on-demand tool output (tui) [`577be74e`](https://github.com/jesusalcaladev/zode/commit/577be74e)
 
 ## [0.3.0-beta.2] - 2026-11-27
 

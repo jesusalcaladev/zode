@@ -182,9 +182,29 @@ Show what the model has read and what it has changed in this session.
 
 ### `/file open`
 
-Open the focused changed file in a small in-TUI editor: `Ctrl+S` saves it back,
-`Esc` closes. No external `$EDITOR` is spawned and the terminal is never
-suspended. Files above 4 MB are refused rather than partially loaded.
+Open the focused changed file in the full-screen in-TUI review editor. No
+external `$EDITOR` is spawned and the terminal is never suspended.
+
+- `Ctrl+S` saves and refreshes the diff baseline; `Esc` closes (twice when dirty).
+- `Ctrl+R` cycles Code → Diff (against the file as opened) → side-by-side split.
+- `v` enters Vim-style visual-line selection (`j`/`k` extend, `y` sends to the
+  prompt, `d` deletes); `Ctrl+G` accepts `40` (jump) or `40-120` (select a range).
+- `Ctrl+Enter` stages `@path:first-last` in the composer. Type your instruction
+  and press Enter to send: the model receives ONLY the selected lines with
+  their real line numbers, not the whole file.
+- `Ctrl+Z` / `Ctrl+Shift+Z` undo/redo; `Tab`-free plain typing, real newlines,
+  and bracketed paste all stay inside the editor while it is open.
+- Files above 256 KB are refused rather than partially loaded.
+
+Clicking a file path printed in the transcript (including a file card) opens
+that file in the same editor.
+
+### `/file board`
+
+Full-surface card board of every file touched by the agent in this session,
+with real `+added / −removed` stats, a relative magnitude bar and a clickable
+path. `↑↓` select, `Enter` open in the editor, `Ctrl+D` jump to the diff, `Esc`
+close. `Ctrl+B` opens it from anywhere (also from inside a running session).
 
 ### `/glob <pattern>`
 

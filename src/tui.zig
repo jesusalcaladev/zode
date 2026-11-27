@@ -20,6 +20,9 @@ const filechange = @import("lib/filechange.zig");
 const diffhunks = @import("lib/diffhunks.zig");
 const diffview = @import("lib/diff/view.zig");
 const ed = @import("lib/editor.zig");
+const hl = @import("lib/highlight.zig");
+const filerange = @import("lib/filerange.zig");
+const fileview = @import("lib/fileview.zig");
 const textcap = @import("lib/textcap.zig");
 const prompthistory = @import("lib/prompthistory.zig");
 const typecheck_mod = @import("lib/typecheck.zig");
@@ -1493,6 +1496,36 @@ pub const Model = struct {
     file_ed_active: bool = false,
     file_ed_path: ?[]const u8 = null,
     file_ed_dirty: bool = false,
+    /// Disk snapshot taken when the file opened. The diff shown in the modal
+    /// is ALWAYS against this baseline, never against a guessed "original".
+    file_ed_baseline: ?[]u8 = null,
+    file_ed_marks: []fileview.Mark = &.{},
+    file_ed_removed: usize = 0,
+    file_ed_added: usize = 0,
+    /// Vim-style visual-line selection, in 1-based lines. Keyboard only.
+    file_ed_visual: bool = false,
+    file_ed_anchor: usize = 0,
+    file_ed_sel: ?filerange.Range = null,
+    /// `Ctrl+G` mini prompt inside the modal: `40` jumps, `40-120` selects.
+    file_ed_goto_active: bool = false,
+    file_ed_goto: [32]u8 = undefined,
+    file_ed_goto_len: usize = 0,
+    /// code → diff → split, cycled with Ctrl+R in the editor.
+    file_ed_pane: enum { code, diff, split } = .code,
+    file_ed_notice: [128]u8 = undefined,
+    file_ed_notice_len: usize = 0,
+    file_ed_dirty_ack: bool = false,
+
+    /// Per-cell file links captured from the painted surface. The transcript
+    /// owns the text; this map is only a hit-test so a click on a path opens
+    /// the editor instead of starting a text selection.
+    link_map: std.ArrayList(?u32) = .empty,
+    link_uris: std.ArrayList([]u8) = .empty,
+
+    /// File-intelligence board: a card per file the agent touched, with real
+    /// diff stats and a click-to-open path. Presentation only.
+    file_board_active: bool = false,
+    file_board_sel: usize = 0,
 
     /// User keybindings (Phase 13.3), owned by the config arena. Resolved
     /// before the composer sees a key, so a binding can call any slash command.
@@ -1859,6 +1892,10 @@ pub const Model = struct {
     /// This is a UI layer over shared runtime state; it must not change agent,
     /// session, permission, or tool execution behavior.
     view_mode: ViewMode = .normal,
+    /// Presentation only: tool/diff/reasoning chatter is kept in structured
+    /// state but folded out of the transcript until the user asks for it
+    /// (Ctrl+R for the last tool result, /diff for diffs, alt+t for reasoning).
+    quiet_output: bool = false,
 
     /// Permission dialog (fixed buffers, no churn between threads).
     perm_tool: [64]u8 = undefined,
@@ -2313,6 +2350,10 @@ pub const Model = struct {
         reasoning: bool = false,
         /// Whether the FULL reasoning text is shown for this paragraph.
         reasoning_expanded: bool = false,
+        /// Presentation only: this paragraph is execution chatter. It is kept
+        /// in full (Ctrl+R, /diff, alt+t still work) but folded out of the
+        /// transcript while quiet output is on.
+        quiet_hidden: bool = false,
         /// The text, or the COMPRESSED text when the paragraph is cold.
         ///
         /// See `is_cold`. A cold paragraph keeps its bytes as `zjsonl`
@@ -2542,6 +2583,7 @@ pub const Model = struct {
     const Pending = struct {
         kind: md.Kind,
         reasoning: bool = false,
+        quiet_hidden: bool = false,
         text: []const u8, // gpa copy, freed on drain
         /// Base style imposed on the paragraph. `null` = whatever `kind` says.
         base: ?md.Style = null,
@@ -2735,6 +2777,11 @@ pub const Model = struct {
         self.ed.deinit();
         self.file_ed.deinit();
         if (self.file_ed_path) |p| self.allocator.free(p);
+        if (self.file_ed_baseline) |b| self.allocator.free(b);
+        if (self.file_ed_marks.len > 0) self.allocator.free(self.file_ed_marks);
+        for (self.link_uris.items) |u| self.allocator.free(u);
+        self.link_uris.deinit(self.allocator);
+        self.link_map.deinit(self.allocator);
         if (self.stashed_text) |t| self.allocator.free(t);
         self.stashed_images.clear(self.allocator);
         for (self.extra_dirs.items) |d| self.allocator.free(d);
@@ -3398,21 +3445,26 @@ pub const Model = struct {
         self.settings_active = false;
     }
 
-    /// 51.9: opens a file in an in-TUI editor. Nothing is spawned, no tty is
-    /// suspended: the previous implementation copied the path and told the
-    /// user to run `$EDITOR` outside, which was safe but not "open".
+    /// Open a file in the in-TUI review editor. No process is spawned and no
+    /// tty is suspended. The disk bytes are kept as the diff baseline; the
+    /// editor works on its own copy, so nothing on disk changes until Ctrl+S.
     pub fn openFileEditor(self: *Model, path: []const u8) bool {
+        self.file_board_active = false;
         if (!self.io_ready) {
             self.pushInfo("file: the in-TUI editor needs a live terminal IO");
             return false;
         }
-        const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(4 * 1024 * 1024)) catch {
+        const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(ed.max_bytes + 1)) catch {
             self.pushInfoFmt("file: could not read {s}", .{path});
             return false;
         };
         defer self.allocator.free(data);
+        if (data.len > ed.max_bytes) {
+            self.pushInfo("file: too large for the in-TUI editor (256 KB cap)");
+            return false;
+        }
         self.file_ed.load(data) catch {
-            self.pushInfo("file: too large for the in-TUI editor (4 MB cap)");
+            self.pushInfo("file: could not load the file into the editor");
             return false;
         };
         if (self.file_ed_path) |p| self.allocator.free(p);
@@ -3421,8 +3473,23 @@ pub const Model = struct {
             self.file_ed.clear();
             return false;
         }
+        if (self.file_ed_baseline) |b| self.allocator.free(b);
+        self.file_ed_baseline = self.allocator.dupe(u8, data) catch null;
+        if (self.file_ed_baseline == null) {
+            self.file_ed.clear();
+            return false;
+        }
         self.file_ed_active = true;
         self.file_ed_dirty = false;
+        self.file_ed_dirty_ack = false;
+        self.file_ed_visual = false;
+        self.file_ed_sel = null;
+        self.file_ed_anchor = 0;
+        self.file_ed_goto_active = false;
+        self.file_ed_goto_len = 0;
+        self.file_ed_pane = .code;
+        self.fileEditorRefreshMarks();
+        self.fileEditorSetNotice("v select · Ctrl+R diff · Ctrl+Enter selection to prompt · Ctrl+S save");
         self.requestRedraw();
         return true;
     }
@@ -3430,26 +3497,195 @@ pub const Model = struct {
     pub fn closeFileEditor(self: *Model) void {
         self.file_ed_active = false;
         self.file_ed_dirty = false;
+        self.file_ed_dirty_ack = false;
+        self.file_ed_visual = false;
+        self.file_ed_sel = null;
+        self.file_ed_goto_active = false;
+        self.file_ed_goto_len = 0;
+        self.file_ed_pane = .code;
+        self.file_ed_notice_len = 0;
+        self.requestRedraw();
+    }
+
+    /// One line of status inside the modal. Bounded and owned by the model so
+    /// the painter never has to allocate or parse a rendered string.
+    pub fn fileEditorSetNotice(self: *Model, text: []const u8) void {
+        const n = @min(text.len, self.file_ed_notice.len);
+        @memcpy(self.file_ed_notice[0..n], text[0..n]);
+        self.file_ed_notice_len = n;
+        self.requestRedraw();
+    }
+
+    /// Recomputed once per edit, never in draw: the painter only reads marks.
+    fn fileEditorRefreshMarks(self: *Model) void {
+        if (self.file_ed_marks.len > 0) {
+            self.allocator.free(self.file_ed_marks);
+            self.file_ed_marks = &.{};
+        }
+        self.file_ed_added = 0;
+        self.file_ed_removed = 0;
+        const base = self.file_ed_baseline orelse return;
+        const changes = fileview.docChanges(self.allocator, base, self.file_ed.text()) catch return;
+        self.file_ed_marks = changes.marks;
+        self.file_ed_added = changes.added;
+        self.file_ed_removed = changes.removed;
+    }
+
+    fn fileEditorAfterEdit(self: *Model) void {
+        self.file_ed_dirty = true;
+        self.file_ed_dirty_ack = false;
+        self.fileEditorRefreshMarks();
         self.requestRedraw();
     }
 
     pub fn fileEditorSave(self: *Model) void {
         const path = self.file_ed_path orelse return;
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = path, .data = self.file_ed.text() }) catch {
-            self.pushInfoFmt("file: could not save {s}", .{path});
+            self.fileEditorSetNotice("Save failed: check permissions and retry");
             return;
         };
+        if (self.file_ed_baseline) |b| self.allocator.free(b);
+        self.file_ed_baseline = self.allocator.dupe(u8, self.file_ed.text()) catch null;
         self.file_ed_dirty = false;
-        self.pushInfoFmt("file: saved {s}", .{path});
+        self.file_ed_dirty_ack = false;
+        self.fileEditorRefreshMarks();
+        self.fileEditorSetNotice("Saved · diff baseline refreshed");
     }
 
-    /// The file editor captures every key while open, like the picker.
-    /// Deliberately small: editing, navigation, Ctrl+S and Esc — no vim or
-    /// paste integration, so it cannot swallow a composition in progress.
+    /// The current selection, in 1-based lines. Visual mode is line-wise,
+    /// like Vim's `V`: the anchored end and the caret are both included.
+    pub fn fileEditorSelection(self: *const Model) ?filerange.Range {
+        const text = self.file_ed.text();
+        const total = filerange.lineCount(text);
+        const raw = if (self.file_ed_visual)
+            fileview.rangeForOffsets(text, self.file_ed_anchor, self.file_ed.cursor)
+        else if (self.file_ed_sel) |r| r else blk: {
+            const line = fileview.lineOfOffset(text, self.file_ed.cursor);
+            break :blk filerange.Range{ .first = line, .last = line };
+        };
+        return filerange.normalize(raw.first, raw.last, total);
+    }
+
+    /// Ctrl+Enter / visual `y`: put `@path:first-last` into the composer so the
+    /// user can type the instruction and send it with Enter. Nothing is sent
+    /// behind their back and the mention expands ONLY the selected lines.
+    pub fn fileEditorStageSelection(self: *Model) void {
+        const path = self.file_ed_path orelse return;
+        const r = self.fileEditorSelection() orelse return;
+        var token_buf: [filesview.path_max + 32]u8 = undefined;
+        const token = filerange.format(&token_buf, path, r) catch return;
+        var msg_buf: [filesview.path_max + 64]u8 = undefined;
+        const msg = std.mem.print(&msg_buf, "Review @{s}: ", .{token}) catch return;
+        self.closeFileEditor();
+        insertIntoInput(self, msg);
+        self.pushInfoFmt("file: selected lines {d}-{d} added to the prompt", .{ r.first, r.last });
+    }
+
+    fn fileEditorDeleteSelection(self: *Model) void {
+        const r = self.fileEditorSelection() orelse return;
+        const text = self.file_ed.text();
+        const start = fileview.offsetOfLine(text, r.first);
+        const end = if (r.last >= filerange.lineCount(text)) text.len else fileview.offsetOfLine(text, r.last + 1);
+        self.file_ed.deleteRange(start, end) catch return;
+        self.file_ed_visual = false;
+        self.file_ed_sel = null;
+        self.file_ed.cursor = @min(start, self.file_ed.text().len);
+        self.fileEditorAfterEdit();
+    }
+
+    fn fileEditorApplyGoto(self: *Model) void {
+        const spec = filerange.parse(self.file_ed_goto[0..self.file_ed_goto_len]);
+        self.file_ed_goto_active = false;
+        self.file_ed_goto_len = 0;
+        const s = spec orelse {
+            self.fileEditorSetNotice("Go to: use a line (40) or a range (40-120)");
+            return;
+        };
+        const r = s.asRange();
+        const total = filerange.lineCount(self.file_ed.text());
+        const first = fileview.clampLine(self.file_ed.text(), r.first);
+        self.file_ed.cursor = fileview.offsetOfLine(self.file_ed.text(), first);
+        if (s == .range) {
+            self.file_ed_anchor = self.file_ed.cursor;
+            const last = fileview.clampLine(self.file_ed.text(), r.last);
+            const last_start = fileview.offsetOfLine(self.file_ed.text(), last);
+            self.file_ed.cursor = if (last >= total)
+                self.file_ed.text().len
+            else
+                fileview.lineEnd(self.file_ed.text(), last_start);
+            self.file_ed_visual = true;
+            self.file_ed_sel = filerange.normalize(first, last, total);
+            self.fileEditorSetNotice("Selected lines in prompt with Ctrl+Enter");
+        } else {
+            self.file_ed_visual = false;
+            self.file_ed_sel = null;
+            self.fileEditorSetNotice("Jumped to line");
+        }
+        self.requestRedraw();
+    }
+
+    /// Paste lands in the file editor while it is open, never in the composer.
+    pub fn fileEditorInsertText(self: *Model, text: []const u8) void {
+        if (!self.file_ed_active or text.len == 0) return;
+        if (self.file_ed_visual) self.fileEditorDeleteSelection();
+        self.file_ed.insert(text) catch {
+            self.fileEditorSetNotice("Buffer is full (256 KB cap)");
+            return;
+        };
+        self.fileEditorAfterEdit();
+    }
+
+    /// The file editor owns every key while open, before global shortcuts.
     pub fn fileEditorHandleKey(self: *Model, key: vaxis.Key) bool {
         if (!self.file_ed_active) return false;
+        const ctrl = key.mods.ctrl;
+        const alt = key.mods.alt;
+
+        // The go-to-line mini prompt owns keys until Enter or Esc.
+        if (self.file_ed_goto_active) {
+            if (key.matches(vaxis.Key.escape, .{})) {
+                self.file_ed_goto_active = false;
+                self.file_ed_goto_len = 0;
+                self.requestRedraw();
+                return true;
+            }
+            if (key.matches(vaxis.Key.enter, .{})) {
+                self.fileEditorApplyGoto();
+                return true;
+            }
+            if (key.matches(vaxis.Key.backspace, .{})) {
+                self.file_ed_goto_len -|= 1;
+                self.requestRedraw();
+                return true;
+            }
+            const cp = key.codepoint;
+            if (!ctrl and !alt and self.file_ed_goto_len < self.file_ed_goto.len and
+                (cp == '-' or (cp < 128 and std.ascii.isDigit(@intCast(cp)))))
+            {
+                self.file_ed_goto[self.file_ed_goto_len] = @intCast(cp);
+                self.file_ed_goto_len += 1;
+                self.requestRedraw();
+            }
+            return true;
+        }
+
         if (key.matches(vaxis.Key.escape, .{})) {
+            if (self.file_ed_visual) {
+                self.file_ed_visual = false;
+                self.file_ed_sel = null;
+                self.requestRedraw();
+                return true;
+            }
+            if (self.file_ed_dirty and !self.file_ed_dirty_ack) {
+                self.file_ed_dirty_ack = true;
+                self.fileEditorSetNotice("Unsaved changes · Esc again to discard, Ctrl+S to save");
+                return true;
+            }
             self.closeFileEditor();
+            return true;
+        }
+        if (key.matches(vaxis.Key.enter, .{ .ctrl = true })) {
+            self.fileEditorStageSelection();
             return true;
         }
         if (key.matches('s', .{ .ctrl = true })) {
@@ -3457,55 +3693,175 @@ pub const Model = struct {
             self.requestRedraw();
             return true;
         }
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            self.file_ed.deleteBefore();
-            self.file_ed_dirty = true;
+        if (key.matches('r', .{ .ctrl = true })) {
+            self.file_ed_pane = switch (self.file_ed_pane) {
+                .code => .diff,
+                .diff => .split,
+                .split => .code,
+            };
+            self.fileEditorSetNotice(switch (self.file_ed_pane) {
+                .code => "Code view",
+                .diff => "Diff vs the file as opened",
+                .split => "Side by side: opened / current",
+            });
+            return true;
+        }
+        if (key.matches('g', .{ .ctrl = true })) {
+            self.file_ed_goto_active = true;
+            self.file_ed_goto_len = 0;
             self.requestRedraw();
+            return true;
+        }
+        if (ctrl and (key.codepoint == 'z' or key.codepoint == 'Z')) {
+            const changed = if (key.mods.shift) self.file_ed.redo() else self.file_ed.undo();
+            if (changed) self.fileEditorAfterEdit();
+            return true;
+        }
+        if (key.matches('a', .{ .ctrl = true })) {
+            self.file_ed_visual = true;
+            self.file_ed_anchor = 0;
+            self.file_ed.cursor = self.file_ed.text().len;
+            self.file_ed_sel = filerange.normalize(1, filerange.lineCount(self.file_ed.text()), filerange.lineCount(self.file_ed.text()));
+            self.requestRedraw();
+            return true;
+        }
+        // Vim-style visual line mode, as in the composer: `v` anchors, motions
+        // extend, `y` sends the selection to the prompt, `d` deletes it.
+        if (!ctrl and !alt and key.codepoint == 'v') {
+            self.file_ed_visual = !self.file_ed_visual;
+            if (self.file_ed_visual) {
+                self.file_ed_anchor = self.file_ed.cursor;
+            } else {
+                self.file_ed_sel = null;
+            }
+            self.requestRedraw();
+            return true;
+        }
+        if (self.file_ed_visual and !ctrl and !alt and (key.codepoint == 'y' or key.codepoint == 'Y')) {
+            self.fileEditorStageSelection();
+            return true;
+        }
+        if (self.file_ed_visual and !ctrl and !alt and (key.codepoint == 'd' or key.codepoint == 'D')) {
+            self.fileEditorDeleteSelection();
+            return true;
+        }
+        if (self.file_ed_visual and !ctrl and !alt and (key.codepoint == 'j' or key.codepoint == 'k')) {
+            if (key.codepoint == 'j') self.file_ed.moveDown() else self.file_ed.moveUp();
+            self.file_ed_sel = fileview.rangeForOffsets(self.file_ed.text(), self.file_ed_anchor, self.file_ed.cursor);
+            self.requestRedraw();
+            return true;
+        }
+
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            if (self.file_ed_visual) self.fileEditorDeleteSelection() else self.file_ed.deleteBefore();
+            self.fileEditorAfterEdit();
             return true;
         }
         if (key.matches(vaxis.Key.delete, .{})) {
-            self.file_ed.deleteAfter();
-            self.file_ed_dirty = true;
+            if (self.file_ed_visual) self.fileEditorDeleteSelection() else self.file_ed.deleteAfter();
+            self.fileEditorAfterEdit();
+            return true;
+        }
+        const up = key.matches(vaxis.Key.up, .{}) or (!ctrl and !alt and key.codepoint == 'k');
+        const down = key.matches(vaxis.Key.down, .{}) or (!ctrl and !alt and key.codepoint == 'j');
+        if (up or down) {
+            if (up) self.file_ed.moveUp() else self.file_ed.moveDown();
+            if (self.file_ed_visual) self.file_ed_sel = fileview.rangeForOffsets(self.file_ed.text(), self.file_ed_anchor, self.file_ed.cursor);
             self.requestRedraw();
             return true;
         }
-        if (key.matches(vaxis.Key.up, .{})) {
-            self.file_ed.moveUp();
+        if (key.matches(vaxis.Key.home, .{}) or (ctrl and key.matches('h', .{}))) {
+            self.file_ed.moveToStart();
+            if (self.file_ed_visual) self.file_ed_sel = fileview.rangeForOffsets(self.file_ed.text(), self.file_ed_anchor, self.file_ed.cursor);
             self.requestRedraw();
             return true;
         }
-        if (key.matches(vaxis.Key.down, .{})) {
-            self.file_ed.moveDown();
-            self.requestRedraw();
-            return true;
-        }
-        if (key.matches(vaxis.Key.home, .{})) {
-            self.file_ed.moveHome();
-            self.requestRedraw();
-            return true;
-        }
-        if (key.matches(vaxis.Key.end, .{})) {
-            self.file_ed.moveEnd();
+        if (key.matches(vaxis.Key.end, .{}) or (ctrl and key.matches('e', .{}))) {
+            self.file_ed.moveToEnd();
+            if (self.file_ed_visual) self.file_ed_sel = fileview.rangeForOffsets(self.file_ed.text(), self.file_ed_anchor, self.file_ed.cursor);
             self.requestRedraw();
             return true;
         }
         if (key.matches(vaxis.Key.left, .{})) {
-            self.file_ed.moveLeft();
+            if (ctrl or alt) self.file_ed.moveWordLeft() else self.file_ed.moveLeft();
             self.requestRedraw();
             return true;
         }
         if (key.matches(vaxis.Key.right, .{})) {
-            self.file_ed.moveRight();
+            if (ctrl or alt) self.file_ed.moveWordRight() else self.file_ed.moveRight();
             self.requestRedraw();
             return true;
         }
-        if (key.codepoint > 0 and !key.mods.ctrl and !key.mods.alt) {
-            var buf: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(key.codepoint, &buf) catch return true;
-            self.file_ed.insert(buf[0..n]) catch {};
-            self.file_ed_dirty = true;
-            self.requestRedraw();
+        if (!ctrl and !alt and key.codepoint > 0) {
+            if (key.matches(vaxis.Key.enter, .{})) {
+                if (self.file_ed_visual) self.fileEditorDeleteSelection();
+                self.file_ed.insert("\n") catch {};
+            } else {
+                if (self.file_ed_visual) self.fileEditorDeleteSelection();
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(key.codepoint, &buf) catch return true;
+                self.file_ed.insert(buf[0..n]) catch {};
+            }
+            self.fileEditorAfterEdit();
         }
+        return true;
+    }
+
+    /// Open the file-intelligence board. It is a presentation of the SAME
+    /// structured entries `/file list` uses — no new truth is invented here.
+    pub fn openFileBoard(self: *Model) bool {
+        if (self.file_intel_len == 0) return false;
+        if (self.file_ed_active) self.closeFileEditor();
+        self.file_board_sel = @min(self.file_board_sel, self.file_intel_len - 1);
+        self.file_board_active = true;
+        self.requestRedraw();
+        return true;
+    }
+
+    pub fn closeFileBoard(self: *Model) void {
+        self.file_board_active = false;
+        self.requestRedraw();
+    }
+
+    fn fileBoardMove(self: *Model, delta: i8) void {
+        if (self.file_intel_len == 0) return;
+        const n: isize = @intCast(self.file_intel_len);
+        var cur: isize = @intCast(self.file_board_sel);
+        cur = @mod(cur + @as(isize, delta), n);
+        self.file_board_sel = @intCast(cur);
+        self.requestRedraw();
+    }
+
+    /// Enter opens the selected entry in the review editor; Ctrl+D jumps to
+    /// its diff paragraph; Esc closes the board.
+    pub fn fileBoardHandleKey(self: *Model, key: vaxis.Key) bool {
+        if (!self.file_board_active) return false;
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.closeFileBoard();
+            return true;
+        }
+        if (key.matches(vaxis.Key.up, .{}) or (!key.mods.ctrl and key.codepoint == 'k')) {
+            self.fileBoardMove(-1);
+            return true;
+        }
+        if (key.matches(vaxis.Key.down, .{}) or (!key.mods.ctrl and key.codepoint == 'j')) {
+            self.fileBoardMove(1);
+            return true;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            const e = &self.file_intel[self.file_board_sel];
+            const path = e.pathOf();
+            self.closeFileBoard();
+            _ = self.openFileEditor(path);
+            return true;
+        }
+        if (key.matches('d', .{ .ctrl = true })) {
+            const idx = self.file_board_sel;
+            self.closeFileBoard();
+            _ = self.showFileIntelFocus(idx, true);
+            return true;
+        }
+        // Any other key closes the board instead of leaking into the composer.
         return true;
     }
 
@@ -4667,9 +5023,14 @@ pub const Model = struct {
     /// BOTH the height tree and the paint loop, so the viewport positions
     /// derived from `heightPrefix` stay consistent with what is on screen.
     pub fn paraVisible(self: *const Model, idx: usize) bool {
-        if (self.view_mode != .focus) return true;
         if (idx >= self.paras.items.len) return false;
-        return switch (self.paras.items[idx].kind) {
+        const p = self.paras.items[idx];
+        // `quiet_hidden` is already a decision made at enqueue time: an
+        // explicit `pushKindEx(..., true)` must stay folded even when the
+        // global quiet-output switch is off.
+        if (p.quiet_hidden) return false;
+        if (self.view_mode != .focus) return true;
+        return switch (p.kind) {
             .tool_run, .tool_res, .diff => false,
             else => true,
         };
@@ -4681,7 +5042,7 @@ pub const Model = struct {
     pub fn refreshViewHeights(self: *Model) void {
         self.clearSegCache();
         self.ensureParaHeights();
-        if (self.view_mode == .focus) {
+        if (self.view_mode == .focus or self.quiet_output) {
             if (self.normal_heights.items.len != self.para_heights.items.len) {
                 self.normal_heights.clearRetainingCapacity();
                 self.normal_heights.appendSlice(self.allocator, self.para_heights.items) catch return;
@@ -5678,14 +6039,38 @@ pub const Model = struct {
 
     // ── thread-safe API (enqueue; draw drains) ──────────
     pub fn pushKind(self: *Model, kind: md.Kind, text: []const u8) void {
+        self.pushKindEx(kind, text, false);
+    }
+
+    /// Same enqueue, with an explicit "execution chatter" marker. The bytes
+    /// are never dropped: a folded paragraph still lives in the history and
+    /// the tool memo, so Ctrl+R, /diff and alt+t can still reveal it.
+    pub fn pushKindEx(self: *Model, kind: md.Kind, text: []const u8, quiet_hidden: bool) void {
         const copy = self.allocator.dupe(u8, text) catch return;
         self.lock();
         defer self.unlock();
-        self.pending.append(self.allocator, .{ .kind = kind, .text = copy }) catch {
+        self.pending.append(self.allocator, .{ .kind = kind, .text = copy, .quiet_hidden = quiet_hidden }) catch {
             self.allocator.free(copy);
         };
         self.dirty = true;
         // Ask for a frame now: the tick can be up to 120 ms away.
+        self.redraw_requested.store(true, .seq_cst);
+    }
+
+    /// `/diff` is an explicit request to see the diff. Unfold diff paragraphs
+    /// that quiet output had hidden, without changing any tool/session state.
+    pub fn showQuietDiffs(self: *Model) void {
+        self.lock();
+        defer self.unlock();
+        var changed = false;
+        for (self.paras.items) |*p| {
+            if (p.kind != .diff or !p.quiet_hidden) continue;
+            p.quiet_hidden = false;
+            changed = true;
+        }
+        if (!changed) return;
+        self.clearSegCache();
+        self.dirty = true;
         self.redraw_requested.store(true, .seq_cst);
     }
 
@@ -5760,6 +6145,7 @@ pub const Model = struct {
             .kind = .info,
             .text = copy,
             .reasoning = true,
+            .quiet_hidden = self.quiet_output,
         }) catch {
             self.allocator.free(copy);
             return;
@@ -6473,7 +6859,7 @@ pub const Model = struct {
         else
             std.fmt.allocPrint(self.allocator, "*{s}*({s})", .{ tool, display_arg }) catch return;
         defer self.allocator.free(line);
-        self.pushKind(.tool_run, line);
+        self.pushKindEx(.tool_run, line, self.quiet_output);
 
         // Registers the tool in progress for the "running" line. Own copies:
         // `arg` comes from a worker arena that is freed at the end of the turn.
@@ -6667,7 +7053,7 @@ pub const Model = struct {
         self.lock();
         defer self.unlock();
         if (self.last_tool) |*lt| lt.deinit(self.allocator);
-        self.pending.append(self.allocator, .{ .kind = .tool_res, .text = copy }) catch {
+        self.pending.append(self.allocator, .{ .kind = .tool_res, .text = copy, .quiet_hidden = self.quiet_output }) catch {
             self.allocator.free(copy);
             self.allocator.free(full);
             self.allocator.free(sum);
@@ -7000,16 +7386,18 @@ pub const Model = struct {
             };
             var path_buf: [200]u8 = undefined;
             const shown_path = filechange.shortenPathInto(&path_buf, path, 64);
+            // The shortened label stays readable; the LINK carries the full
+            // path so a click opens exactly the file the agent touched.
             if (is_net and dc.added == 0 and dc.removed == 0) {
                 if (has_label)
-                    self.pushInfoFmt("  {s} [{s}] {s}  (unchanged)", .{ op_word, chip.label, shown_path })
+                    self.pushInfoFmt("  {s} [{s}] [{s}](file:{s})  (unchanged)", .{ op_word, chip.label, shown_path, path })
                 else
-                    self.pushInfoFmt("  {s} {s}  (unchanged)", .{ op_word, shown_path });
+                    self.pushInfoFmt("  {s} [{s}](file:{s})  (unchanged)", .{ op_word, shown_path, path });
             } else if (is_net or dc.added > 0 or dc.removed > 0) {
                 if (has_label)
-                    self.pushInfoFmt("  {s} [{s}] {s}  +{d} -{d}", .{ op_word, chip.label, shown_path, dc.added, dc.removed })
+                    self.pushInfoFmt("  {s} [{s}] [{s}](file:{s})  +{d} -{d}", .{ op_word, chip.label, shown_path, path, dc.added, dc.removed })
                 else
-                    self.pushInfoFmt("  {s} {s}  +{d} -{d}", .{ op_word, shown_path, dc.added, dc.removed });
+                    self.pushInfoFmt("  {s} [{s}](file:{s})  +{d} -{d}", .{ op_word, shown_path, path, dc.added, dc.removed });
             }
         }
 
@@ -7173,7 +7561,7 @@ pub const Model = struct {
         const lang_copy = gpa.dupe(u8, lang) catch {
             gpa.free(text_copy);
             freeDiffMemoParts(gpa, keep_full, keep_short);
-            self.pushKind(.diff, para_src);
+            self.pushKindEx(.diff, para_src, self.quiet_output);
             return;
         };
         const path_copy: []u8 = if (path.len > 0)
@@ -7191,6 +7579,7 @@ pub const Model = struct {
             .text = text_copy,
             .lang = lang_copy,
             .word_diff = word_diff,
+            .quiet_hidden = self.quiet_output,
         }) catch {
             gpa.free(text_copy);
             gpa.free(lang_copy);
@@ -7516,6 +7905,11 @@ pub const Model = struct {
         self.allocator.free(p.text);
         p.text = copy;
         p.is_cold = false;
+        // Explicit expansion is a request to SEE this paragraph. In quiet
+        // output it was folded; revealing it here keeps Ctrl+R and /diff
+        // working without polluting the default transcript.
+        p.quiet_hidden = false;
+        self.refreshViewHeights();
         // The word-level diff belongs to the WHOLE diff: a preview is a
         // summary and its highlights are noise, so expanding it turns them
         // on and collapsing it turns them off.
@@ -7837,11 +8231,14 @@ pub const Model = struct {
         // and it looked like scrolling didn't work.
         const hubo_nuevo = self.pending.items.len > 0;
         const born_ms = if (hubo_nuevo) self.nowMs() else 0;
+        var fold_quiet = false;
         for (self.pending.items) |p| {
+            if (self.quiet_output and p.quiet_hidden) fold_quiet = true;
             self.paras.append(self.allocator, .{
                 .kind = p.kind,
                 .reasoning = p.reasoning,
                 .reasoning_expanded = self.reasoning_expanded,
+                .quiet_hidden = p.quiet_hidden,
                 .text = p.text,
                 .base = p.base,
                 .mood = p.mood,
@@ -7854,6 +8251,9 @@ pub const Model = struct {
             };
         }
         self.pending.clearRetainingCapacity();
+        // New paragraphs never consume a row in quiet mode. Without this the
+        // draw skips them but the height tree still reserves their lines.
+        if (fold_quiet) self.refreshViewHeights();
         self.dirty = false;
         // NOTHING to do about the scroll here, and that is the point.
         //
@@ -8236,21 +8636,42 @@ pub const Model = struct {
         self.selectable_map.clearRetainingCapacity();
         self.selectable_rows = height;
         self.selectable_width = width;
+        self.link_map.clearRetainingCapacity();
+        for (self.link_uris.items) |u| self.allocator.free(u);
+        self.link_uris.clearRetainingCapacity();
 
         const map_len = std.math.mul(usize, @as(usize, height), @as(usize, width) + 1) catch return error.OutOfMemory;
         try self.selectable_map.ensureTotalCapacity(self.allocator, map_len);
+        try self.link_map.ensureTotalCapacity(self.allocator, map_len);
         for (0..height) |row| {
             if (row > 0) try self.selectable_text.append(self.allocator, '\n');
             try self.selectable_map.append(self.allocator, self.selectable_text.items.len);
+            try self.link_map.append(self.allocator, null);
             var col: u16 = 0;
             while (col < width) {
                 const cell = surface.readCell(col, row);
                 const text = cell.char.grapheme;
                 try self.selectable_text.appendSlice(self.allocator, text);
+                // Only file links are interactive here. Web URLs keep their
+                // terminal OSC-8 behaviour and must not open the code editor.
+                var link_idx: ?u32 = null;
+                if (std.mem.startsWith(u8, cell.link.uri, "file:")) {
+                    const last_is_same = self.link_uris.items.len > 0 and
+                        std.mem.eql(u8, self.link_uris.items[self.link_uris.items.len - 1], cell.link.uri);
+                    if (!last_is_same) {
+                        const owned = try self.allocator.dupe(u8, cell.link.uri);
+                        self.link_uris.append(self.allocator, owned) catch {
+                            self.allocator.free(owned);
+                            return error.OutOfMemory;
+                        };
+                    }
+                    link_idx = @intCast(self.link_uris.items.len - 1);
+                }
                 const cell_width: u16 = @max(@as(u16, cell.char.width), 1);
                 var step: u16 = 0;
                 while (step < cell_width and col + step < width) : (step += 1) {
                     try self.selectable_map.append(self.allocator, self.selectable_text.items.len);
+                    try self.link_map.append(self.allocator, link_idx);
                 }
                 col += cell_width;
             }
@@ -8327,6 +8748,20 @@ pub const Model = struct {
             .row = @min(@as(u16, @intCast(mouse.row)), self.selectable_rows - 1),
             .col = @min(@as(u16, @intCast(mouse.col)), self.selectable_width - 1),
         };
+    }
+
+    /// A click on a `file:` cell resolves to a real path. Only the painted
+    /// surface is consulted — no state is parsed out of rendered strings.
+    pub fn fileLinkAt(self: *const Model, mouse: vaxis.Mouse) ?[]const u8 {
+        const point = self.clampedSelectionPoint(mouse) orelse return null;
+        const idx = @as(usize, point.row) * (@as(usize, self.selectable_width) + 1) + point.col;
+        if (idx >= self.link_map.items.len) return null;
+        const uri_idx = self.link_map.items[idx] orelse return null;
+        if (uri_idx >= self.link_uris.items.len) return null;
+        const uri = self.link_uris.items[uri_idx];
+        if (std.mem.startsWith(u8, uri, "file://")) return uri[7..];
+        if (std.mem.startsWith(u8, uri, "file:")) return uri[5..];
+        return null;
     }
 
     /// One place for the endpoint order: the copy and the highlight must
@@ -11539,54 +11974,270 @@ fn graphemeStep(ctx: *const anyopaque, text: []const u8, i: usize) ed.Step {
 /// the throughput, then the context gauge, and the model last), because a
 /// half-drawn face is a drawing bug and a missing model is a command away
 /// (`/model`).
-/// A compact, borderless file editor modal. No external process, no terminal
-/// suspend: the file is loaded into a fixed-capacity buffer and written back
-/// on Ctrl+S. It is deliberately plain so it cannot be mistaken for the
-/// composer or for a diff.
-pub fn drawFileEditor(p: *Painter, width: u16, height: u16, self: *const Model) void {
-    if (!self.file_ed_active) return;
-    const bw: u16 = @min(width -| 8, 100);
-    const bh: u16 = @min(height -| 6, 22);
-    if (bw < 20 or bh < 6) {
-        // Never make an interactive surface vanish silently: on a tiny pane
-        // say what is missing, in one line, using the dim gutter role.
+/// A full-surface code-review view. It deliberately covers the transcript:
+/// opening a file is a focus mode, not another box floating over the chat.
+/// Every colour comes from `theme`; every number comes from structured state.
+fn paintEditorColumn(
+    p: *Painter,
+    text: []const u8,
+    marks: []const fileview.Mark,
+    lang: []const u8,
+    win: filerange.Range,
+    x: u16,
+    y: u16,
+    rows: usize,
+    width: u16,
+    sel: ?filerange.Range,
+    cursor_line: usize,
+    label: ?[]const u8,
+) void {
+    if (width < 8 or rows == 0) return;
+    const gutter_digits = @max(diffview.digits(win.last), 1);
+    const text_x: u16 = x + 1 + @as(u16, @intCast(gutter_digits)) + 1;
+    const text_w: u16 = width -| (text_x - x);
+    const row_bg = theme.code_bg.bg;
+    const select_bg = theme.brand_faint.fg;
+    const change_bg = theme.diff_add_line_bg.bg;
+
+    if (label) |name| {
+        _ = p.putClipped(x + 1, y, name, width -| 2, theme.code_lang);
+    }
+
+    var state = hl.State{};
+    var i: usize = 0;
+    while (i < rows) : (i += 1) {
+        const ln = win.first + i;
+        const row = y + @as(u16, @intCast(i));
+        if (row >= p.height) break;
+        const line = filerange.lineAt(text, ln);
+        const changed = ln - 1 < marks.len and marks[ln - 1] == .changed;
+        const selected = if (sel) |r| r.contains(ln) else false;
+        const is_cursor = ln == cursor_line;
+
+        var bg = row_bg;
+        if (changed) bg = change_bg;
+        if (selected) bg = select_bg;
+        if (is_cursor and !selected) bg = theme.code_border.bg;
+        p.fillRange(x, x + width, row, " ", .{ .bg = bg });
+
+        // Sign column: a real change marker, never a decoration on unchanged
+        // lines. Without colour the `+` still says what happened.
+        const sign: []const u8 = if (changed) "+" else " ";
+        _ = p.putClipped(x, row, sign, 1, if (changed) theme.diff_add else theme.code_gutter);
+
+        // Right-aligned line number. Manual padding keeps this independent of
+        // how many digits the longest line in THIS window has.
+        var num_buf: [24]u8 = undefined;
+        const num = std.fmt.bufPrint(&num_buf, "{d}", .{ln}) catch "";
+        const pad = gutter_digits -| num.len;
+        var gx = x + 1;
+        var k: usize = 0;
+        while (k < pad) : (k += 1) {
+            _ = p.putClipped(gx, row, " ", 1, theme.code_gutter);
+            gx += 1;
+        }
+        const num_style: vaxis.Style = if (is_cursor or selected) theme.selected else theme.code_gutter;
+        _ = p.putClipped(gx, row, num, @intCast(gutter_digits - pad), num_style);
+
+        // One highlighter state walks the visible window, so a block comment
+        // opened above the viewport still colours the lines inside it.
+        const segs = hl.highlightLineState(p.arena, line, lang, &state) catch &.{};
+        if (segs.len == 0) {
+            _ = p.putClipped(text_x, row, line, text_w, theme.code_text);
+        } else {
+            var col = text_x;
+            for (segs) |seg| {
+                if (col >= text_x + text_w) break;
+                var st = seg.style;
+                st.bg = bg;
+                col = p.putClipped(col, row, seg.text, text_x + text_w - col, st);
+            }
+        }
+    }
+}
+
+/// Text with an OSC-8 `file:` target, one grapheme at a time. The TUI reads
+/// these links back from the painted surface to implement click-to-open.
+fn putLinkedText(p: *Painter, col: u16, row: u16, text: []const u8, style: vaxis.Style, uri: []const u8) void {
+    if (text.len == 0 or row >= p.height) return;
+    const stable = p.arena.dupe(u8, text) catch return;
+    const resolved = theme.resolve(style);
+    var it = vaxis.unicode.graphemeIterator(stable);
+    var c = col;
+    while (it.next()) |g| {
+        const b = g.bytes(stable);
+        const w = p.measure(b);
+        if (c + w > p.width) break;
+        p.putStableLinkedResolved(c, row, b, w, resolved, .{ .uri = uri });
+        c += w;
+    }
+}
+
+/// A card board for the files the agent touched. It is the review queue:
+/// every row is a real `FileIntelEntry`, with honest +/− stats and a path that
+/// is a clickable link to the editor.
+pub fn drawFileBoard(p: *Painter, width: u16, height: u16, self: *const Model) void {
+    if (!self.file_board_active) return;
+    if (width < 30 or height < 10) {
         if (width > 0 and height > 0) {
-            _ = p.putClipped(0, 0, "editor needs 20x6", width, theme.code_gutter);
+            p.fillRange(0, width, 0, " ", theme.code_bg);
+            _ = p.putClipped(0, 0, "board needs 30x10", width, theme.hint);
         }
         return;
     }
-    const x0: u16 = (width - bw) / 2;
-    const y0: u16 = (height - bh) / 2;
+    var r: u16 = 0;
+    while (r < height) : (r += 1) p.fillRange(0, width, r, " ", theme.code_bg);
 
-    var row: u16 = 0;
-    while (row < bh) : (row += 1) {
-        p.fillRange(x0, x0 + bw, y0 + row, " ", theme.code_bg);
+    const n = @min(self.file_intel_len, max_file_intel);
+    p.fillRange(0, width, 0, " ", .{ .bg = theme.brand_faint.fg });
+    _ = p.putText(1, 0, "FILE INTELLIGENCE", theme.brand_hi);
+    var head_buf: [64]u8 = undefined;
+    const head = std.mem.print(&head_buf, "{d} file{s} touched", .{ n, if (n == 1) "" else "s" }) catch "";
+    _ = p.putClipped(width -| (@as(u16, @intCast(head.len)) + 1), 0, head, width, theme.ink2);
+    _ = p.putClipped(1, 1, "↑↓ select · Enter open in editor · Ctrl+D jump to diff · Esc close", width -| 2, theme.key_hint);
+
+    var max_change: usize = 1;
+    for (self.file_intel[0..n]) |e| max_change = @max(max_change, e.added + e.removed);
+
+    const body_h: usize = height - 3;
+    const first: usize = if (self.file_board_sel >= body_h / 3) self.file_board_sel - body_h / 3 else 0;
+    var shown: usize = 0;
+    var i: usize = first;
+    while (i < n and shown + 2 < body_h) : (i += 1) {
+        const e = &self.file_intel[i];
+        const path = e.pathOf();
+        const chip = self.fileIntelLabel(path);
+        const op = Model.fileIntelOpWord(e);
+        const selected = i == self.file_board_sel;
+        const y = 2 + @as(u16, @intCast(shown * 3));
+        const card_bg: vaxis.Style = if (selected) .{ .bg = theme.brand_faint.fg } else .{ .bg = theme.code_bg.bg };
+        p.fillRange(1, width -| 1, y, " ", card_bg);
+        p.fillRange(1, width -| 1, y + 1, " ", card_bg);
+
+        _ = p.putClipped(2, y, if (selected) "▸" else " ", 1, if (selected) theme.brand else theme.gutter);
+        _ = p.putClipped(4, y, op, 9, theme.ink);
+        var col: u16 = 14;
+        if (chip.has) {
+            col = p.putClipped(col, y, "[", 1, theme.code_lang);
+            col = p.putClipped(col, y, chip.label, @intCast(@min(chip.label.len, 12)), theme.code_lang);
+            col = p.putClipped(col, y, "]", 1, theme.code_lang) + 1;
+        }
+        var path_buf: [200]u8 = undefined;
+        const shown_path = filechange.shortenPathInto(&path_buf, path, @intCast(width -| col -| 24));
+        const uri = if (std.mem.startsWith(u8, path, "/"))
+            std.fmt.allocPrint(p.arena, "file://{s}", .{path}) catch ""
+        else
+            std.fmt.allocPrint(p.arena, "file:{s}", .{path}) catch "";
+        putLinkedText(p, col, y, shown_path, if (selected) theme.selected else theme.ink, uri);
+
+        var stat_buf: [128]u8 = undefined;
+        const stat = std.mem.print(&stat_buf, "+{d} -{d}", .{ e.added, e.removed }) catch "";
+        _ = p.putClipped(width -| (@as(u16, @intCast(stat.len)) + 2), y, stat, width, theme.diff_stat_add);
+
+        // Magnitude bar: proportional to the largest change in THIS board,
+        // never an invented number or a fake percentage.
+        const total_change = @as(usize, e.added) + @as(usize, e.removed);
+        const cells: usize = @min(16, @max(1, total_change * 16 / max_change));
+        var bar: std.ArrayList(u8) = .empty;
+        for (0..16) |k| bar.appendSlice(p.arena, if (k < cells) "█" else "░") catch {};
+        _ = p.putClipped(5, y + 1, bar.items, 16, if (total_change == 0) theme.gutter else theme.diff_stat_add);
+        const add_bar: []const u8 = if (e.added > 0) "added" else "unchanged";
+        _ = p.putClipped(24, y + 1, add_bar, 16, theme.hint);
+        shown += 1;
     }
-    const title: []const u8 = if (self.file_ed_dirty) "FILE · UNSAVED" else "FILE";
-    _ = p.putText(x0 + 1, y0, title, if (self.file_ed_dirty) theme.warn else theme.code_lang);
-    if (self.file_ed_path) |path| {
-        _ = p.putClipped(x0 + 18, y0, path, bw -| 19, theme.ink);
+    const foot = height - 1;
+    p.fillRange(0, width, foot, " ", .{ .bg = theme.brand_faint.fg });
+    var foot_buf: [96]u8 = undefined;
+    const foot_text = std.mem.print(&foot_buf, "review queue · {d} of {d}", .{
+        if (n == 0) 0 else self.file_board_sel + 1, n,
+    }) catch "";
+    _ = p.putClipped(1, foot, foot_text, width -| 2, theme.key_hint);
+}
+
+pub fn drawFileEditor(p: *Painter, width: u16, height: u16, self: *const Model) void {
+    if (!self.file_ed_active) return;
+    if (width < 30 or height < 10) {
+        // Never make an interactive surface vanish silently. A full-surface
+        // review view needs room for a gutter, a code row and two bars.
+        if (width > 0 and height > 0) {
+            p.fillRange(0, width, 0, " ", theme.code_bg);
+            _ = p.putClipped(0, 0, "editor needs 20x6", width, theme.hint);
+        }
+        return;
     }
-    _ = p.putText(x0 + 1, y0 + 1, "Ctrl+S save · Esc close", theme.hint);
+
+    var r: u16 = 0;
+    while (r < height) : (r += 1) {
+        p.fillRange(0, width, r, " ", theme.code_bg);
+    }
 
     const text = self.file_ed.text();
-    const cursor_line = self.file_ed.cursorLine();
-    const visible_lines: usize = bh - 3;
-    const first_line: usize = if (cursor_line > visible_lines / 2) cursor_line - visible_lines / 2 else 0;
-    var line_no: usize = 0;
-    var shown: usize = 0;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        if (line_no < first_line) {
-            line_no += 1;
-            continue;
-        }
-        if (shown >= visible_lines) break;
-        const y = y0 + 3 + @as(u16, @intCast(shown));
-        _ = p.putClipped(x0 + 1, y, line, bw -| 2, theme.code_text);
-        shown += 1;
-        line_no += 1;
+    const total = filerange.lineCount(text);
+    const cursor_line = fileview.clampLine(text, self.file_ed.cursorLine());
+    const sel = self.fileEditorSelection();
+    const status_bg = theme.brand_faint.fg;
+
+    // ── title bar ────────────────────────────────────────────────
+    p.fillRange(0, width, 0, " ", .{ .bg = theme.code_border.bg });
+    const title: []const u8 = if (self.file_ed_dirty) "FILE · UNSAVED" else "FILE";
+    _ = p.putText(1, 0, title, if (self.file_ed_dirty) theme.warn else theme.brand);
+    if (self.file_ed_path) |path| {
+        _ = p.putClipped(18, 0, path, width -| 48, theme.ink);
     }
+    var stats_buf: [96]u8 = undefined;
+    const stats = std.mem.print(&stats_buf, "Ln {d}/{d}  +{d} -{d}", .{
+        cursor_line, total, self.file_ed_added, self.file_ed_removed,
+    }) catch "";
+    const stats_x = width -| (@as(u16, @intCast(stats.len)) + 1);
+    _ = p.putClipped(stats_x, 0, stats, width -| stats_x, theme.diff_stat_add);
+
+    // ── always-visible shortcuts: discoverability is the UX ──────
+    p.fillRange(0, width, 1, " ", .{ .bg = status_bg });
+    _ = p.putClipped(1, 1,
+        "Ctrl+S save · Ctrl+R code/diff/split · v select · Ctrl+G line · Ctrl+Enter add to prompt · Esc close",
+        width -| 2, theme.key_hint);
+
+    const rows: usize = height - 3;
+    const win = fileview.windowFor(text, cursor_line, rows);
+    const lang = if (self.file_ed_path) |path| lang_icons.forPath(path, false).label else "text";
+    const pane: []const u8 = switch (self.file_ed_pane) {
+        .code => "CODE",
+        .diff => "DIFF",
+        .split => "SPLIT",
+    };
+
+    if (self.file_ed_pane == .split) {
+        const half: u16 = (width -| 3) / 2;
+        const baseline = self.file_ed_baseline orelse "";
+        const no_marks: []const fileview.Mark = &.{};
+        p.fillRange(0, width, 2, " ", theme.code_bg);
+        _ = p.putClipped(1, 2, "OPENED", half -| 2, theme.code_lang);
+        _ = p.putClipped(half + 2, 2, "CURRENT", half -| 2, theme.code_lang);
+        const body_y: u16 = 3;
+        const body_rows: usize = if (height > 5) height - 5 else 1;
+        const left_win = fileview.windowFor(baseline, cursor_line, body_rows);
+        paintEditorColumn(p, baseline, no_marks, lang, left_win, 0, body_y, body_rows, half, null, 0, null);
+        paintEditorColumn(p, text, self.file_ed_marks, lang, win, half + 1, body_y, body_rows, half -| 1, sel, cursor_line, null);
+    } else {
+        paintEditorColumn(p, text, self.file_ed_marks, lang, win, 0, 2, rows, width, sel, cursor_line,
+            if (self.file_ed_pane == .diff) "DIFF · changed lines vs the file as opened" else null);
+    }
+
+    // ── status bar: notice + selection + mode ────────────────────
+    const foot = height - 1;
+    p.fillRange(0, width, foot, " ", .{ .bg = status_bg });
+    if (self.file_ed_notice_len > 0) {
+        _ = p.putClipped(1, foot, self.file_ed_notice[0..self.file_ed_notice_len], width -| 30, theme.hint);
+    }
+    var sel_buf: [64]u8 = undefined;
+    const sel_text: []const u8 = if (sel) |rr|
+        std.mem.print(&sel_buf, "L{d}-{d}", .{ rr.first, rr.last }) catch ""
+    else
+        "";
+    const sel_x = width -| (@as(u16, @intCast(sel_text.len + pane.len + 4)));
+    _ = p.putClipped(sel_x, foot, sel_text, width -| sel_x, theme.selected);
+    const pane_x = width -| (@as(u16, @intCast(pane.len)) + 1);
+    _ = p.putClipped(pane_x, foot, pane, width -| pane_x, theme.brand_soft);
 }
 
 pub fn drawStateFooter(

@@ -127,6 +127,7 @@ under 160k".
 | model's own window | from the catalogue | Used when `ZODE_CONTEXT_LIMIT` is not set. The palette shows it (`free · 200k`), and choosing a model adopts it. |
 | fallback window | `128000` | Used when neither of the above says anything. |
 | `ZODE_TERSE_TOOLS` | unset | Use short tool schemas at startup (≈15% smaller request); `/style <terse-style>` still wins when set later. |
+| `ZODE_VERBOSE_OUTPUT` | `0` | Show tool calls/results, diffs and the `Done` stats in the transcript. Default `0` keeps a clean transcript: the bytes stay in structured state, and `Ctrl+R`, `/diff` and `alt+t` reveal them on request. |
 | `ZODE_COMPACT_PCT` | `80` | The **budget**: this percentage of the window. Clamped to `10..95`. |
 | `ZODE_COMPACT` | `elide` | What compaction may do when unset: `off`, `elide` (default), `full` (§ below). |
 | `ZODE_COMPACT_BG_PCT` | window-based | "Warm" threshold: start the tier-2 summary in the background at this % of the window. |

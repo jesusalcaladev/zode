@@ -11,6 +11,7 @@ const vxfw = vaxis.vxfw;
 const agent = @import("app").agent;
 const ed = @import("lib/editor.zig");
 const prompthistory = @import("lib/prompthistory.zig");
+const fileview = @import("lib/fileview.zig");
 const commands_mod = @import("app").commands;
 const keybinds = @import("lib/keybinds.zig");
 const mascot = @import("lib/mascot.zig");
@@ -1956,6 +1957,172 @@ test "in-TUI file editor: the modal shows the path and the file body" {
     }
     try std.testing.expect(found_title);
     try std.testing.expect(found_body);
+}
+
+test "file editor: Enter inserts a real newline and marks only the changed line" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const path = "/tmp/zode-file-editor-newline.txt";
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "one\ntwo" });
+
+    var m = Model.init(a);
+    defer m.deinit();
+    m.attachIo(io);
+    try std.testing.expect(m.openFileEditor(path));
+    try std.testing.expectEqual(@as(usize, 2), m.file_ed_marks.len);
+    try std.testing.expectEqual(@as(usize, 0), m.file_ed_added);
+
+    m.file_ed.setCursor(3);
+    _ = m.fileEditorHandleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expectEqualStrings("one\n\ntwo", m.file_ed.text());
+    try std.testing.expect(m.file_ed_dirty);
+    try std.testing.expectEqual(@as(usize, 3), m.file_ed_marks.len);
+    try std.testing.expectEqual(@as(usize, 1), m.file_ed_added);
+
+    _ = m.fileEditorHandleKey(.{ .codepoint = 's', .mods = .{ .ctrl = true } });
+    try std.testing.expect(!m.file_ed_dirty);
+    try std.testing.expectEqual(@as(usize, 0), m.file_ed_added);
+}
+
+test "file editor: Ctrl+G 2-3 selects a range and Ctrl+Enter stages it in the prompt" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const path = "/tmp/zode-file-editor-range.txt";
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "l1\nl2\nl3\nl4\nl5\n" });
+
+    var m = Model.init(a);
+    defer m.deinit();
+    m.attachIo(io);
+    try std.testing.expect(m.openFileEditor(path));
+
+    _ = m.fileEditorHandleKey(.{ .codepoint = 'g', .mods = .{ .ctrl = true } });
+    try std.testing.expect(m.file_ed_goto_active);
+    _ = m.fileEditorHandleKey(.{ .codepoint = '2' });
+    _ = m.fileEditorHandleKey(.{ .codepoint = '-' });
+    _ = m.fileEditorHandleKey(.{ .codepoint = '3' });
+    _ = m.fileEditorHandleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(m.file_ed_visual);
+    const r = m.fileEditorSelection().?;
+    try std.testing.expectEqual(@as(usize, 2), r.first);
+    try std.testing.expectEqual(@as(usize, 3), r.last);
+
+    _ = m.fileEditorHandleKey(.{ .codepoint = vaxis.Key.enter, .mods = .{ .ctrl = true } });
+    try std.testing.expect(!m.file_ed_active);
+    try std.testing.expect(std.mem.indexOf(u8, m.ed.text(), "@" ++ path ++ ":2-3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, m.ed.text(), "Review ") != null);
+}
+
+test "file editor: the review surface shows a gutter, a change mark and the mode" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const path = "/tmp/zode-file-editor-review.txt";
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "alpha\nbeta\ngamma\n" });
+
+    var m = Model.init(a);
+    defer m.deinit();
+    m.attachIo(io);
+    try std.testing.expect(m.openFileEditor(path));
+    m.file_ed.cursor = 0;
+    _ = m.fileEditorHandleKey(.{ .codepoint = 'x' });
+    try std.testing.expectEqual(fileview.Mark.changed, m.file_ed_marks[0]);
+
+    var buf: [256]u8 = undefined;
+    var s = try drawTest(&m, a, 100, 24);
+    var found_number = false;
+    var found_mark = false;
+    var found_hint = false;
+    var r: u16 = 0;
+    while (r < s.size.height) : (r += 1) {
+        const row = rowText(s, r, &buf);
+        if (std.mem.indexOf(u8, row, "1") != null and std.mem.indexOf(u8, row, "xalpha") != null) found_number = true;
+        if (std.mem.indexOf(u8, row, "+xalpha") != null or std.mem.indexOf(u8, row, "+") != null) found_mark = true;
+        if (std.mem.indexOf(u8, row, "Ctrl+Enter") != null) found_hint = true;
+    }
+    try std.testing.expect(found_number);
+    try std.testing.expect(found_mark);
+    try std.testing.expect(found_hint);
+
+    _ = m.fileEditorHandleKey(.{ .codepoint = 'r', .mods = .{ .ctrl = true } });
+    s = try drawTest(&m, a, 100, 24);
+    var found_diff = false;
+    r = 0;
+    while (r < s.size.height) : (r += 1) {
+        if (std.mem.indexOf(u8, rowText(s, r, &buf), "DIFF") != null) found_diff = true;
+    }
+    try std.testing.expect(found_diff);
+}
+
+test "file board: touched files become cards with real stats and open in the editor" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+    const path = "/tmp/zode-file-board-card.txt";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "one\ntwo\n" });
+
+    var m = Model.init(a);
+    defer m.deinit();
+    m.attachIo(io);
+    try std.testing.expect(!m.openFileBoard());
+    m.recordFileIntel(path, null, 12, 3, false, .modified);
+    try std.testing.expect(m.openFileBoard());
+
+    const s = try drawTest(&m, a, 110, 30);
+    var buf: [256]u8 = undefined;
+    var found_title = false;
+    var found_path = false;
+    var found_stats = false;
+    var r: u16 = 0;
+    while (r < s.size.height) : (r += 1) {
+        const row = rowText(s, r, &buf);
+        if (std.mem.indexOf(u8, row, "FILE INTELLIGENCE") != null) found_title = true;
+        if (std.mem.indexOf(u8, row, "card.txt") != null) found_path = true;
+        if (std.mem.indexOf(u8, row, "+12 -3") != null) found_stats = true;
+    }
+    try std.testing.expect(found_title);
+    try std.testing.expect(found_path);
+    try std.testing.expect(found_stats);
+
+    _ = m.fileBoardHandleKey(.{ .codepoint = vaxis.Key.enter });
+    try std.testing.expect(!m.file_board_active);
+    try std.testing.expect(m.file_ed_active);
+    try std.testing.expectEqualStrings("one\ntwo\n", m.file_ed.text());
+}
+
+test "a painted file link resolves to the full path for click-to-open" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var m = Model.init(a);
+    defer m.deinit();
+    m.recordFileIntel("/tmp/zode-click-card.zig", null, 3, 1, false, .modified);
+    try std.testing.expect(m.openFileBoard());
+    const s = try drawTest(&m, a, 110, 30);
+    try m.snapshotSelectableHistory(s, 30);
+
+    var target: ?vaxis.Mouse = null;
+    for (0..m.selectable_rows) |row| {
+        const base = row * (@as(usize, m.selectable_width) + 1);
+        for (0..m.selectable_width) |col| {
+            if (m.link_map.items[base + col] != null) {
+                target = .{ .col = @intCast(col), .row = @intCast(row), .button = .left, .type = .press, .mods = .{} };
+                break;
+            }
+        }
+        if (target != null) break;
+    }
+    try std.testing.expect(target != null);
+    try std.testing.expectEqualStrings("/tmp/zode-click-card.zig", m.fileLinkAt(target.?).?);
 }
 
 test "footer: vim mode and register are rendered as one short dim segment" {
@@ -7935,4 +8102,45 @@ test "focus: tool and diff paragraphs fold away, the answer stays, and the layou
 
     commands_mod.cmdView(&m, "normal");
     try std.testing.expectEqual(full_height, m.heightPrefix(m.paras.items.len));
+}
+
+test "quiet output: execution chatter is hidden, the answer and explicit commands stay" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.quiet_output = true;
+
+    m.pushKindEx(.tool_run, "*read*(src/tui.zig)", true);
+    m.pushToolDone("read", "Read 100 lines", 3, "1|const std\n2|fn main()", null);
+    m.pushKindEx(.info, "◇ Thinking · 165 chars\nreasoning", true);
+    m.pushKind(.assistant, "the answer is here");
+
+    const s = try drawTest(&m, arena, 100, 30);
+    try std.testing.expect(findRow(s, "read(src/tui.zig)") == null);
+    try std.testing.expect(findRow(s, "Read 100 lines") == null);
+    try std.testing.expect(findRow(s, "Thinking") == null);
+    try std.testing.expect(findRow(s, "the answer is here") != null);
+
+    // Ctrl+R is an explicit request: it reveals the full result.
+    try std.testing.expect(m.toggleLastTool());
+    var arena2_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena2_state.deinit();
+    const s2 = try drawTest(&m, arena2_state.allocator(), 100, 30);
+    try std.testing.expect(findRow(s2, "const std") != null);
+}
+
+test "quiet output: ZODE_VERBOSE_OUTPUT=0 restores the tool transcript" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.quiet_output = false;
+
+    m.pushToolStart("read", "src/tui.zig");
+    m.pushToolDone("read", "Read 100 lines", 3, "full", null);
+    const s = try drawTest(&m, arena_state.allocator(), 100, 30);
+    try std.testing.expect(findRow(s, "read(src/tui.zig)") != null);
+    try std.testing.expect(findRow(s, "Read 100 lines") != null);
 }

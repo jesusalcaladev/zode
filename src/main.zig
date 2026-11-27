@@ -429,6 +429,9 @@ fn runTui(init: std.process.Init) !u8 {
     // context into a notification queue that is still alive at this point.
     defer agent.fireLifecycleHook(gpa, .SessionEnd, "tui");
     model.environ = init.environ_map;
+    // Clean transcript by default. `ZODE_VERBOSE_OUTPUT=1` restores the old
+    // tool-by-tool paragraphs and end-of-turn stats.
+    model.quiet_output = !agent.envTruthyIn(init.environ_map, "ZODE_VERBOSE_OUTPUT", false);
     model.nerd_icons = lang_icons.nerdIconsEnabled(init.environ_map);
     agent.status_model_target = &model;
     // Scrubbed child env: bash/bg tools inherit only safe vars, never keys.

@@ -1455,13 +1455,13 @@ pub fn replaySessionMessages(m: *tui.Model, s: *session_mod.Session) void {
                 if (sm.tool_name) |name| {
                     const labeled = std.fmt.allocPrint(m.allocator, "tool {s}\n{s}", .{ name, sm.content }) catch null;
                     if (labeled) |txt| {
-                        m.pushKind(.tool_res, txt);
+                        m.pushKindEx(.tool_res, txt, true);
                         m.allocator.free(txt);
                     } else {
-                        m.pushKind(.tool_res, sm.content);
+                        m.pushKindEx(.tool_res, sm.content, true);
                     }
                 } else {
-                    m.pushKind(.tool_res, sm.content);
+                    m.pushKindEx(.tool_res, sm.content, true);
                 }
             },
             .system => m.pushKind(.info, sm.content),
@@ -1492,7 +1492,7 @@ fn replayAssistantToolCalls(m: *tui.Model, tool_calls_json: []const u8) void {
         }
         const line = std.fmt.allocPrint(m.allocator, "tool call: {s}", .{name}) catch continue;
         defer m.allocator.free(line);
-        m.pushKind(.info, line);
+        m.pushKindEx(.info, line, true);
     }
 }
 
@@ -5312,10 +5312,6 @@ fn pushTurnSummary(m: *tui.Model) void {
     // pending queue with a pointer to a frame that dies when this function
     // returns: the next draw paints freed memory (SIGSEGV in
     // `ensureParaHeights`) and the exit would be an "Invalid free".
-    var line_buf: [256]u8 = undefined;
-    const line = s.summaryLine(&line_buf, ms, ctx_used, cacheHitPct()) catch return;
-    m.pushInfo(line);
-
     // A finished checklist has done its job: it goes off the row above the
     // input, and the history keeps the full list. Without this the block stayed
     // for the rest of the session — "the plan is always there" — and it is the
@@ -5323,10 +5319,34 @@ fn pushTurnSummary(m: *tui.Model) void {
     const plan_now = m.planCopy();
     if (plan_now.allDone()) m.clearPlan();
 
-    if (s.files.items.len == 0 and s.yolo_open.items.len == 0) return;
-    var detail_buf: [512]u8 = undefined;
-    const detail = s.detailLine(&detail_buf) catch return;
-    if (detail.len > 0) m.pushInfo(detail);
+    // Execution stats are footer chrome, not transcript. In quiet output an
+    // ordinary answer ends with NO `⏺ Done · 0 tools · …` line: that line was
+    // the thing that made zode look like a tool log instead of an answer.
+    // `ZODE_QUIET_OUTPUT=0` restores the old, verbose paragraph.
+    if (m.quiet_output) {
+        if (s.files.items.len == 0 and s.yolo_open.items.len == 0 and s.denied == 0) return;
+        var quiet_buf: [192]u8 = undefined;
+        const board_hint: []const u8 = if (s.files.items.len > 0) " · /file board" else "";
+        const compact = std.mem.print(&quiet_buf, "Turn: {d} file{s} changed · {d}.{d}s{s}", .{
+            s.files.items.len,
+            if (s.files.items.len == 1) "" else "s",
+            ms / 1000,
+            (ms % 1000) / 100,
+            board_hint,
+        }) catch return;
+        m.pushFeedback(compact);
+        var detail_buf: [512]u8 = undefined;
+        const detail = s.detailLine(&detail_buf) catch return;
+        if (detail.len > 0) m.pushFeedback(detail);
+    } else {
+        var line_buf: [256]u8 = undefined;
+        const line = s.summaryLine(&line_buf, ms, ctx_used, cacheHitPct()) catch return;
+        m.pushInfo(line);
+        if (s.files.items.len == 0 and s.yolo_open.items.len == 0) return;
+        var detail_buf: [512]u8 = undefined;
+        const detail = s.detailLine(&detail_buf) catch return;
+        if (detail.len > 0) m.pushInfo(detail);
+    }
 
     // The questions nobody answered, in the summary.
     //
@@ -5337,7 +5357,9 @@ fn pushTurnSummary(m: *tui.Model) void {
     if (s.yolo_open.items.len > 0) {
         var ybuf: [256]u8 = undefined;
         const y = s.yoloOpenLine(&ybuf) catch return;
-        if (y.len > 0) m.pushInfo(y);
+        if (y.len > 0) {
+            if (m.quiet_output) m.pushFeedback(y) else m.pushInfo(y);
+        }
     }
 }
 
@@ -19362,7 +19384,7 @@ fn resolveCodeReviewPrompt(m: *tui.Model, arena: std.mem.Allocator, io: std.Io, 
         switch (pipeline_support.buildDiffReviewPrompt(arena, io)) {
             .prompt => |p| return p,
             .nothing_to_review => {
-                m.pushInfo("· code-review: nothing to review — the working tree is clean");
+                m.pushFeedback("Code-review: nothing to review — the working tree is clean");
                 m.streamEnd();
                 setStatusWithZo(m, .done, "Code-review done");
                 endTurn(m, turn_stats.iterations, false);
@@ -19393,7 +19415,7 @@ fn runCodeReview(m: *tui.Model, arg: []const u8) void {
 
     m.setPipelineStage("reviewer");
     defer m.setPipelineStage(null);
-    m.pushInfo("· code-review: analyzing the changes…");
+    m.pushFeedback("Code-review: analyzing the changes…");
     // The command's raw argument line goes into the session like any other
     // prompt, so `zode` knows this turn asked for a review and not a fix.
     const session_line = if (arg.len > 0) arg else "/code-review";
@@ -19422,10 +19444,10 @@ fn finishCodeReviewRun(m: *tui.Model, prompt: []const u8, run_dir: []const u8) v
     const counts = pipeline_mod.parseReviewReport(report);
     m.streamEnd();
     setStatusWithZo(m, .done, "Code-review done");
-    m.pushInfoFmt("· code-review — {d} high, {d} medium, {d} low", .{ counts.high, counts.medium, counts.low });
-    m.pushInfoFmt("· the report is in {s}/review.md", .{run_dir});
+    m.pushFeedbackFmt("Code-review: {d} high · {d} medium · {d} low", .{ counts.high, counts.medium, counts.low });
+    m.pushFeedbackFmt("Report: {s}/review.md", .{run_dir});
     if (counts.high > 0) {
-        m.pushInfo("· to fix the high-severity findings, say so — the harness will not touch tests to make them pass");
+        m.pushFeedback("To fix the high-severity findings, say so — the harness will not touch tests to make them pass");
     }
     endTurn(m, turn_stats.iterations, false);
 }

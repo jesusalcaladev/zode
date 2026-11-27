@@ -30,7 +30,11 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             if (self.pasting) {
                 if (key.matches(vaxis.Key.escape, .{})) {
                     self.pasting = false;
-                    tui.insertIntoInput(self, self.paste_buf.items);
+                    if (self.file_ed_active) {
+                        self.fileEditorInsertText(self.paste_buf.items);
+                    } else {
+                        tui.insertIntoInput(self, self.paste_buf.items);
+                    }
                     self.paste_buf.clearRetainingCapacity();
                     ctx.redraw = true;
                     return;
@@ -94,6 +98,16 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             // Transcript search bar (33.13): captures input while typing query.
             if (self.transcriptSearchActive()) {
                 if (self.searchBarHandleKey(key)) {
+                    self.flushCopyPending(ctx);
+                    ctx.redraw = true;
+                    try self.armTick(ctx);
+                    return;
+                }
+            }
+            // The file board is a full-surface review queue and owns every key
+            // while it is open, like the picker.
+            if (self.file_board_active) {
+                if (self.fileBoardHandleKey(key)) {
                     self.flushCopyPending(ctx);
                     ctx.redraw = true;
                     try self.armTick(ctx);
@@ -186,6 +200,16 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             // a palette on top of work in progress.
             if (key.matches('a', .{ .ctrl = true }) and self.ed.isEmpty()) {
                 agent.openConnectPalette(self);
+                ctx.redraw = true;
+                try self.armTick(ctx);
+                return;
+            }
+            // Ctrl+B: the file-intelligence board — the review queue of every
+            // file the agent touched, with a click-to-open path on each card.
+            if (key.matches('b', .{ .ctrl = true })) {
+                if (!self.openFileBoard()) {
+                    self.pushInfo("file: no changed files to put on the board");
+                }
                 ctx.redraw = true;
                 try self.armTick(ctx);
                 return;
@@ -707,7 +731,11 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             // Route bracketed paste to the active key prompt (provider connect),
             // otherwise insert into the composer. Newlines/control chars are
             // filtered by the key buffer so a pasted API key stays valid.
-            if (self.pal.active and self.pal.mode == .key_prompt) {
+            if (self.file_ed_active) {
+                // The file editor owns the keyboard while open: a paste must
+                // not leak into the composer behind the modal.
+                self.fileEditorInsertText(self.paste_buf.items);
+            } else if (self.pal.active and self.pal.mode == .key_prompt) {
                 self.pal.appendKeyText(self.paste_buf.items);
             } else {
                 tui.insertIntoInput(self, self.paste_buf.items);
@@ -846,6 +874,17 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                         var pos = @min(off -| self.input_text_start, bytes.len);
                         while (pos > 0 and (bytes[pos] & 0xC0) == 0x80) pos -= 1;
                         self.ed.setCursor(pos);
+                        ctx.redraw = true;
+                        return;
+                    }
+                }
+                // A file path printed in the transcript is a button: click it
+                // to open the review editor. This runs AFTER the rail and the
+                // composer caret so those keep their own click targets, and
+                // BEFORE text selection so a click does not swallow the link.
+                if (self.fileLinkAt(m)) |path| {
+                    if (self.openFileEditor(path)) {
+                        self.pushInfoFmt("file: opened {s} from the transcript", .{path});
                         ctx.redraw = true;
                         return;
                     }

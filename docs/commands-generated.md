@@ -6,6 +6,9 @@ Do not edit by hand — the table there is the one the TUI uses.
 | Command | Description | Argument / hint |
 |---|---|---|
 | `/help` | show commands | `ctrl+p` |
+| `/memory` | list \| pending \| approve <id> — durable project memory | — |
+| `/history` | search and reuse a past prompt | — |
+| `/focus` | quiet transcript: hide tool and diff details | — |
 | `/model` | pick a model in a modal | `ctrl+p` |
 | `/provider` | pick a provider in a modal | — |
 | `/providers` | list providers | — |
