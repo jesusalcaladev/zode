@@ -216,7 +216,9 @@ def main() -> int:
         print(f"smoke: {note}")
 
     # 1) Startup: banner, input box, status bar, and nothing falls over.
-    out, t = drive([b"hola mundo", b"\r"])
+    # Wait for the FULL startup state: asserting the frame before the wordmark
+    # and the command grid have been painted made the box-border check flaky.
+    out, t = drive([b"hola mundo", b"\r"], expect="choose a model")
     ok = True
     print(f"smoke: {len(out)} bytes through the pty")
     # The ASCII is gone. What replaced it is type: a wordmark, a tagline, and

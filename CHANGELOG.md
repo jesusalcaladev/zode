@@ -95,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - integrate mission runtime into zode (core) [`7644158c`](https://github.com/jesusalcaladev/zode/commit/7644158c)
 - remove dead code and close one-shot leaks (mission) [`0c0ead9c`](https://github.com/jesusalcaladev/zode/commit/0c0ead9c)
 - share hard-stop decisions between both runners [`c86b81eb`](https://github.com/jesusalcaladev/zode/commit/c86b81eb)
-- scale edge scrolling and unify copy cleanup (tui) [`8d0a4451`](https://github.com/jesusalcaladev/zode/commit/8d0a4451)
+- scale edge scrolling and unify copy cleanup (tui) [`cffd22f8`](https://github.com/jesusalcaladev/zode/commit/cffd22f8)
 
 ### Performance
 
@@ -117,6 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add a real headless tool-loop smoke (hooks) [`423e774a`](https://github.com/jesusalcaladev/zode/commit/423e774a)
 - gate background completion in the headless loop [`d66c2e57`](https://github.com/jesusalcaladev/zode/commit/d66c2e57)
 - gate /remote against the reference server [`906855e3`](https://github.com/jesusalcaladev/zode/commit/906855e3)
+- close the last verification gaps [`42f6c575`](https://github.com/jesusalcaladev/zode/commit/42f6c575)
 
 ### Styles
 

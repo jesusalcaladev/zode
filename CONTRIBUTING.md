@@ -24,7 +24,7 @@ Thanks for your interest in `zode`. It is a pure Zig code harness, built to be f
 | `zig build test -Dlive` | Live-provider tests (needs keys) |
 | `zig build test -De2e` | End-to-end scenarios |
 | `zig build pty-check` | The pty smoke scripts |
-| `zig build hooks-check` | Real headless tool-loop gates: a PostToolUse hook and a background completion drain (fake provider, no key) |
+| `zig build hooks-check` | Real headless tool-loop gates: PostToolUse hook, background completion drain and PermissionRequest deny/approve (fake provider, no key) |
 | `zig build remote-check` | `/remote list` in a pty against the reference server |
 | `zig build ui-frame` | Renders real scenes with real draw functions |
 | `zig build memaudit` | Static audit for use-after-free patterns |

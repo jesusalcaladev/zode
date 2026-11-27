@@ -437,6 +437,13 @@ pub fn build(b: *std.Build) void {
     run_bg.has_side_effects = true;
     run_bg.step.dependOn(&run_hooks.step);
     hooks_check.dependOn(&run_bg.step);
+    // 43.7: PermissionRequest hooks, deny AND approve. Same fixture server,
+    // so it runs last in the serialized chain.
+    const run_perm = b.addSystemCommand(&.{ "python3", "tools/permission_smoke.py" });
+    run_perm.setName("permission_smoke");
+    run_perm.has_side_effects = true;
+    run_perm.step.dependOn(&run_bg.step);
+    hooks_check.dependOn(&run_perm.step);
 
     // 43.7: `/remote` needs a real pty (slash commands are not driven in
     // --chat). Its own step: different port, different harness, no coupling

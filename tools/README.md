@@ -12,6 +12,7 @@ Every script is standalone. Run from the repo root unless noted.
 | `hooks_smoke.py` | Real PostToolUse hook in the headless tool loop, no key needed | `zig build hooks-check` |
 | `background_smoke.py` | Real `bash run_in_background` job and its completion drain | `zig build hooks-check` |
 | `remote_smoke.py` | `/remote list` in a pty against the reference server; token never printed | `zig build remote-check` |
+| `permission_smoke.py` | PermissionRequest hook, deny and approve branches in headless | `zig build hooks-check` |
 | `segv_probe.py` | SIGSEGV: terminal restored, `pc:` line in `/tmp/zode-crash.log` | `python3 tools/segv_probe.py` |
 | `zig build ui-frame` | Renders scenes with real draw functions | `zig build ui-frame` |
 | `zig build memaudit` | Static audit for the two crash classes | `zig build memaudit` |

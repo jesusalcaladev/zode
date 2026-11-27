@@ -93,6 +93,16 @@ SCENARIOS = {
         {"tools": [{"name": "read", "args": {"path": "AGENTS.md"}}]},
         {"tools": [{"name": "send_user_message", "args": {"message": "headless headlesssmoke scenario finished. done!"}}]},
     ],
+    # Phase 43.7: a tool that touches a file. A PermissionRequest hook decides
+    # whether `perm-hook-marker.txt` exists; both branches are smoke-tested.
+    "permhook": [
+        {"tools": [{"name": "bash", "args": {
+            "command": "touch perm-hook-marker.txt",
+            "description": "scripted write whose permission a hook decides",
+        }}]},
+        {"tools": [{"name": "send_user_message", "args": {"message": "permhook scenario finished"}}]},
+        {"text": "permhook done"},
+    ],
     # Phase 43.7: run a REAL tool through the headless loop while a project
     # hook is loaded, so the smoke can assert the hook fired on disk.
     "hooksmoke": [

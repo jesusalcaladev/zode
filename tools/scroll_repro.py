@@ -132,6 +132,29 @@ class Term:
             pass
         self.pump(0.25)
 
+    def pump_until(self, predicate, budget: float = 2.0) -> bool:
+        """Drain until `predicate(self.buf)` is true, not for a fixed time.
+
+        Fixed sleeps made this script flaky under load: a redraw that arrived
+        50 ms late was reported as 'no redraw at all' — the exact opposite of
+        what the script is meant to verify.
+        """
+        end = time.time() + budget
+        while time.time() < end:
+            if predicate(self.buf):
+                return True
+            r, _, _ = select.select([self.fd], [], [], 0.05)
+            if not r:
+                continue
+            try:
+                chunk = os.read(self.fd, 1 << 16)
+            except OSError:
+                return predicate(self.buf)
+            if not chunk:
+                return predicate(self.buf)
+            self.buf += chunk
+        return predicate(self.buf)
+
     def screen(self) -> str:
         """Everything that has been drawn so far, as plain text.
 
@@ -170,7 +193,7 @@ def main() -> int:
     ok = True
     t = Term()
     # Startup: the hero, the composer and its footer.
-    t.pump(2.0)
+    t.pump_until(lambda b: "######  ####" in strip_ansi(b) and "Ask anything" in strip_ansi(b), 4.0)
     s0 = t.screen()
     # The startup screen is the ASCII wordmark and the composer, and that is what
     # this asserts — the same two anchors `pty_smoke` pins. It used to look for
@@ -194,26 +217,25 @@ def main() -> int:
 
     t.send(filler)
     t.send(b"\r")
-    t.pump(3.0)
+    t.pump_until(lambda b: b"historial para probar" in b, 6.0)
     after_prompt = t.screen()
     ok &= check("history has content to scroll", "historial para probar" in after_prompt)
 
     # 1) PageUp moves the view: the app must redraw.
     mark = len(t.buf)
     t.send(PAGE_UP)
-    t.pump(0.6)
-    ok &= check("PageUp produced a redraw", len(t.buf) > mark)
+    ok &= check("PageUp produced a redraw", t.pump_until(lambda b: len(b) > mark, 1.5))
 
     # 2) The bug itself: overscroll WAY past the top, then ONE PageDown.
+    mark = len(t.buf)
     for _ in range(8):
         t.send(PAGE_UP)
-    t.pump(0.8)
+    t.pump_until(lambda b: len(b) > mark, 2.0)
     at_top = len(t.buf)
 
     mark = len(t.buf)
     t.send(PAGE_DOWN)
-    t.pump(0.8)
-    moved = len(t.buf) > mark
+    moved = t.pump_until(lambda b: len(b) > mark, 1.5)
 
     if not moved:
         print()
@@ -227,13 +249,11 @@ def main() -> int:
     # never scrolling': half-page down has to work too.
     mark = len(t.buf)
     t.send(HALF_DOWN)
-    t.pump(0.6)
-    ok &= check("ctrl+d (half page down) redraws", len(t.buf) > mark)
+    ok &= check("ctrl+d (half page down) redraws", t.pump_until(lambda b: len(b) > mark, 1.5))
 
     mark = len(t.buf)
     t.send(WHEEL_UP)
-    t.pump(0.4)
-    ok &= check("wheel up redraws", len(t.buf) > mark)
+    ok &= check("wheel up redraws", t.pump_until(lambda b: len(b) > mark, 1.5))
 
     # 3) Nothing exploded along the way.
     t.send(HALF_UP)
