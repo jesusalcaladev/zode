@@ -33,7 +33,9 @@ SCENARIOS = {
         }}]},
     ],
     "bg": [
-        {"tools": [{"name": "run_in_background", "args": {"command": "echo start; sleep 3; echo done"}}]},
+        # `run_in_background` is a bash FLAG, not a tool. The old scenario
+        # called a tool that does not exist, so it never started a job.
+        {"tools": [{"name": "bash", "args": {"command": "echo bg-done-marker", "run_in_background": True, "description": "start a scripted background job"}}]},
         {"tools": [{"name": "bash_output", "args": {"id": 1}}]},
         {"text": "bg scenario finished"},
     ],

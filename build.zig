@@ -424,12 +424,19 @@ pub fn build(b: *std.Build) void {
     // headless_smoke. It gets its OWN step: pty-check bundles the pty scripts
     // and one of them (scroll_repro) can fail for terminal-size reasons on a
     // headless runner, which must not hide this gate's result.
-    const hooks_check = b.step("hooks-check", "Build and verify hooks in the real headless tool loop");
+    const hooks_check = b.step("hooks-check", "Build and verify the headless tool-loop gates (hooks + background)");
     hooks_check.dependOn(b.getInstallStep());
     const run_hooks = b.addSystemCommand(&.{ "python3", "tools/hooks_smoke.py" });
     run_hooks.setName("hooks_smoke");
     run_hooks.has_side_effects = true;
     hooks_check.dependOn(&run_hooks.step);
+    // 43.7: background job start + completion drain. Same fixture server, so
+    // it has to run AFTER hooks_smoke (both bind port 11434).
+    const run_bg = b.addSystemCommand(&.{ "python3", "tools/background_smoke.py" });
+    run_bg.setName("background_smoke");
+    run_bg.has_side_effects = true;
+    run_bg.step.dependOn(&run_hooks.step);
+    hooks_check.dependOn(&run_bg.step);
 
     // Phase 37: `zig build diag` — one-shot internal diagnostics. Doesn't
     // touch the network or the real HOME: --diag only reads /proc/self/status.
