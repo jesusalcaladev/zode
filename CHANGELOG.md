@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-beta.3] - 2026-11-27
+
 ### Features
 
-- clean transcript by default with on-demand tool output (tui) [`577be74e`](https://github.com/jesusalcaladev/zode/commit/577be74e)
+- clean transcript by default with on-demand tool output (tui) [`4d0af40b`](https://github.com/jesusalcaladev/zode/commit/4d0af40b)
 
 ## [0.3.0-beta.2] - 2026-11-27
 
