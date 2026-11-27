@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - open files in an in-TUI editor (tui) [`1c81439c`](https://github.com/jesusalcaladev/zode/commit/1c81439c)
 - auto-scroll selection and cleaner copied text (tui) [`2817fc49`](https://github.com/jesusalcaladev/zode/commit/2817fc49)
 - polish compact fallback and regex search feedback (tui) [`b8ac804b`](https://github.com/jesusalcaladev/zode/commit/b8ac804b)
+- polish Settings with useful runtime switches (tui) [`c040735b`](https://github.com/jesusalcaladev/zode/commit/c040735b)
 
 ### Bug Fixes
 
@@ -74,6 +75,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - remove the completed task board (tasks) [`65c9ef69`](https://github.com/jesusalcaladev/zode/commit/65c9ef69)
 - remove the dead model_requested_iter path (42.8 notes) [`b9650023`](https://github.com/jesusalcaladev/zode/commit/b9650023)
 - finish the split cleanup (47.4) (tui) [`3d9e5596`](https://github.com/jesusalcaladev/zode/commit/3d9e5596)
+- clean generated artifacts and guard internal ASCII [`d20c6f37`](https://github.com/jesusalcaladev/zode/commit/d20c6f37)
 
 ### Documentation
 
@@ -109,7 +111,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - materialize autocomplete matches once per query (47.3) (tui) [`c99f62d1`](https://github.com/jesusalcaladev/zode/commit/c99f62d1)
 - refresh stale model cache, cache keychain lookups (47.8) (startup) [`50081b94`](https://github.com/jesusalcaladev/zode/commit/50081b94)
 - per-check cache keys from declared files (mission) [`ed158298`](https://github.com/jesusalcaladev/zode/commit/ed158298)
-- add ZODE_TERSE_TOOLS and stabilize pty smokes [`f434cea8`](https://github.com/jesusalcaladev/zode/commit/f434cea8)
+- add ZODE_TERSE_TOOLS and stabilize pty smokes [`33d93b57`](https://github.com/jesusalcaladev/zode/commit/33d93b57)
 
 ### Tests
 

@@ -1353,6 +1353,9 @@ pub fn settingsValue(m: *tui.Model, s: configmenu.Setting) []const u8 {
         .nerd_icons => gpa.dupe(u8, if (m.nerd_icons) "on" else "off") catch "",
         .active_agent => activeAgentValue(m),
         .new_agent => gpa.dupe(u8, "enter to create") catch "",
+        .terse_tools => gpa.dupe(u8, if (agent.terse_tools) "on" else "off") catch "",
+        .no_animation => gpa.dupe(u8, if (m.no_animation) "on" else "off") catch "",
+        .reduced_motion => gpa.dupe(u8, if (m.reduced_motion) "on" else "off") catch "",
     };
 }
 
@@ -1449,6 +1452,9 @@ pub fn applySettingValue(m: *tui.Model, s: configmenu.Setting, value: []const u8
         .nerd_icons => m.nerd_icons = std.mem.eql(u8, value, "on"),
         .active_agent => agent.setActiveAgent(m, value),
         .new_agent => return, // handled by the row handler (opens an editor)
+        .terse_tools => agent.terse_tools = std.mem.eql(u8, value, "on"),
+        .no_animation => m.no_animation = std.mem.eql(u8, value, "on"),
+        .reduced_motion => m.reduced_motion = std.mem.eql(u8, value, "on"),
     }
     if (s.persisted()) persistSettings(m);
 }

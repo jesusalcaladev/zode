@@ -12521,7 +12521,12 @@ fn verifycountsCountdown(m: *Model, buf: []u8) []const u8 {
 }
 
 pub fn drawSettingsScreen(p: *Painter, m: *Model, width: u16, height: u16) void {
-    if (width < 40 or height < 12) return;
+    if (width < 40 or height < 12) {
+        if (width > 0 and height > 0) {
+            _ = p.putClipped(0, 0, "settings needs 40x12", width, theme.code_gutter);
+        }
+        return;
+    }
     const secs = configmenu.all_sections;
     const sec = secs[@min(m.settings_section, secs.len - 1)];
     const rows = configmenu.settingsFor(sec);
@@ -12565,6 +12570,13 @@ pub fn drawSettingsScreen(p: *Painter, m: *Model, width: u16, height: u16) void 
         }
     }
 
+    // A one-line hint under the section list: what this column actually
+    // controls, without opening a row.
+    const hint_y = top + @as(u16, @intCast(secs.len)) + 2;
+    if (hint_y < bottom) {
+        _ = p.putClipped(2, hint_y, sec.hint(), left_w - 2, theme.code_comment);
+    }
+
     // Right column: the selected section's rows and their current values.
     const rx: u16 = split + 2;
     const rw: u16 = width - rx - 2;
@@ -12579,7 +12591,16 @@ pub fn drawSettingsScreen(p: *Painter, m: *Model, width: u16, height: u16) void 
         var shown = value;
         if (shown.len == 0) shown = "(not set)";
         if (shown.len > 28) shown = shown[0..28];
-        _ = p.putClipped(rx + 25, y, shown, rw - 25, if (chosen) theme.brand_hi else theme.ink2);
+        if (s.kind() == .toggle) {
+            const on = std.mem.eql(u8, shown, "on");
+            var flag_buf: [32]u8 = undefined;
+            const flag = std.mem.print(&flag_buf, "{s} {s}", .{
+                if (on) "●" else "○", shown,
+            }) catch shown;
+            _ = p.putClipped(rx + 25, y, flag, rw - 25, if (on) theme.ok else theme.ink3);
+        } else {
+            _ = p.putClipped(rx + 25, y, shown, rw - 25, if (chosen) theme.brand_hi else theme.ink2);
+        }
         if (s.persisted()) {
             _ = p.putText(width - 10, y, "saved", theme.ok);
         }

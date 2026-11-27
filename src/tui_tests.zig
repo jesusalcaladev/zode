@@ -3134,6 +3134,35 @@ test "code fence: matching brackets share a colour, nesting changes it" {
     try std.testing.expect(!std.meta.eql(inner.fg, open.fg));
 }
 
+test "settings: the screen shows sections, hints and a visible tiny fallback" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.settingsOpen();
+
+    const big = try drawTest(&m, arena_state.allocator(), 110, 36);
+    var buf: [256]u8 = undefined;
+    var title = false;
+    var hint = false;
+    var r: u16 = 0;
+    while (r < big.size.height) : (r += 1) {
+        const row = rowText(big, r, &buf);
+        if (std.mem.indexOf(u8, row, "Settings") != null) title = true;
+        if (std.mem.indexOf(u8, row, "Who answers") != null) hint = true;
+    }
+    try std.testing.expect(title);
+    try std.testing.expect(hint);
+
+    const tiny = try drawTest(&m, arena_state.allocator(), 30, 8);
+    var fallback = false;
+    r = 0;
+    while (r < tiny.size.height) : (r += 1) {
+        if (std.mem.indexOf(u8, rowText(tiny, r, &buf), "settings needs 40x12") != null) fallback = true;
+    }
+    try std.testing.expect(fallback);
+}
+
 test "motion: reduced and disabled animation both degrade to static rendering" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();

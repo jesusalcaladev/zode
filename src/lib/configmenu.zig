@@ -76,6 +76,9 @@ pub const Setting = enum {
     nerd_icons,
     active_agent,
     new_agent,
+    terse_tools,
+    no_animation,
+    reduced_motion,
 
     pub fn label(self: Setting) []const u8 {
         return switch (self) {
@@ -99,6 +102,9 @@ pub const Setting = enum {
             .nerd_icons => "Nerd Font icons",
             .active_agent => "Default agent",
             .new_agent => "New agent…",
+            .terse_tools => "Terse tool schemas",
+            .no_animation => "No animation",
+            .reduced_motion => "Reduced motion",
         };
     }
 
@@ -124,6 +130,9 @@ pub const Setting = enum {
             .nerd_icons => "Language glyph before code-block labels (auto = detect).",
             .active_agent => "Used by task when no definition is named (Enter to cycle).",
             .new_agent => "Create .zode/agents/<name>.md from a template, then edit it with !.",
+            .terse_tools => "Short tool schemas (≈15% fewer request tokens); /style can override it.",
+            .no_animation => "Render the final state immediately: no mascot motion, no fades.",
+            .reduced_motion => "Keep status changes but drop continuous motion (ZODE_REDUCED_MOTION).",
         };
     }
 
@@ -137,6 +146,8 @@ pub const Setting = enum {
             .color_palette, .vim_mode, .nerd_icons => .appearance,
             .active_agent => .agents,
             .new_agent => .agents,
+            .terse_tools => .context_cache,
+            .no_animation, .reduced_motion => .appearance,
         };
     }
 
@@ -148,7 +159,8 @@ pub const Setting = enum {
             .output_style, .effort, .context_limit, .compaction,
             .read_cache_size, .task_parallel, .max_iter, .color_palette,
             .nerd_icons => .picker,
-            .prompt_cache, .auto_check, .web_allow_local, .vim_mode => .toggle,
+            .prompt_cache, .auto_check, .web_allow_local, .vim_mode,
+            .terse_tools, .no_animation, .reduced_motion => .toggle,
             .permission_mode => .picker,
             .active_agent => .picker,
             .new_agent => .action,
@@ -159,6 +171,9 @@ pub const Setting = enum {
     /// and the two palette rows are not persisted here (model/provider already
     /// have their own persistence path).
     pub fn persisted(self: Setting) bool {
+        // These three are runtime switches from the environment, not config
+        // fields; showing "saved" for them would be a lie.
+        if (self == .terse_tools or self == .no_animation or self == .reduced_motion) return false;
         return switch (self.kind()) {
             .info, .action, .palette => false,
             .picker, .toggle => self != .model and self != .provider,
@@ -183,10 +198,10 @@ pub fn settingsFor(section: Section) []const Setting {
     return switch (section) {
         .model => &.{ .model, .provider, .effort },
         .output_style => &.{.output_style},
-        .context_cache => &.{ .context_limit, .compaction, .read_cache_size, .prompt_cache, .cache_stats },
+        .context_cache => &.{ .context_limit, .compaction, .read_cache_size, .prompt_cache, .terse_tools, .cache_stats },
         .agent => &.{ .task_parallel, .max_iter, .auto_check },
         .permissions => &.{ .permission_mode, .permission_rules, .web_allow_local },
-        .appearance => &.{ .color_palette, .vim_mode, .nerd_icons },
+        .appearance => &.{ .color_palette, .vim_mode, .nerd_icons, .no_animation, .reduced_motion },
         .agents => &.{ .active_agent, .new_agent },
     };
 }
@@ -199,7 +214,8 @@ pub fn optionsFor(s: Setting) []const []const u8 {
         .permission_mode => &.{ "build", "accept-edits", "plan", "bypass" },
         .compaction => &.{ "off", "elide", "full" },
         .read_cache_size => &.{ "64K", "256K", "1M", "4M", "10M" },
-        .prompt_cache, .auto_check, .web_allow_local, .vim_mode => &.{ "on", "off" },
+        .prompt_cache, .auto_check, .web_allow_local, .vim_mode,
+        .terse_tools, .no_animation, .reduced_motion => &.{ "on", "off" },
         .task_parallel => &.{ "1", "2", "3", "4", "5", "6", "7", "8", "auto" },
         .max_iter => &.{ "8", "12", "20", "40", "80", "200" },
         .context_limit => &.{ "auto", "32k", "64k", "128k", "200k", "1M" },
@@ -271,6 +287,11 @@ test "configmenu: only real settings are marked persisted" {
     try std.testing.expect(!Setting.new_agent.persisted());
     try std.testing.expect(Setting.active_agent.persisted());
     try std.testing.expect(!Setting.model.persisted());
+    // Environment-backed switches are visible in the screen but are not
+    // config.json fields; they must never show a "saved" badge.
+    try std.testing.expect(!Setting.terse_tools.persisted());
+    try std.testing.expect(!Setting.no_animation.persisted());
+    try std.testing.expect(!Setting.reduced_motion.persisted());
 }
 
 test "configmenu: option lookup" {
