@@ -3610,7 +3610,16 @@ pub const Model = struct {
         const text = self.copy_pending orelse return;
         self.copy_pending = null;
         defer self.allocator.free(text);
-        ctx.copyToClipboard(text) catch {};
+        // Every clipboard route gets the SAME cleanup: a path copied by
+        // `/file copy`, a selected answer, or a diff snippet should not carry
+        // CRLF or trailing padding from the painted grid.
+        const cleaned = cliptext.clean(self.allocator, text) catch {
+            ctx.copyToClipboard(text) catch {};
+            return;
+        };
+        defer self.allocator.free(cleaned.text);
+        if (cleaned.text.len == 0) return;
+        ctx.copyToClipboard(cleaned.text) catch {};
     }
 
     fn pickerRefilter(self: *Model) void {
@@ -8300,10 +8309,11 @@ pub const Model = struct {
         if (!self.selecting_text or self.selection_edge_dir == 0 or self.selectable_rows == 0) return false;
         const before = self.anchorLine();
         const max_off = self.currentMaxOffset();
+        const steps: usize = @intCast(@abs(self.selection_edge_dir));
         const after = if (self.selection_edge_dir < 0)
-            before -| 1
+            before -| steps
         else
-            @min(before +| 1, max_off);
+            @min(before +| steps, max_off);
         if (after == before) return false;
         const moved: i64 = @as(i64, @intCast(after)) - @as(i64, @intCast(before));
 
@@ -8335,11 +8345,22 @@ pub const Model = struct {
         };
     }
 
-    fn selectedText(self: *const Model, allocator: std.mem.Allocator) !?[]u8 {
+    /// One place for the endpoint order: the copy and the highlight must
+    /// agree on which end is first, or a drag upward paints one range and
+    /// copies another.
+    fn selectionOrdered(self: *const Model) ?struct { first: SelectionPoint, last: SelectionPoint } {
         const start = self.selection_start orelse return null;
         const end = self.selection_end orelse return null;
-        const first = if (selectionPointLess(end, start)) end else start;
-        const last = if (selectionPointLess(end, start)) start else end;
+        return if (selectionPointLess(end, start))
+            .{ .first = end, .last = start }
+        else
+            .{ .first = start, .last = end };
+    }
+
+    fn selectedText(self: *const Model, allocator: std.mem.Allocator) !?[]u8 {
+        const ordered = self.selectionOrdered() orelse return null;
+        const first = ordered.first;
+        const last = ordered.last;
         if (first.row >= self.selectable_rows or last.row >= self.selectable_rows) return null;
         const stride = @as(usize, self.selectable_width) + 1;
         var out: std.ArrayList(u8) = .empty;
@@ -8361,10 +8382,9 @@ pub const Model = struct {
     }
 
     pub fn paintTextSelection(self: *const Model, surface: vxfw.Surface) void {
-        const start = self.selection_start orelse return;
-        const end = self.selection_end orelse return;
-        const first = if (selectionPointLess(end, start)) end else start;
-        const last = if (selectionPointLess(end, start)) start else end;
+        const ordered = self.selectionOrdered() orelse return;
+        const first = ordered.first;
+        const last = ordered.last;
         if (first.row >= self.selectable_rows or last.row >= self.selectable_rows) return;
         var row = first.row;
         while (row <= last.row) : (row += 1) {

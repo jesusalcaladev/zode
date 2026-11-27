@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fire PreCompact and subagent lifecycle events (hooks) [`7fc97683`](https://github.com/jesusalcaladev/zode/commit/7fc97683)
 - fire the last four lifecycle events (hooks) [`9c40372a`](https://github.com/jesusalcaladev/zode/commit/9c40372a)
 - open files in an in-TUI editor (tui) [`1c81439c`](https://github.com/jesusalcaladev/zode/commit/1c81439c)
-- auto-scroll selection and cleaner copied text (tui) [`40f48f6e`](https://github.com/jesusalcaladev/zode/commit/40f48f6e)
+- auto-scroll selection and cleaner copied text (tui) [`2817fc49`](https://github.com/jesusalcaladev/zode/commit/2817fc49)
 
 ### Bug Fixes
 
@@ -95,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - integrate mission runtime into zode (core) [`7644158c`](https://github.com/jesusalcaladev/zode/commit/7644158c)
 - remove dead code and close one-shot leaks (mission) [`0c0ead9c`](https://github.com/jesusalcaladev/zode/commit/0c0ead9c)
 - share hard-stop decisions between both runners [`c86b81eb`](https://github.com/jesusalcaladev/zode/commit/c86b81eb)
+- scale edge scrolling and unify copy cleanup (tui) [`8d0a4451`](https://github.com/jesusalcaladev/zode/commit/8d0a4451)
 
 ### Performance
 

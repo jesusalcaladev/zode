@@ -11,12 +11,15 @@ pub const Point = struct {
     col: u16,
 };
 
-/// -1 = scroll toward older text (pointer near the top edge), +1 = toward
-/// newer text (pointer near the bottom edge), 0 = no auto-scroll.
+/// Negative = scroll toward older text (pointer near the top edge), positive
+/// = toward newer text (pointer near the bottom edge), 0 = no auto-scroll.
+/// Magnitude is the number of rows per tick: the closer to the very edge, the
+/// faster the scroll, so pushing further up actually moves further.
 pub fn edgeDirection(row: u16, rows: u16, margin: u16) i8 {
-    if (rows == 0 or margin == 0) return 0;
-    if (row < @min(margin, rows)) return -1;
-    if (rows > margin and row >= rows - @min(margin, rows - 1)) return 1;
+    if (rows <= 1 or margin == 0) return 0;
+    const band = @min(margin, rows - 1);
+    if (row < band) return -@as(i8, @intCast(band - row));
+    if (row >= rows - band) return @as(i8, @intCast(row - (rows - band) + 1));
     return 0;
 }
 
@@ -30,13 +33,16 @@ pub fn shift(point: Point, move: i64, rows: u16) Point {
     return .{ .row = @intCast(next), .col = point.col };
 }
 
-test "edge direction only fires near the viewport edges" {
-    try @import("std").testing.expectEqual(@as(i8, -1), edgeDirection(0, 20, 2));
-    try @import("std").testing.expectEqual(@as(i8, -1), edgeDirection(1, 20, 2));
-    try @import("std").testing.expectEqual(@as(i8, 0), edgeDirection(2, 20, 2));
-    try @import("std").testing.expectEqual(@as(i8, 1), edgeDirection(19, 20, 2));
-    try @import("std").testing.expectEqual(@as(i8, 0), edgeDirection(17, 20, 2));
-    try @import("std").testing.expectEqual(@as(i8, 0), edgeDirection(5, 0, 2));
+test "edge direction speeds up closer to the viewport edge" {
+    const t = @import("std").testing;
+    try t.expectEqual(@as(i8, -2), edgeDirection(0, 20, 2));
+    try t.expectEqual(@as(i8, -1), edgeDirection(1, 20, 2));
+    try t.expectEqual(@as(i8, 0), edgeDirection(2, 20, 2));
+    try t.expectEqual(@as(i8, 2), edgeDirection(19, 20, 2));
+    try t.expectEqual(@as(i8, 1), edgeDirection(18, 20, 2));
+    try t.expectEqual(@as(i8, 0), edgeDirection(17, 20, 2));
+    try t.expectEqual(@as(i8, 0), edgeDirection(5, 0, 2));
+    try t.expectEqual(@as(i8, 0), edgeDirection(0, 1, 2));
 }
 
 test "a selection anchor follows the document when the view scrolls" {
