@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- make the /diff test independent of git availability (commands) [`b3d16707`](https://github.com/jesusalcaladev/zode/commit/b3d16707)
+
 ## [0.3.0-beta.2] - 2026-11-27
 
 ### Features

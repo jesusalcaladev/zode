@@ -3294,9 +3294,13 @@ test "/diff command is dispatched" {
     try agent.submit(&m, "/diff");
     const text = try pendingText(&m, std.testing.allocator);
     defer std.testing.allocator.free(text);
-    // In a git repo with a working test IO, shows "diff · uncommitted";
-    // if process spawning is unavailable under test IO, reports git unavailable.
-    try std.testing.expect(std.mem.indexOf(u8, text, "diff") != null);
+    // The header is "Diff · uncommitted changes" when git works and
+    // "diff: not a git repository..." when process spawning is unavailable.
+    // Compare case-insensitively: CI has git, a test-only IO may not.
+    var lower: [512]u8 = undefined;
+    const n = @min(text.len, lower.len);
+    for (text[0..n], 0..) |c, i| lower[i] = std.ascii.toLower(c);
+    try std.testing.expect(std.mem.indexOf(u8, lower[0..n], "diff") != null);
 }
 
 pub fn cmdVersion(m: *tui.Model) void {
