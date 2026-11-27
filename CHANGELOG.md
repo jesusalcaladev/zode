@@ -52,7 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - open files in an in-TUI editor (tui) [`1c81439c`](https://github.com/jesusalcaladev/zode/commit/1c81439c)
 - auto-scroll selection and cleaner copied text (tui) [`2817fc49`](https://github.com/jesusalcaladev/zode/commit/2817fc49)
 - polish compact fallback and regex search feedback (tui) [`b8ac804b`](https://github.com/jesusalcaladev/zode/commit/b8ac804b)
-- polish Settings with useful runtime switches (tui) [`c040735b`](https://github.com/jesusalcaladev/zode/commit/c040735b)
+- polish Settings with useful runtime switches (tui) [`4885ef3d`](https://github.com/jesusalcaladev/zode/commit/4885ef3d)
+- unify and capitalize tool result output (tools) [`784e8525`](https://github.com/jesusalcaladev/zode/commit/784e8525)
 
 ### Bug Fixes
 

@@ -4,6 +4,7 @@ const sandbox_mod = @import("../lib/sandbox.zig");
 const agent = @import("app").agent;
 const bg_tool = @import("bg.zig");
 const bgproc = @import("../bgproc.zig");
+const output = @import("../lib/tooloutput.zig");
 
 pub fn toolBash(
     io: std.Io,
@@ -101,17 +102,17 @@ pub fn toolBash(
         else => 255,
     } else null;
     if (exit_line) |code| {
-        try out.print(arena, "exit={d}\n", .{code});
+        try out.print(arena, "{s}: {d} (exit={d})\n", .{ output.title(.exit), code, code });
     } else {
-        try out.appendSlice(arena, "exit=(stopped at the tool's output cap)\n");
+        try out.appendSlice(arena, "Exit: stopped at the tool's output cap (exit=(stopped at the tool's output cap))\n");
     }
     if (result.stdout.len > 0) {
-        try out.appendSlice(arena, "--- stdout ---\n");
+        try out.appendSlice(arena, "Stdout\n");
         try out.appendSlice(arena, result.stdout[0..@min(result.stdout.len, common.max_tool_output)]);
         try out.appendSlice(arena, "\n");
     }
     if (result.stderr.len > 0) {
-        try out.appendSlice(arena, "--- stderr ---\n");
+        try out.appendSlice(arena, "Stderr\n");
         try out.appendSlice(arena, result.stderr[0..@min(result.stderr.len, common.max_tool_output)]);
         try out.appendSlice(arena, "\n");
     }

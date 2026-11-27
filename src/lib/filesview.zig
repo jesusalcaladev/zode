@@ -35,6 +35,7 @@
 const std = @import("std");
 const repeat = @import("repeat.zig");
 const lang_icons = @import("lang_icons.zig");
+const output = @import("tooloutput.zig");
 
 /// The read cache's counters, as `/files` shows them.
 pub const Stats = struct {
@@ -202,30 +203,28 @@ pub const Report = struct {
         errdefer out.deinit(self.gpa);
 
         if (self.reads == 0 and self.changes == 0 and !self.bash_may_write) {
-            try out.appendSlice(self.gpa, "Files  ·  Nothing read or written yet this session");
+            try out.print(self.gpa, "{s}  ·  Nothing read or written yet this session", .{output.title(.files)});
             return out.toOwnedSlice(self.gpa);
         }
 
-        try out.print(self.gpa, "Files  ·  {d} read  ·  {d} changed this session", .{
-            self.reads,
-            self.changes,
+        try out.print(self.gpa, "{s}  ·  {d} read  ·  {d} changed this session", .{
+            output.title(.files), self.reads, self.changes,
         });
         if (self.body.items.len > 0) {
             try out.append(self.gpa, '\n');
             try out.appendSlice(self.gpa, self.body.items);
         }
         if (dropped > 0) {
-            try out.print(self.gpa, "\n  Note  {d} more file(s) not listed (list holds {d})", .{
-                dropped,
-                max_changed,
+            try out.print(self.gpa, "\n  {s}  {d} more file(s) not listed (list holds {d})", .{
+                output.title(.note), dropped, max_changed,
             });
         }
         if (self.bash_may_write) {
-            try out.print(self.gpa, "\n  Note  A `bash` command may have changed files that are not in this list", .{});
+            try out.print(self.gpa, "\n  {s}  A `bash` command may have changed files that are not in this list", .{output.title(.note)});
         }
         if (stats.hits > 0 or stats.saved > 0) {
-            try out.print(self.gpa, "\n  Cache  {d} re-read{s} avoided  ·  ~{d} KB not re-sent", .{
-                stats.hits,
+            try out.print(self.gpa, "\n  {s}  {d} re-read{s} avoided  ·  ~{d} KB not re-sent", .{
+                output.title(.cache), stats.hits,
                 if (stats.hits == 1) "" else "s",
                 stats.saved / 1024,
             });

@@ -429,11 +429,11 @@ test "list_files lists this src" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const out = try execute(std.testing.io, "list_files", "{\"path\":\"src\"}", arena_state.allocator(), null, null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "f main.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "FILE  main.zig") != null);
     // The tools are a FOLDER now. It was `f tools.zig`, and deleting the zombie
     // file that a `git checkout` had put back took this test down with it: two
     // tests failing for wanting a file that nothing imports.
-    try std.testing.expect(std.mem.indexOf(u8, out, "d tools") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "DIR   tools") != null);
 }
 
 test "think returns OK with no effects" {
@@ -1926,7 +1926,7 @@ test "bash: output over the cap is CUT and says so, not an error" {
     // was STOPPED (it really was: a child that kept writing would block on a pipe
     // nobody reads).
     try std.testing.expect(std.mem.indexOf(u8, out, "1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "--- stdout ---") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Stdout") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "output cut at") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "tool cap is") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "stopped at the cap") != null);

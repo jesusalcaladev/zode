@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
+const output = @import("../lib/tooloutput.zig");
 
 // ── list_files: plain directory listing (cheap) ──────────────
 pub fn toolListFiles(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocator) ![]const u8 {
@@ -9,25 +10,28 @@ pub fn toolListFiles(io: std.Io, obj: std.json.ObjectMap, arena: std.mem.Allocat
     };
     defer dir.close(io);
 
-    var out: std.ArrayList(u8) = .empty;
-    var count: usize = 0;
+    var rows_buf: [128 * 1024]u8 = undefined;
+    var rows: std.Io.Writer = .fixed(&rows_buf);
+    var shown: usize = 0;
+    var total: usize = 0;
+    const limit: usize = 500;
     var it = dir.iterate();
     while (it.next(io) catch null) |e| {
         if (e.name.len > 0 and e.name[0] == '.') continue; // hidden
-        const tag: []const u8 = switch (e.kind) {
-            .directory => "d",
-            .file => "f",
-            else => "?",
-        };
-        out.print(arena, "{s} {s}\n", .{ tag, e.name }) catch {};
-        count += 1;
-        if (count >= 500) {
-            out.appendSlice(arena, "… (truncated)\n") catch {};
-            break;
-        }
+        total += 1;
+        if (shown >= limit) continue; // keep counting: a silent cut is a lie
+        output.fileRow(&rows, e.kind == .directory, e.name) catch {};
+        shown += 1;
     }
-    if (count == 0) return std.fmt.allocPrint(arena, "(empty) {s}", .{path});
-    return out.items;
+    var head_buf: [256]u8 = undefined;
+    var head: std.Io.Writer = .fixed(&head_buf);
+    if (shown == 0) {
+        output.emptyDir(&head, path) catch {};
+        return arena.dupe(u8, head.buffered());
+    }
+    output.header(&head, .files, path) catch {};
+    if (total > shown) output.truncated(&head, shown, total) catch {};
+    return std.mem.concat(arena, u8, &.{ head.buffered(), rows.buffered() });
 }
 
 pub fn looksLikeText(path: []const u8) bool {
