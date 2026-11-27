@@ -9,7 +9,6 @@ var summary_breaker: SummaryBreaker = .{};
 
 pub fn tripped() bool { return summary_breaker.tripped(); }
 pub fn noteSuccess() void { summary_breaker.noteSuccess(); }
-pub fn resetBreaker() void { summary_breaker.reset(); }
 
 pub fn maySummarize(iteration: usize) bool {
     if (summary_breaker.tripped()) return false;

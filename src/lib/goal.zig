@@ -164,26 +164,6 @@ fn eqlAny(s: []const u8, alts: []const []const u8) bool {
     return false;
 }
 
-/// What the harness appends to the prompt so the objective stays in front of the model.
-///
-/// It goes at the END of the turn's context, after the stable prefix, for two reasons:
-/// the provider's cache is read up to the first byte that differs, so putting it in
-/// front would invalidate the whole tools+system+history prefix on every iteration and
-/// cost a cache miss per step; and a model reads the end of its context most
-/// reliably, which is where a thing it must not forget belongs.
-///
-/// The bytes are IDENTICAL every iteration on purpose — that is what keeps the prefix
-/// cacheable across the whole run.
-pub fn reminder(g: *const Goal, soft_cap: usize, hard_cap: usize, left: usize) []const u8 {
-    _ = soft_cap;
-    _ = hard_cap;
-    _ = left;
-    // The three numbers are in the SIGNATURE on purpose. A model told it has plenty
-    // of budget polishes and a model told it has two iterations left finishes, and
-    // that difference is free: the harness knows both numbers and the model does not.
-    if (g.status == .none) return "GOAL (keep working towards it; do not stop early claiming it is met)\n";
-    return "";
-}
 
 /// The line the harness prints when it stops the model to ask for a verdict.
 ///

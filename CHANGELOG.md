@@ -51,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fire the last four lifecycle events (hooks) [`9c40372a`](https://github.com/jesusalcaladev/zode/commit/9c40372a)
 - open files in an in-TUI editor (tui) [`1c81439c`](https://github.com/jesusalcaladev/zode/commit/1c81439c)
 - auto-scroll selection and cleaner copied text (tui) [`2817fc49`](https://github.com/jesusalcaladev/zode/commit/2817fc49)
-- polish compact fallback and regex search feedback (tui) [`57e6cad5`](https://github.com/jesusalcaladev/zode/commit/57e6cad5)
+- polish compact fallback and regex search feedback (tui) [`b8ac804b`](https://github.com/jesusalcaladev/zode/commit/b8ac804b)
 
 ### Bug Fixes
 
@@ -98,6 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - share hard-stop decisions between both runners [`c86b81eb`](https://github.com/jesusalcaladev/zode/commit/c86b81eb)
 - scale edge scrolling and unify copy cleanup (tui) [`cffd22f8`](https://github.com/jesusalcaladev/zode/commit/cffd22f8)
 - break the agent/tui/commands import cycle [`368cb489`](https://github.com/jesusalcaladev/zode/commit/368cb489)
+- run RC gate in CI and remove dead code [`4c02f869`](https://github.com/jesusalcaladev/zode/commit/4c02f869)
 
 ### Performance
 

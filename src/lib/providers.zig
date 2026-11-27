@@ -343,12 +343,6 @@ pub fn appendEnvRedactionKeys(
     }
 }
 
-/// Returns known saved provider keys for redaction. Caller owns the slice.
-pub fn savedRedactionKeys(gpa: std.mem.Allocator) []const []const u8 {
-    var list: std.ArrayList([]const u8) = .empty;
-    appendSavedRedactionKeys(&list, gpa);
-    return list.toOwnedSlice(gpa) catch &.{};
-}
 
 pub fn keyFor(def: *const ProviderDef, env: ?*const std.process.Environ.Map) ?[]const u8 {
     // 1) The one stored via the palette: what the user just typed.

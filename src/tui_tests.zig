@@ -3134,6 +3134,19 @@ test "code fence: matching brackets share a colour, nesting changes it" {
     try std.testing.expect(!std.meta.eql(inner.fg, open.fg));
 }
 
+test "motion: reduced and disabled animation both degrade to static rendering" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    try std.testing.expect(m.motionAllowed());
+    m.no_animation = true;
+    try std.testing.expect(!m.motionAllowed());
+    m.no_animation = false;
+    m.reduced_motion = true;
+    try std.testing.expect(!m.motionAllowed());
+    m.reduced_motion = false;
+    try std.testing.expect(m.motionAllowed());
+}
+
 test "search: an invalid regex says so instead of silently finding nothing" {
     var m = Model.init(std.testing.allocator);
     defer m.deinit();

@@ -165,22 +165,8 @@ pub fn paramStr(params: ?std.json.Value, key: []const u8) ?[]const u8 {
     return getStr(o, key);
 }
 
-pub fn paramInt(params: ?std.json.Value, key: []const u8) ?i64 {
-    const o = getObj(params) orelse return null;
-    const v = o.get(key) orelse return null;
-    return if (v == .integer) v.integer else null;
-}
 
-pub fn paramBool(params: ?std.json.Value, key: []const u8) ?bool {
-    const o = getObj(params) orelse return null;
-    const v = o.get(key) orelse return null;
-    return if (v == .bool) v.bool else null;
-}
 
-pub fn paramVal(params: ?std.json.Value, key: []const u8) ?std.json.Value {
-    const o = getObj(params) orelse return null;
-    return o.get(key);
-}
 
 const t = std.testing;
 

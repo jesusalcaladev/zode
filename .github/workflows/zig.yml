@@ -35,6 +35,11 @@ jobs:
         # src/main.zig has no unit tests: this real-pty probe is the only gate
         # on terminal restoration and the pc: entry in the crash log.
         run: python3 tools/segv_probe.py --bin ./zig-out/bin/zode-debug
+      - name: RC gate (serialized)
+        # One command that runs every v3 gate in order and stops at the first
+        # red one. It also covers ui-frame, hooks, remote, the import seam and
+        # the Windows cross-build, which the steps above do not exercise.
+        run: zig build rc-check
 
   # Also test with version flag
   build-with-version:

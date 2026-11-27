@@ -134,13 +134,6 @@ fn containsRemote(remote: []const SessionRef, id: []const u8) bool {
     return false;
 }
 
-pub fn actionLabel(a: Action) []const u8 {
-    return switch (a) {
-        .pull => "pull",
-        .push => "push",
-        .skip => "skip",
-    };
-}
 
 test "remote: config reads env and validates the URL" {
     var env: std.process.Environ.Map = .init(std.testing.allocator);

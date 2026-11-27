@@ -1153,9 +1153,6 @@ pub fn writeImprovements(gpa: std.mem.Allocator, io: std.Io, root: []const u8, t
 pub fn readRoadmap(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]const u8 {
     return readNamed(gpa, io, root, mission.roadmap_file);
 }
-pub fn writeRoadmap(gpa: std.mem.Allocator, io: std.Io, root: []const u8, text: []const u8) !void {
-    try writeNamed(gpa, io, root, mission.roadmap_file, text);
-}
 pub fn extendRequested(gpa: std.mem.Allocator, io: std.Io, root: []const u8) bool {
     const path = pathFor(gpa, root, mission.extend_file) catch return false;
     defer gpa.free(path);

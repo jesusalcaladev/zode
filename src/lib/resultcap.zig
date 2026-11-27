@@ -211,61 +211,6 @@ pub fn frozenCapResult(
     return result;
 }
 
-/// Like `capAggregate`, but honors frozen cut decisions from `caps`.
-///
-/// Each result is capped with `frozenCapResult` so a previously-cut result
-/// keeps the same cut on every later turn. After capping, if the total still
-/// exceeds `aggregate_max`, trim the largest results first - but only results
-/// that were NOT previously cut (a frozen cut must stay frozen).
-pub fn frozenCapAggregate(
-    caps: *Caps,
-    gpa: std.mem.Allocator,
-    arena: std.mem.Allocator,
-    results: []const []const u8,
-    result_ids: []const []const u8,
-    per_tool_max: usize,
-    aggregate_max: usize,
-) ![]Capped {
-    if (results.len != result_ids.len) return capAggregate(arena, results, per_tool_max, aggregate_max);
-
-    var capped: std.ArrayList(Capped) = .empty;
-    var j: usize = 0;
-    for (results) |r| {
-        try capped.append(arena, try frozenCapResult(caps, gpa, arena, result_ids[j], r, per_tool_max));
-        j += 1;
-    }
-    var total: usize = 0;
-    for (capped.items) |c| total += c.text.len;
-    if (total <= aggregate_max) return capped.toOwnedSlice(arena);
-
-    // Trim the largest result that was NOT previously cut, then recompute.
-    // A previously-cut result keeps its frozen cut: trimming it would change
-    // the model's cached prefix.
-    while (total > aggregate_max) {
-        var best: ?usize = null;
-        var best_len: usize = 0;
-        var k: usize = 0;
-        for (capped.items) |c| {
-            const was_cut = if (caps.find(result_ids[k])) |rec| rec.cut else false;
-            if (!was_cut and c.text.len > best_len and c.text.len > cut_notice.len) {
-                best_len = c.text.len;
-                best = k;
-            }
-            k += 1;
-        }
-        if (best == null) break; // nothing left to give without breaking a frozen cut
-        const i = best.?;
-        const cur = capped.items[i].text.len;
-        const others = total - cur;
-        const new_max = if (aggregate_max > others) aggregate_max - others else 0;
-        const trimmed = try capResult(arena, capped.items[i].text, new_max);
-        total = others + trimmed.text.len;
-        capped.items[i] = trimmed;
-        // Remember the new cut as frozen too.
-        caps.record(gpa, result_ids[i], trimmed.text.len, true) catch {};
-    }
-    return capped.toOwnedSlice(arena);
-}
 
 /// Serialize `Caps` to JSON: a flat array of {result_id, bytes_kept, cut}.
 /// Written next to the session JSONL so it survives resume.

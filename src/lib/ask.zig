@@ -255,17 +255,7 @@ pub const guidance =
     \\ - After the answer: keep going. No follow-up that restates the same decision, and nothing you have already been told.
 ;
 
-/// The line the TUI shows above the options, and the ONLY thing the user reads
-/// before choosing. It is the question, not the header.
-pub fn displayQuestion(q: Question) []const u8 {
-    return q.question;
-}
 
-/// One-line summary for the history, next to the `ask(...)` header.
-pub fn answerSummary(answered_text: []const u8) []const u8 {
-    const t = std.mem.trim(u8, answered_text, " \t\r\n");
-    return t;
-}
 
 test "parse: question is required and its whitespace is trimmed" {
     var ast = std.heap.ArenaAllocator.init(std.testing.allocator);

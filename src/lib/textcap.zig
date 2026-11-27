@@ -66,10 +66,6 @@ pub fn clipInto(text: []const u8, max_cols: usize, out: []u8) []const u8 {
 pub fn scratchFor(max_cols: usize) usize {
     return max_cols * 4 + 8;
 }
-pub fn clipWrap(text: []const u8, max_cols: usize) ClipWrap {
-    var buf: [scratchFor(default_max)]u8 = undefined;
-    return .{ .s = clipInto(text, max_cols, &buf) };
-}
 
 /// The largest `n` such that `text[0..n]` is valid UTF-8 and `n` is at most
 /// `budget` COLUMNS. Never runs past the end and never splits a character.

@@ -48,24 +48,6 @@ pub fn pathParts(path: []const u8) struct { base: []const u8, dir: []const u8 } 
     };
 }
 
-/// A shortened path for display: keeps the basename and as much of the tail
-/// as fits, replacing a long prefix with `…/`. The basename is never cut.
-pub fn shortenPath(path: []const u8, max: usize) []const u8 {
-    if (path.len <= max or max < 4) return path;
-    const base = std.fs.path.basename(path);
-    // Always keep at least `…/` + basename tail.
-    if (base.len + 2 >= max) return base;
-    const keep = max - 2; // room after "…/"
-    const tail_start = path.len - keep;
-    // Try to cut at a path separator so we don't split a segment.
-    var cut = tail_start;
-    if (std.mem.indexOfScalarPos(u8, path, tail_start, '/')) |s| {
-        if (path.len - (s + 1) + 2 <= max) cut = s + 1;
-    }
-    // If that still doesn't fit well, fall back to raw tail.
-    if (path.len - cut + 2 > max) cut = path.len - keep;
-    return path; // caller renders with prefix marker; see shortenPathInto
-}
 
 /// Writes a shortened display path into `out` and returns it. When the path is
 /// shortened the result starts with `…/`.

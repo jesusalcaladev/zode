@@ -176,19 +176,6 @@ fn containsWordIgnoreCaseAny(haystack: []const u8, needles: []const []const u8) 
 /// The pipeline stages, for logs and the status row.
 pub const Stage = enum { explorer, investigator, implementer, tester, verify, reviewer, done };
 
-/// One-line name for a stage, used in `pushInfo` notes and the artifacts
-/// directory layout.
-pub fn stageName(s: Stage) []const u8 {
-    return switch (s) {
-        .explorer => "explorer",
-        .investigator => "investigator",
-        .implementer => "implementer",
-        .tester => "tester",
-        .verify => "verify",
-        .reviewer => "reviewer",
-        .done => "done",
-    };
-}
 
 /// Artifacts are written under `.zode/pipeline/<run-id>/`. The run id is
 /// `<unix-seconds>-<pid>`, which is unique enough for one working tree and is

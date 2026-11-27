@@ -56,12 +56,6 @@ pub fn loadPermRulesInto(
     out.* = .{ .rules = all.items };
 }
 
-pub fn loadHooksAt(out: *hooks_mod.Set, arena: std.mem.Allocator, io: std.Io, path: []const u8) void {
-    out.* = .{};
-    if (readFileToWith(io, arena, path)) |data| {
-        out.* = hooks_mod.parseConfig(arena, data);
-    }
-}
 
 /// Loads USER hooks first, then PROJECT hooks. A project hook with the same
 /// event+matcher+condition replaces the user one, so a repo can override a
@@ -130,7 +124,3 @@ test "loadHooksMerged: project overrides user on the same event, others survive"
     try std.testing.expect(saw_user_start);
 }
 
-pub fn hooksPathForProjectPermissions(pp: []const u8, buf: []u8) ?[]const u8 {
-    const dir = std.fs.path.dirname(pp) orelse ".";
-    return std.mem.print(buf, "{s}/{s}", .{ dir, "hooks.json" }) catch null;
-}
