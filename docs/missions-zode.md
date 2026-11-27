@@ -49,7 +49,9 @@ file, the turn/cost ceiling, `max_failures`, or a `blocked` verdict.
 Criteria run in batches of up to three concurrent shells. Verdicts are cached in
 `.mission/checks-cache.json` under a workspace fingerprint (path + size + mtime,
 excluding `.mission`) plus the criteria signature, so an unchanged suite is not
-re-run. Any workspace change invalidates the whole suite; external state (clock,
+re-run. A criterion may declare `files: ["relative/path", ...]`; when it does,
+its cache key covers only those paths, so an unrelated edit keeps the hit.
+Checks without `files` keep the conservative whole-workspace key. External state (clock,
 network, environment) is not modeled. For those checks, create
 `.mission/NO_CACHE` — the marker lives inside `.mission`, so it does not itself
 invalidate the fingerprint, and every suite runs fresh while it exists.
@@ -156,7 +158,7 @@ without letting an assertion become truth.
   state.json        durable supervisor state
   journal.md        append-only memory
   evidence/*.txt    stdout, stderr, exit, expectation per check
-  checks-cache.json fingerprint + cached check verdicts (safe to delete)
+  checks-cache.json v2: per-check fingerprints + verdicts (safe to delete)
   NO_CACHE          presence forces a fresh suite (outside the fingerprint)
   facts.json        structured facts injected into prompts (proposed ones marked ?)
   fact-requests.jsonl  agent proposal inbox; validated and consumed each turn

@@ -208,8 +208,42 @@ fn workspaceFingerprint(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ch
     return h;
 }
 
+/// Per-check cache key. A check with declared `files` fingerprints only those
+/// paths; an opaque check falls back to the whole-workspace fingerprint. The
+/// criteria signature is always included so editing a command invalidates it.
+fn checkFingerprint(gpa: std.mem.Allocator, io: std.Io, root: []const u8, check: mission.Check, whole_fp: u64) !u64 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var h = fnvUpdate(0xcbf29ce484222325, "zode-mission-check-v2");
+    h = fnvUpdate(h, check.id);
+    h = fnvUpdate(h, check.cmd);
+    h = fnvUpdate(h, check.expect);
+    h = fnvUpdate(h, std.mem.asBytes(&check.timeout_ms));
+    if (check.files.len == 0) return fnvUpdate(h, std.mem.asBytes(&whole_fp));
+
+    var stamps = std.ArrayList(FsStamp).empty;
+    for (check.files) |rel| {
+        const full = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, rel });
+        const st = cwdDir().statFile(io, full, .{}) catch continue;
+        try stamps.append(a, .{ .path = rel, .size = st.size, .mtime_ns = st.mtime.nanoseconds });
+    }
+    std.mem.sort(FsStamp, stamps.items, {}, struct {
+        fn lessThan(_: void, x: FsStamp, y: FsStamp) bool {
+            return std.mem.lessThan(u8, x.path, y.path);
+        }
+    }.lessThan);
+    for (stamps.items) |s| {
+        h = fnvUpdate(h, s.path);
+        h = fnvUpdate(h, std.mem.asBytes(&s.size));
+        h = fnvUpdate(h, std.mem.asBytes(&s.mtime_ns));
+    }
+    return h;
+}
+
 const CheckCache = struct {
-    fingerprint: u64,
+    version: u8,
+    fingerprints: []u64,
     results: []mission.CheckResult,
 };
 
@@ -230,10 +264,12 @@ fn loadCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?CheckCa
     defer arena.deinit();
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), data, .{}) catch return null;
     if (parsed != .object) return null;
-    const fp_s = objStr(parsed.object, "fingerprint") orelse return null;
-    const fingerprint = std.fmt.parseInt(u64, fp_s, 10) catch return null;
+    const version_v = parsed.object.get("version") orelse return null;
+    if (version_v != .integer or version_v.integer < 2) return null; // v1 cache: re-run once
     const arr_v = parsed.object.get("results") orelse return null;
     if (arr_v != .array) return null;
+    var fps = std.ArrayList(u64).empty;
+    errdefer fps.deinit(gpa);
     var out = std.ArrayList(mission.CheckResult).empty;
     errdefer {
         for (out.items) |r| {
@@ -245,16 +281,26 @@ fn loadCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?CheckCa
     for (arr_v.array.items) |item| {
         if (item != .object) continue;
         const id = objStr(item.object, "id") orelse continue;
+        const fp_s = objStr(item.object, "fp") orelse continue;
+        const fp = std.fmt.parseInt(u64, fp_s, 10) catch continue;
         out.append(gpa, .{
             .id = gpa.dupe(u8, id) catch return null,
             .ok = objBool(item.object, "ok", false),
             .summary = gpa.dupe(u8, objStr(item.object, "summary") orelse "") catch return null,
         }) catch return null;
+        fps.append(gpa, fp) catch return null;
     }
-    return .{ .fingerprint = fingerprint, .results = out.toOwnedSlice(gpa) catch return null };
+    if (fps.items.len != out.items.len) return null;
+    const owned_fps = fps.toOwnedSlice(gpa) catch return null;
+    fps = .empty; // ownership moved; the errdefer above must not free it
+    const owned_results = out.toOwnedSlice(gpa) catch {
+        gpa.free(owned_fps);
+        return null;
+    };
+    return .{ .version = 2, .fingerprints = owned_fps, .results = owned_results };
 }
 
-fn saveCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8, fingerprint: u64, results: []const mission.CheckResult) void {
+fn saveCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8, fingerprints: []const u64, results: []const mission.CheckResult) void {
     const meta = pathFor(gpa, root, mission.dir_name) catch return;
     defer gpa.free(meta);
     cwdDir().createDirPath(io, meta) catch return;
@@ -263,7 +309,7 @@ fn saveCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8, fingerpr
 
     var buf: [256 * 1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    w.print("{{\"version\":1,\"fingerprint\":\"{d}\",\"results\":[", .{fingerprint}) catch return;
+    w.writeAll("{\"version\":2,\"results\":[") catch return;
     for (results, 0..) |r, i| {
         if (i > 0) w.writeByte(',') catch return;
         w.writeAll("{\"id\":") catch return;
@@ -272,6 +318,7 @@ fn saveCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8, fingerpr
         w.writeAll(if (r.ok) "true" else "false") catch return;
         w.writeAll(",\"summary\":") catch return;
         writeString(&w, r.summary) catch return;
+        if (i < fingerprints.len) w.print(",\"fp\":\"{d}\"", .{fingerprints[i]}) catch return;
         w.writeByte('}') catch return;
     }
     w.writeAll("]}\n") catch return;
@@ -814,6 +861,14 @@ pub fn writePlanFiles(gpa: std.mem.Allocator, io: std.Io, root: []const u8, plan
             try writeString(&w, c.cmd);
             try w.writeAll(",\"expect\":");
             try writeString(&w, c.expect);
+            if (c.files.len > 0) {
+                try w.writeAll(",\"files\":[");
+                for (c.files, 0..) |f, j| {
+                    if (j > 0) try w.writeByte(',');
+                    try writeString(&w, f);
+                }
+                try w.writeByte(']');
+            }
             try w.print(",\"timeout_ms\":{d}}}", .{c.timeout_ms});
         }
         try w.writeAll("]}");
@@ -878,6 +933,7 @@ pub fn loadCriteria(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]mis
             .cmd = try gpa.dupe(u8, cmd),
             .expect = try gpa.dupe(u8, objStr(item.object, "expect") orelse "exit0"),
             .timeout_ms = @intCast(@max(1000, @min(600000, objInt(item.object, "timeout_ms", 30000)))),
+            .files = try mission.parseCheckFiles(gpa, item.object.get("files")),
         });
     }
     return out.toOwnedSlice(gpa);
@@ -1195,7 +1251,23 @@ fn exitCode(term: std.process.Child.Term) u8 {
 /// `freeCheckResults`.
 pub fn runChecks(gpa: std.mem.Allocator, io: std.Io, root: []const u8, checks: []const mission.Check) ![]mission.CheckResult {
     if (checks.len == 0) return &.{};
-    const fingerprint = try workspaceFingerprint(gpa, io, root, checks);
+    const whole_fp = try workspaceFingerprint(gpa, io, root, checks);
+    const fps = try gpa.alloc(u64, checks.len);
+    defer gpa.free(fps);
+    for (checks, 0..) |check, i| fps[i] = try checkFingerprint(gpa, io, root, check, whole_fp);
+
+    const out = try gpa.alloc(mission.CheckResult, checks.len);
+    const owned = try gpa.alloc(bool, checks.len);
+    @memset(owned, false);
+    defer {
+        for (out, owned) |r, have| {
+            if (!have) continue;
+            if (r.id.len > 0) gpa.free(r.id);
+            if (r.summary.len > 0) gpa.free(r.summary);
+        }
+        gpa.free(owned);
+        gpa.free(out);
+    }
 
     const no_cache_path: ?[]const u8 = pathFor(gpa, root, mission.no_cache_file) catch null;
     defer if (no_cache_path) |p| gpa.free(p);
@@ -1203,61 +1275,53 @@ pub fn runChecks(gpa: std.mem.Allocator, io: std.Io, root: []const u8, checks: [
 
     if (!force_fresh) {
         if (loadCheckCache(gpa, io, root)) |cache| {
-            defer freeCachedResults(gpa, cache.results);
-            if (cache.fingerprint == fingerprint and cacheMatches(cache.results, checks)) {
-                var hit = try gpa.alloc(mission.CheckResult, cache.results.len);
-                var filled: usize = 0;
-                errdefer {
-                    for (hit[0..filled]) |r| {
-                        gpa.free(r.id);
-                        gpa.free(r.summary);
-                    }
-                    gpa.free(hit);
-                }
+            defer {
+                gpa.free(cache.fingerprints);
+                freeCachedResults(gpa, cache.results);
+            }
+            if (cacheMatches(cache.results, checks) and cache.fingerprints.len == checks.len) {
                 for (cache.results, 0..) |r, i| {
+                    if (fps[i] != cache.fingerprints[i] or owned[i]) continue;
                     const id = try gpa.dupe(u8, r.id);
                     errdefer gpa.free(id);
                     const summary = try gpa.dupe(u8, r.summary);
-                    hit[i] = .{ .id = id, .ok = r.ok, .summary = summary };
-                    filled += 1;
+                    out[i] = .{ .id = id, .ok = r.ok, .summary = summary };
+                    owned[i] = true;
                 }
-                return hit;
             }
         }
     }
 
+    // Only misses run. The result slots for hits are already owned and stay put.
     const jobs = try gpa.alloc(CheckJob, checks.len);
     defer gpa.free(jobs);
     for (checks, jobs) |check, *job| {
         job.* = .{ .check = check, .gpa = gpa, .io = io, .root = root, .result = .{ .id = "", .ok = false } };
     }
-    var results_owned = false;
-    errdefer if (!results_owned) {
-        for (jobs) |job| {
-            if (job.result.id.len > 0) gpa.free(job.result.id);
-            if (job.result.summary.len > 0) gpa.free(job.result.summary);
-        }
-    };
-
     var next: usize = 0;
-    while (next < jobs.len) {
-        const n = @min(max_parallel_checks, jobs.len - next);
+    while (next < checks.len) {
+        const n = @min(max_parallel_checks, checks.len - next);
         var threads = @as([max_parallel_checks]?std.Thread, @splat(null));
+        var launched: usize = 0;
         for (0..n) |k| {
-            const job = &jobs[next + k];
-            threads[k] = std.Thread.spawn(.{}, CheckJob.run, .{job}) catch null;
-            if (threads[k] == null) CheckJob.run(job);
+            const i = next + k;
+            if (owned[i]) continue;
+            const job = &jobs[i];
+            threads[launched] = std.Thread.spawn(.{}, CheckJob.run, .{job}) catch null;
+            if (threads[launched] == null) CheckJob.run(job);
+            launched += 1;
         }
-        for (threads[0..n]) |maybe_thread| {
+        for (threads[0..launched]) |maybe_thread| {
             if (maybe_thread) |thread| thread.join();
         }
         next += n;
     }
-
-    var out = try gpa.alloc(mission.CheckResult, jobs.len);
-    results_owned = true;
-    for (jobs, 0..) |job, i| out[i] = job.result;
-    saveCheckCache(gpa, io, root, fingerprint, out);
+    for (jobs, 0..) |job, i| {
+        if (owned[i]) continue;
+        out[i] = job.result;
+        owned[i] = true;
+    }
+    saveCheckCache(gpa, io, root, fps, out);
     return out;
 }
 
@@ -1619,6 +1683,48 @@ test "mission_io: unchanged checks are cached until the workspace or criteria ch
     const fifth = try runChecks(std.testing.allocator, io, root, &checks);
     defer freeCheckResults(std.testing.allocator, fifth);
     try std.testing.expectEqual(@as(usize, 8), try countLines(std.testing.allocator, io, counter));
+}
+
+test "mission_io: declared files keep the cache hit for every other check" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const root = try testRoot(a, "scoped-cache");
+    defer cleanRoot(io, root);
+    try cwdDir().createDirPath(io, root);
+    const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
+    try cwdDir().createDirPath(io, meta);
+
+    const fa = try std.fmt.allocPrint(a, "{s}/a.txt", .{root});
+    const fb = try std.fmt.allocPrint(a, "{s}/b.txt", .{root});
+    try cwdDir().writeFile(io, .{ .sub_path = fa, .data = "a" });
+    try cwdDir().writeFile(io, .{ .sub_path = fb, .data = "b" });
+    const ca = "/tmp/zode-mission-scoped-a";
+    const cb = "/tmp/zode-mission-scoped-b";
+    defer cwdDir().deleteFile(io, ca) catch {};
+    defer cwdDir().deleteFile(io, cb) catch {};
+    try cwdDir().writeFile(io, .{ .sub_path = ca, .data = "" });
+    try cwdDir().writeFile(io, .{ .sub_path = cb, .data = "" });
+
+    const files_a = [_][]const u8{"a.txt"};
+    const files_b = [_][]const u8{"b.txt"};
+    const checks = [_]mission.Check{
+        .{ .id = "a", .cmd = try std.fmt.allocPrint(a, "echo x >> {s}", .{ca}), .files = &files_a },
+        .{ .id = "b", .cmd = try std.fmt.allocPrint(a, "echo x >> {s}", .{cb}), .files = &files_b },
+    };
+    const first = try runChecks(std.testing.allocator, io, root, &checks);
+    defer freeCheckResults(std.testing.allocator, first);
+    try std.testing.expectEqual(@as(usize, 1), try countLines(std.testing.allocator, io, ca));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(std.testing.allocator, io, cb));
+
+    // Only a.txt changes: check "a" re-runs, check "b" is a cache hit.
+    try cwdDir().writeFile(io, .{ .sub_path = fa, .data = "a changed" });
+    const second = try runChecks(std.testing.allocator, io, root, &checks);
+    defer freeCheckResults(std.testing.allocator, second);
+    try std.testing.expectEqual(@as(usize, 2), try countLines(std.testing.allocator, io, ca));
+    try std.testing.expectEqual(@as(usize, 1), try countLines(std.testing.allocator, io, cb));
+    try std.testing.expectEqualStrings("a", first[0].summary);
 }
 
 test "mission_io: durable facts replace by subject and survive a JSON round trip" {

@@ -366,7 +366,19 @@ fn jsonChecks(gpa: std.mem.Allocator, checks: []const mission.Check) ![]const u8
         defer gpa.free(cmd);
         const expect = try jsonQuote(gpa, c.expect);
         defer gpa.free(expect);
-        const part = try std.fmt.allocPrint(gpa, "{{\"id\":{s},\"cmd\":{s},\"expect\":{s},\"timeout_ms\":{d}}}", .{ id, cmd, expect, c.timeout_ms });
+        var files_buf: [1024]u8 = undefined;
+        var fw: std.Io.Writer = .fixed(&files_buf);
+        if (c.files.len > 0) {
+            fw.writeAll(",\"files\":[") catch {};
+            for (c.files, 0..) |f, j| {
+                if (j > 0) fw.writeByte(',') catch {};
+                const q = jsonQuote(gpa, f) catch continue;
+                defer gpa.free(q);
+                fw.writeAll(q) catch {};
+            }
+            fw.writeByte(']') catch {};
+        }
+        const part = try std.fmt.allocPrint(gpa, "{{\"id\":{s},\"cmd\":{s},\"expect\":{s},{s}\"timeout_ms\":{d}}}", .{ id, cmd, expect, fw.buffered(), c.timeout_ms });
         defer gpa.free(part);
         try out.appendSlice(gpa, part);
     }

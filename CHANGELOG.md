@@ -98,7 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - share hard-stop decisions between both runners [`c86b81eb`](https://github.com/jesusalcaladev/zode/commit/c86b81eb)
 - scale edge scrolling and unify copy cleanup (tui) [`cffd22f8`](https://github.com/jesusalcaladev/zode/commit/cffd22f8)
 - break the agent/tui/commands import cycle [`368cb489`](https://github.com/jesusalcaladev/zode/commit/368cb489)
-- run RC gate in CI and remove dead code [`4c02f869`](https://github.com/jesusalcaladev/zode/commit/4c02f869)
+- run RC gate in CI and remove dead code [`b43ee703`](https://github.com/jesusalcaladev/zode/commit/b43ee703)
 
 ### Performance
 
@@ -108,6 +108,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - eliminate quadratic SSE tool-arg parsing and per-chunk allocations (46.6-46.11) [`14ee2362`](https://github.com/jesusalcaladev/zode/commit/14ee2362)
 - materialize autocomplete matches once per query (47.3) (tui) [`c99f62d1`](https://github.com/jesusalcaladev/zode/commit/c99f62d1)
 - refresh stale model cache, cache keychain lookups (47.8) (startup) [`50081b94`](https://github.com/jesusalcaladev/zode/commit/50081b94)
+- per-check cache keys from declared files (mission) [`05627a77`](https://github.com/jesusalcaladev/zode/commit/05627a77)
 
 ### Tests
 

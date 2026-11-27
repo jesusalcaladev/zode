@@ -106,6 +106,10 @@ pub const Check = struct {
     cmd: []const u8,
     expect: []const u8 = "exit0",
     timeout_ms: u32 = 30000,
+    /// Files this check reads. When present, the cache key covers ONLY these
+    /// paths, so an unrelated edit does not re-run the suite. Empty means the
+    /// whole workspace (the conservative default for opaque commands).
+    files: []const []const u8 = &.{},
 };
 
 pub const CheckResult = struct {
@@ -345,6 +349,25 @@ fn safeId(s: []const u8) bool {
     return true;
 }
 
+/// `files` in a criterion is an allow-list for the cache key: only declared
+/// paths (relative, no "..") are accepted. A bad entry is ignored, not fatal.
+pub fn parseCheckFiles(gpa: std.mem.Allocator, value: ?std.json.Value) ![]const []const u8 {
+    const v = value orelse return &.{};
+    if (v != .array or v.array.items.len == 0) return &.{};
+    var out = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (out.items) |p| gpa.free(p);
+        out.deinit(gpa);
+    }
+    for (v.array.items) |item| {
+        if (item != .string) continue;
+        const p = std.mem.trim(u8, item.string, " \t");
+        if (p.len == 0 or p.len > 256 or std.mem.indexOf(u8, p, "..") != null or std.mem.startsWith(u8, p, "/")) continue;
+        try out.append(gpa, try gpa.dupe(u8, p));
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 fn unsafeCommand(cmd: []const u8) bool {
     const denied = [_][]const u8{ "sudo ", "rm -rf /", "mkfs", "dd if=", "curl ", "wget " };
     for (denied) |needle| {
@@ -384,6 +407,7 @@ pub fn planFromJson(gpa: std.mem.Allocator, data: []const u8) !Plan {
             .cmd = try gpa.dupe(u8, cmd_v.string),
             .expect = try gpa.dupe(u8, expect),
             .timeout_ms = timeout_ms,
+            .files = try parseCheckFiles(gpa, item.object.get("files")),
         });
     }
     if (checks.items.len == 0) return error.InvalidPlan;
@@ -502,13 +526,15 @@ pub fn planFromObjective(gpa: std.mem.Allocator, objective: []const u8) !Plan {
         for (files.items, 0..) |file, i| {
             const id = try std.fmt.allocPrint(gpa, "file{d}", .{i + 1});
             const cmd = try std.fmt.allocPrint(gpa, "test -f '{s}'", .{file});
-            try checks.append(gpa, .{ .id = id, .cmd = cmd });
+            const one = [_][]const u8{file};
+            try checks.append(gpa, .{ .id = id, .cmd = cmd, .files = try gpa.dupe([]const u8, &one) });
         }
         for (words.items, 0..) |word, i| {
             const file = files.items[@min(i, files.items.len - 1)];
             const id = try std.fmt.allocPrint(gpa, "content{d}", .{i + 1});
             const cmd = try std.fmt.allocPrint(gpa, "grep -q '{s}' '{s}'", .{ word, file });
-            try checks.append(gpa, .{ .id = id, .cmd = cmd });
+            const one = [_][]const u8{file};
+            try checks.append(gpa, .{ .id = id, .cmd = cmd, .files = try gpa.dupe([]const u8, &one) });
         }
         for (files.items, 0..) |file, i| {
             const one = [_][]const u8{file};
