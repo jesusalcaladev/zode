@@ -169,6 +169,7 @@ Project-level `zig build test` is the primary gate (the full test suite); `tools
 | `Ctrl+D` | Scroll half a page down |
 | `Ctrl+A` | Connect a provider |
 | `Ctrl+V` | Attach a clipboard image |
+| Mouse drag in history | Select text; holding at the top/bottom edge scrolls while the selection grows, and the release copies cleaned text (CRLF normalized, trailing spaces trimmed, indentation kept) |
 | `Ctrl+,` | Settings screen |
 | `?` | Shortcut list |
 | `Ctrl+L` | Redraw screen |

@@ -1887,6 +1887,35 @@ test "reasoning: a thinking block starts collapsed and alt+t reveals its body" {
     try std.testing.expect(found_hidden);
 }
 
+test "selection: edge auto-scroll keeps the anchor on the same text" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.selectable_rows = 10;
+    m.selectable_width = 80;
+    m.selecting_text = true;
+    m.selection_start = .{ .row = 5, .col = 0 };
+    m.selection_end = .{ .row = 0, .col = 3 };
+    m.selection_edge_dir = -1; // pointer at the top edge
+    m.max_offset = 20;
+    // One 100-line paragraph so ensureParaHeights can build a real line map.
+    try m.paras.append(std.testing.allocator, .{
+        .kind = .assistant,
+        .text = try std.testing.allocator.dupe(u8, "selection fixture"),
+        .known_lines = 100,
+    });
+    m.anchor_off = 5;
+    m.anchor = 5;
+
+    try std.testing.expect(m.autoScrollSelection());
+    try std.testing.expectEqual(@as(usize, 4), m.anchorLine());
+    try std.testing.expectEqual(@as(u16, 6), m.selection_start.?.row);
+    try std.testing.expectEqual(@as(u16, 0), m.selection_end.?.row);
+
+    // Releasing the drag disarms it: no runaway scrolling after the click.
+    m.selection_edge_dir = 0;
+    try std.testing.expect(!m.autoScrollSelection());
+}
+
 test "in-TUI file editor: the modal shows the path and the file body" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

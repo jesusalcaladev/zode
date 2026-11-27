@@ -120,7 +120,7 @@ pub const default_system_prompt = default_system_prompt_core ++ coding_rules;
 /// phrased as "one call instead of N" because that is the shape of the waste.
 pub const tool_routing_prompt =
     \\Choosing the right tool (do not guess — route): Each rule is "one call instead of N" to save round trips.
-    \\ - `check` TYPECHECKS the project in the background, returning errors with file:line. Use it instead of `bash zig build`/`npx tsc`/`cargo check`: no guessing the command, no frozen input. Read its output before writing more. The harness WILL NOT end your turn while a check behind it is red — — not the harness stalling. no green typecheck means the tests pass. Upper rungs: `bash zig build test`, `check {id}`.
+    \\ - `check` TYPECHECKS the project in the background, returning errors with file:line. Use it instead of `bash zig build`/`npx tsc`/`cargo check`: no guessing the command, no frozen input. Read its output before writing more. The harness WILL NOT end your turn while a check behind it is red — that is the exit gate, not the harness stalling. A green typecheck says NOTHING about tests: run the narrow test separately before claiming tests pass. Upper rungs: `bash zig build test`, `check {id}`.
     \\ - INTERNET → web tools. NEVER use bash (curl, wget, pip, npm) for the web. web_search = you do NOT have the URL and need to find pages; web_fetch = have the URL. It hands back a WINDOW of the page: the first line names bytes, total and `offset` continues them — pass that offset for the NEXT window of the same text, never answer from the first window as the whole document. one specific query, default five results, fetch the 1-2 best primary sources, do not fetch every result, answer with links. Do not repeat equivalent queries; refine the query instead. Final claims must link to the source.
     \\ - bash EXECUTES on this machine: builds, git, file inspection grep/glob cannot express. Before bash, ask whether read/grep/glob/refs/web_* is better. Local code → glob/grep/refs (find), read (understand). Interactive TTY commands (e.g. `git rebase -i`) are refused by the harness; use explicit non-interactive ones. Slow verifications may go to the background automatically; use `bash_output` for the result, without polling loops.
     \\ - JUPYTER (.ipynb): `read` gives a NUMBERED outline; change a cell with `notebook_edit` by that index. NEVER `edit`/`write` the raw JSON — you cannot see why the match fails and a rewrite destroys the outputs.
@@ -369,10 +369,11 @@ test "the prompt tells the model what the harness does when a check is red" {
     // model reading about `check` has to learn in the same breath that the harness
     // acts on its result.
     try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "not the harness stalling") != null);
-    // And it says the typecheck is not the suite, because the sentence right before it
-    // is "the check passed", and a model that reads that as "the tests pass" is making
-    // the exact overclaim the exit gate was built to remove.
-    try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "no green typecheck means the tests pass") != null);
+    // And it says the typecheck is not the suite. The old wording here was
+    // "no green typecheck means the tests pass" — literally false, and pinned by
+    // a test — so a model could claim a suite pass from a typecheck. Affirm the
+    // real rule instead: a green typecheck says NOTHING about tests.
+    try std.testing.expect(std.mem.indexOf(u8, tool_routing_prompt, "A green typecheck says NOTHING about tests") != null);
 }
 
 test "the routing table is about ROUND TRIPS, and says so" {
@@ -439,7 +440,7 @@ test "prompt: the routing table tells the model to use send_user_message for the
 test "routing: every load-bearing rule survives the shorter wording" {
     const must_have = [_][]const u8{
         "WILL NOT end your turn while a check behind it is red",
-        "no green typecheck means the tests pass",
+        "A green typecheck says NOTHING about tests",
         "NEVER use bash",
         "Final claims must link to the source",
         "NUMBERED outline",

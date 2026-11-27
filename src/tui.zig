@@ -2,6 +2,8 @@ const std = @import("std");
 const textcase = @import("lib/textcase.zig");
 const regex = @import("lib/regex.zig");
 const codeguides = @import("lib/codeguides.zig");
+const selectgeom = @import("lib/selectgeom.zig");
+const cliptext = @import("lib/cliptext.zig");
 const builtin = @import("builtin");
 
 const vaxis = @import("vaxis");
@@ -1826,6 +1828,8 @@ pub const Model = struct {
     selection_start: ?SelectionPoint = null,
     selection_end: ?SelectionPoint = null,
     selecting_text: bool = false,
+    /// Non-zero while a drag sits near a viewport edge; the tick applies it.
+    selection_edge_dir: i8 = 0,
     /// Kind the status was composed with (to color the face).
     status_kind: StatusKind = .idle,
     status_kind_set: bool = false,
@@ -8272,12 +8276,47 @@ pub const Model = struct {
     pub fn cancelMouseGestures(self: *Model) void {
         self.scrollbar_dragging = false;
         self.selecting_text = false;
+        self.selection_edge_dir = 0;
         self.selection_start = null;
         self.selection_end = null;
         // The pointer is gone, so nothing on the rail is under it. Without this
         // the last hovered dot stayed filled forever when the pointer left by
         // the window edge instead of over another cell.
         self.prompt_dot_hover = null;
+    }
+
+    /// Called on every drag: the pointer near a viewport edge arms auto-scroll.
+    /// Two rows of margin is enough that an ordinary selection near the edge
+    /// does not run away, but a deliberate drag to the top keeps scrolling.
+    pub fn updateSelectionEdge(self: *Model, row: u16) void {
+        self.selection_edge_dir = selectgeom.edgeDirection(row, self.selectable_rows, 2);
+    }
+
+    /// Applied once per tick (never from the draw or the mouse handler). Moves
+    /// the anchor by one line and shifts the selection START with the document;
+    /// the live END stays pinned to the edge row under the pointer, so the
+    /// selection grows while older/newer text scrolls underneath it.
+    pub fn autoScrollSelection(self: *Model) bool {
+        if (!self.selecting_text or self.selection_edge_dir == 0 or self.selectable_rows == 0) return false;
+        const before = self.anchorLine();
+        const max_off = self.currentMaxOffset();
+        const after = if (self.selection_edge_dir < 0)
+            before -| 1
+        else
+            @min(before +| 1, max_off);
+        if (after == before) return false;
+        const moved: i64 = @as(i64, @intCast(after)) - @as(i64, @intCast(before));
+
+        self.setAnchorLine(after);
+        self.anchor = after;
+        self.follow_bottom = false;
+        if (self.selection_start) |p| {
+            const shifted = selectgeom.shift(.{ .row = p.row, .col = p.col }, moved, self.selectable_rows);
+            self.selection_start = .{ .row = shifted.row, .col = shifted.col };
+        }
+        const edge_row: u16 = if (self.selection_edge_dir < 0) 0 else self.selectable_rows - 1;
+        if (self.selection_end) |p| self.selection_end = .{ .row = edge_row, .col = p.col };
+        return true;
     }
 
     pub fn selectionPoint(self: *const Model, mouse: vaxis.Mouse) ?SelectionPoint {
@@ -8383,12 +8422,18 @@ pub const Model = struct {
         const start = self.selection_start orelse return;
         const end = self.selection_end orelse return;
         if (start.row == end.row and start.col == end.col) return;
-        const text = (try self.selectedText(ctx.alloc)) orelse return;
-        defer ctx.alloc.free(text);
-        if (text.len == 0) return;
-        try ctx.copyToClipboard(text);
-        // Show a toast in the top-right corner for ~2 seconds.
-        self.copy_toast_text = "Copied to clipboard";
+        const raw = (try self.selectedText(ctx.alloc)) orelse return;
+        defer ctx.alloc.free(raw);
+        const cleaned = try cliptext.clean(ctx.alloc, raw);
+        defer ctx.alloc.free(cleaned.text);
+        if (cleaned.text.len == 0) return;
+        try ctx.copyToClipboard(cleaned.text);
+        // Show a toast in the top-right corner; say so when the selection was
+        // too large to copy whole (the cap protects the OSC 52 payload).
+        self.copy_toast_text = if (cleaned.truncated)
+            "Copied 1 MB (selection truncated)"
+        else
+            "Copied to clipboard";
         self.copy_toast_frames = 60; // ~1 s at 60 fps
     }
 

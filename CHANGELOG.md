@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fire PreCompact and subagent lifecycle events (hooks) [`7fc97683`](https://github.com/jesusalcaladev/zode/commit/7fc97683)
 - fire the last four lifecycle events (hooks) [`9c40372a`](https://github.com/jesusalcaladev/zode/commit/9c40372a)
 - open files in an in-TUI editor (tui) [`1c81439c`](https://github.com/jesusalcaladev/zode/commit/1c81439c)
+- auto-scroll selection and cleaner copied text (tui) [`40f48f6e`](https://github.com/jesusalcaladev/zode/commit/40f48f6e)
 
 ### Bug Fixes
 
@@ -114,7 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add parity cases for supervisor decisions (mission) [`9dfef4d9`](https://github.com/jesusalcaladev/zode/commit/9dfef4d9)
 - add a real headless tool-loop smoke (hooks) [`423e774a`](https://github.com/jesusalcaladev/zode/commit/423e774a)
 - gate background completion in the headless loop [`d66c2e57`](https://github.com/jesusalcaladev/zode/commit/d66c2e57)
-- gate /remote against the reference server [`82835575`](https://github.com/jesusalcaladev/zode/commit/82835575)
+- gate /remote against the reference server [`906855e3`](https://github.com/jesusalcaladev/zode/commit/906855e3)
 
 ### Styles
 

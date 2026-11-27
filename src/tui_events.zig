@@ -613,6 +613,10 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             // which only repaints if something changed; the alternative is an
             // app that goes dead with no explanation.
             self.tick_armed = false;
+            // A drag held at the viewport top/bottom scrolls the history one
+            // row per tick. This is the ONLY place that moves the view during
+            // a selection: no sleeps on the UI thread and no work in draw.
+            if (self.autoScrollSelection()) ctx.redraw = true;
             self.motion_tick_count +%= 1;
             // Phase 37: sample RSS about once per second (the tick fires every
             // ~120 ms). The ring is fixed and allocation-free, so this is safe
@@ -783,12 +787,16 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
             if (self.selecting_text) {
                 switch (m.type) {
                     .drag => {
-                        if (self.clampedSelectionPoint(m)) |point| self.selection_end = point;
+                        if (self.clampedSelectionPoint(m)) |point| {
+                            self.selection_end = point;
+                            self.updateSelectionEdge(point.row);
+                        }
                         ctx.redraw = true;
                         return;
                     },
                     .release => {
                         if (self.clampedSelectionPoint(m)) |point| self.selection_end = point;
+                        self.selection_edge_dir = 0;
                         self.selecting_text = false;
                         try self.copySelectedText(ctx);
                         ctx.redraw = true;
@@ -845,6 +853,7 @@ pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vx
                 if (self.selectionPoint(m)) |point| {
                     self.selection_start = point;
                     self.selection_end = point;
+                    self.selection_edge_dir = 0;
                     self.selecting_text = true;
                     ctx.redraw = true;
                     return;
