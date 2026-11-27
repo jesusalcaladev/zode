@@ -25,6 +25,7 @@ GATES = [
     ("import seam", ["zig", "build", "cycle-check"]),
     ("memory auditor", ["zig", "build", "memaudit"]),
     ("language rule", ["python3", "tools/lang_check.py"]),
+    ("internal ASCII", ["python3", "tools/ascii_check.py"]),
     ("Windows cross-build", ["zig", "build", "-Dtarget=x86_64-windows-gnu"]),
 ]
 
