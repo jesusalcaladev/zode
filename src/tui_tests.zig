@@ -1916,6 +1916,24 @@ test "selection: edge auto-scroll keeps the anchor on the same text" {
     try std.testing.expect(!m.autoScrollSelection());
 }
 
+test "in-TUI file editor: a tiny terminal gets an honest one-line fallback" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    m.file_ed_active = true;
+    try m.file_ed.load("body");
+
+    const s = try drawTest(&m, arena_state.allocator(), 24, 8);
+    var buf: [256]u8 = undefined;
+    var found = false;
+    var r: u16 = 0;
+    while (r < s.size.height) : (r += 1) {
+        if (std.mem.indexOf(u8, rowText(s, r, &buf), "editor needs 20x6") != null) found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "in-TUI file editor: the modal shows the path and the file body" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -3114,6 +3132,19 @@ test "code fence: matching brackets share a colour, nesting changes it" {
     try std.testing.expectEqual(open.fg, close.fg);
     const inner = tui.bracketStyle(.{}, '[', text, 3);
     try std.testing.expect(!std.meta.eql(inner.fg, open.fg));
+}
+
+test "search: an invalid regex says so instead of silently finding nothing" {
+    var m = Model.init(std.testing.allocator);
+    defer m.deinit();
+    const q = "/[unterminated";
+    @memcpy(m.search_query_buf[0..q.len], q);
+    m.search_query_len = q.len;
+    m.runTranscriptSearch();
+    try std.testing.expectEqual(@as(usize, 0), m.search_matches.items.len);
+    try std.testing.expect(m.notification_len > 0);
+    const note = m.notifications[0].slice();
+    try std.testing.expect(std.mem.indexOf(u8, note, "invalid regex") != null);
 }
 
 test "search: a /regex query marks every branch with byte offsets" {

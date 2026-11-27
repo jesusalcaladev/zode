@@ -16,6 +16,42 @@ pub const Regex = struct {
         return .{ .pattern = pattern };
     }
 
+    /// The mini engine rejects only what it cannot parse at all: an open
+    /// character class or a dangling escape. Groups with quantifiers are a
+    /// documented limitation and parse as literals, not an error.
+    pub fn isValid(self: *const Regex) bool {
+        var i: usize = 0;
+        while (i < self.pattern.len) {
+            const c = self.pattern[i];
+            if (c == '\\') {
+                if (i + 1 >= self.pattern.len) return false;
+                i += 2;
+                continue;
+            }
+            if (c == '[') {
+                i += 1;
+                if (i < self.pattern.len and self.pattern[i] == '^') i += 1;
+                if (i < self.pattern.len and self.pattern[i] == ']') i += 1;
+                var closed = false;
+                while (i < self.pattern.len) : (i += 1) {
+                    if (self.pattern[i] == '\\' and i + 1 < self.pattern.len) {
+                        i += 1;
+                        continue;
+                    }
+                    if (self.pattern[i] == ']') {
+                        closed = true;
+                        i += 1;
+                        break;
+                    }
+                }
+                if (!closed) return false;
+                continue;
+            }
+            i += 1;
+        }
+        return true;
+    }
+
     /// Does it match at any position of `text`?
     pub fn matches(self: *const Regex, text: []const u8) bool {
         return self.findFrom(text, 0) != null;
@@ -285,6 +321,15 @@ test "find returns byte offsets for every hit, including alternation" {
     try std.testing.expectEqual(@as(usize, 3), hit.start);
     try std.testing.expectEqual(@as(usize, 6), hit.end);
     try std.testing.expect(Regex.compile("").find("anything") == null);
+}
+
+test "isValid rejects only patterns the engine cannot parse" {
+    try @import("std").testing.expect(Regex.compile("user_[0-9]+").isValid());
+    try @import("std").testing.expect(Regex.compile("a\\.c").isValid());
+    try @import("std").testing.expect(!Regex.compile("[unterminated").isValid());
+    try @import("std").testing.expect(!Regex.compile("trailing\\").isValid());
+    // Groups are a documented limitation, not a syntax error here.
+    try @import("std").testing.expect(Regex.compile("(abc)+").isValid());
 }
 
 test "alternation" {

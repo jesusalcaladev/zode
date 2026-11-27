@@ -3091,6 +3091,13 @@ pub const Model = struct {
         self.clearSegCache();
         if (self.search_query_len == 0) return;
         const q = self.search_query_buf[0..self.search_query_len];
+        if (searchIsRegex(q)) {
+            const re = regex.Regex.compile(searchPattern(q));
+            if (!re.isValid()) {
+                self.pushNotification("Search: invalid regex (check [ ] or trailing \\)");
+                return;
+            }
+        }
         for (self.paras.items, 0..) |*p, i| {
             const text = p.textLive(self.allocator);
             if (searchTextMatches(text, q)) {
@@ -11563,7 +11570,14 @@ pub fn drawFileEditor(p: *Painter, width: u16, height: u16, self: *const Model) 
     if (!self.file_ed_active) return;
     const bw: u16 = @min(width -| 8, 100);
     const bh: u16 = @min(height -| 6, 22);
-    if (bw < 20 or bh < 6) return;
+    if (bw < 20 or bh < 6) {
+        // Never make an interactive surface vanish silently: on a tiny pane
+        // say what is missing, in one line, using the dim gutter role.
+        if (width > 0 and height > 0) {
+            _ = p.putClipped(0, 0, "editor needs 20x6", width, theme.code_gutter);
+        }
+        return;
+    }
     const x0: u16 = (width - bw) / 2;
     const y0: u16 = (height - bh) / 2;
 

@@ -51,6 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fire the last four lifecycle events (hooks) [`9c40372a`](https://github.com/jesusalcaladev/zode/commit/9c40372a)
 - open files in an in-TUI editor (tui) [`1c81439c`](https://github.com/jesusalcaladev/zode/commit/1c81439c)
 - auto-scroll selection and cleaner copied text (tui) [`2817fc49`](https://github.com/jesusalcaladev/zode/commit/2817fc49)
+- polish compact fallback and regex search feedback (tui) [`57e6cad5`](https://github.com/jesusalcaladev/zode/commit/57e6cad5)
 
 ### Bug Fixes
 
@@ -124,7 +125,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Build
 
 - cross-compile zode for Windows [`7e2061db`](https://github.com/jesusalcaladev/zode/commit/7e2061db)
-- add a serialized v3 release-candidate gate [`34f8fe85`](https://github.com/jesusalcaladev/zode/commit/34f8fe85)
+- add a serialized v3 release-candidate gate [`78326e7b`](https://github.com/jesusalcaladev/zode/commit/78326e7b)
 
 ### Styles
 
