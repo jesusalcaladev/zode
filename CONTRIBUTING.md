@@ -20,6 +20,7 @@ Thanks for your interest in `zode`. It is a pure Zig code harness, built to be f
 
 | Command | What it checks |
 |---|---|
+| `zig build rc-check` | Every v3 RC gate, serialized: tests, build, ui-frame, pty, hooks, remote, cycle, memaudit, language, Windows cross-build |
 | `zig build test` | Everything; `-Dtest-filter=name` runs one test group |
 | `zig build test -Dlive` | Live-provider tests (needs keys) |
 | `zig build test -De2e` | End-to-end scenarios |

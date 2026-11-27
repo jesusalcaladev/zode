@@ -513,6 +513,13 @@ pub fn build(b: *std.Build) void {
     cm_run.has_side_effects = true;
     cm_step.dependOn(&cm_run.step);
 
+    const rc_check = b.step("rc-check", "Run every v3 release-candidate gate in order");
+    rc_check.dependOn(b.getInstallStep());
+    const run_rc = b.addSystemCommand(&.{ "python3", "tools/rc_check.py" });
+    run_rc.setName("rc_check");
+    run_rc.has_side_effects = true;
+    rc_check.dependOn(&run_rc.step);
+
     const cycle_check = b.step("cycle-check", "Guard the agent/tui/commands import seam (42.8)");
     const run_cycle = b.addSystemCommand(&.{ "python3", "tools/cycle_check.py" });
     run_cycle.setName("cycle_check");
