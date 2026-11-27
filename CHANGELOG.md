@@ -108,7 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - eliminate quadratic SSE tool-arg parsing and per-chunk allocations (46.6-46.11) [`14ee2362`](https://github.com/jesusalcaladev/zode/commit/14ee2362)
 - materialize autocomplete matches once per query (47.3) (tui) [`c99f62d1`](https://github.com/jesusalcaladev/zode/commit/c99f62d1)
 - refresh stale model cache, cache keychain lookups (47.8) (startup) [`50081b94`](https://github.com/jesusalcaladev/zode/commit/50081b94)
-- per-check cache keys from declared files (mission) [`05627a77`](https://github.com/jesusalcaladev/zode/commit/05627a77)
+- per-check cache keys from declared files (mission) [`ed158298`](https://github.com/jesusalcaladev/zode/commit/ed158298)
+- add ZODE_TERSE_TOOLS and stabilize pty smokes [`f434cea8`](https://github.com/jesusalcaladev/zode/commit/f434cea8)
 
 ### Tests
 

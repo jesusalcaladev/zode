@@ -83,7 +83,7 @@ def fixture_session():
     return path
 
 
-def run(env, feed, cols=160, rows=44, settle=1.5):
+def run(env, feed, cols=160, rows=44, settle=1.5, expect=None):
     """Starts the TUI, sends `keys` spaced out, and returns everything it painted."""
     pid, fd = pty.fork()
     if pid == 0:
@@ -121,11 +121,30 @@ def run(env, feed, cols=160, rows=44, settle=1.5):
                 out.extend(chunk)
         return True
 
+    def drain_until(needle, budget=6.0):
+        """Wait for the asserted SCREEN STATE, not a fixed sleep."""
+        end = time.time() + budget
+        while time.time() < end:
+            if needle in strip_ansi(out.decode("utf-8", errors="replace")):
+                return True
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if fd in r:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out.extend(chunk)
+        return needle in strip_ansi(out.decode("utf-8", errors="replace"))
+
     drain(settle)
     for keys, wait in feed:
         os.write(fd, keys)
         if not drain(wait):
             break
+    if expect:
+        drain_until(expect)
     try:
         os.write(fd, b"\x03")  # ctrl+c, the documented exit
         drain(1.0)
@@ -167,7 +186,7 @@ def main():
     # 1. `/copy` opens the picker.
     text = strip_ansi(run(env, [
         (b"/copy\n", 2.0),
-    ]))
+    ], expect="Full response"))
 
     if "Full response" in text:
         ok("the picker offers the whole response")
@@ -188,7 +207,7 @@ def main():
     text2 = strip_ansi(run(env, [
         (b"/copy\n", 2.0),
         (b"\r", 2.0),
-    ]))
+    ], expect="Copied to"))
     if "Copied to" in text2:
         ok("the copy says what it copied")
     else:
@@ -209,7 +228,7 @@ def main():
     text3 = strip_ansi(run(env, [
         (b"/copy\n", 2.0),
         (b"\x1b", 1.5),
-    ]))
+    ], expect="Copy cancelled"))
     if "Copy cancelled" in text3:
         ok("ESC says the copy was cancelled")
     else:

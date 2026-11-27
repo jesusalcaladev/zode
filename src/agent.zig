@@ -3,6 +3,7 @@ const pluginstore_mod = @import("lib/pluginstore.zig");
 const posix = std.posix;
 const sleepz = @import("lib/sleep.zig");
 const vaxis = @import("vaxis");
+const env_mod = @import("lib/env.zig");
 const builtin = @import("builtin");
 const tui = @import("app").tui;
 const theme = @import("lib/theme.zig");
@@ -1564,6 +1565,11 @@ pub fn loadUserConfig() void {
     if (cfg_arena_state == null) {
         cfg_arena_state = std.heap.ArenaAllocator.init(gpa_global);
         user_config = config_mod.load(cfg_arena_state.?.allocator(), io_global, environ_global);
+
+        // 41.1 promised an env switch as well as an output style. The style
+        // still wins when set later via `/style`; this is the startup default
+        // for people who cannot change settings (CI, containers, long runs).
+        terse_tools = env_mod.truthyIn(environ_global, "ZODE_TERSE_TOOLS", false);
 
         // Restore the output style that `/style` persisted. It used to be
         // written to config.json but never loaded, so a restart silently

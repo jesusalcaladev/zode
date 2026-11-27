@@ -218,6 +218,10 @@ def main() -> int:
     # 1) Startup: banner, input box, status bar, and nothing falls over.
     # Wait for the FULL startup state: asserting the frame before the wordmark
     # and the command grid have been painted made the box-border check flaky.
+    # A SEPARATE startup-only session: the checks below describe the first
+    # frame. Using the stream that also contains the submitted turn let a
+    # later dialog with box borders fail a check about the COMPOSER frame.
+    boot_out, boot = drive([], expect="choose a model")
     out, t = drive([b"hola mundo", b"\r"], expect="choose a model")
     ok = True
     print(f"smoke: {len(out)} bytes through the pty")
@@ -229,14 +233,14 @@ def main() -> int:
     # for a while, and the art was in the tree but nobody drew it). The check
     # looks for the DRAWING and not for pixels of it: the art's own test
     # pins the rows, and this one pins that it is ON THE SCREEN.
-    ok &= check("hero: the wordmark is on screen", "######  ####" in t, t)
-    ok &= check("hero: the tagline is on screen", "a code agent in your terminal" in t, t)
-    ok &= check("hero: the command grid is on screen", "choose a model" in t, t)
+    ok &= check("hero: the wordmark is on screen", "######  ####" in boot, boot)
+    ok &= check("hero: the tagline is on screen", "a code agent in your terminal" in boot, boot)
+    ok &= check("hero: the command grid is on screen", "choose a model" in boot, boot)
     # No box around the input: a hairline above it and an accent bar on the
     # left. Four keys that no longer appear are asserted ABSENT, because the
     # frame is the claim and "no ╭" is the part that can regress silently.
-    ok &= check("input: no box borders", "╭" not in t and "╰" not in t, t)
-    ok &= check("input: the accent bar is there", "▌" in t, t)
+    ok &= check("input: no box borders", "╭" not in boot and "╰" not in boot, boot)
+    ok &= check("input: the accent bar is there", "▌" in boot, boot)
     # The composer's footer: the mascot, its legend and the model.
     #
     # This check used to look for "esc interrupts" in the status row — a
@@ -244,8 +248,8 @@ def main() -> int:
     # on a green suite for nobody to notice. A check nobody reads is a check
     # that stops watching the thing it watched, which is the reason it has to
     # name the CURRENT design and not a remembered one.
-    ok &= check("footer: the mascot is there", "( o o )" in t, t)
-    ok &= check("footer: the legend is there", "Ready" in t, t)
+    ok &= check("footer: the mascot is there", "( o o )" in boot, boot)
+    ok &= check("footer: the legend is there", "Ready" in boot, boot)
     ok &= check("the user prompt echoes", "hola mundo" in t, t)
     ok &= check("no panic", "panic" not in t.lower(), t)
     ok &= check("no 'Invalid free'", "invalid free" not in t.lower(), t)
