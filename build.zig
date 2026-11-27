@@ -438,6 +438,16 @@ pub fn build(b: *std.Build) void {
     run_bg.step.dependOn(&run_hooks.step);
     hooks_check.dependOn(&run_bg.step);
 
+    // 43.7: `/remote` needs a real pty (slash commands are not driven in
+    // --chat). Its own step: different port, different harness, no coupling
+    // to the headless gates above.
+    const remote_check = b.step("remote-check", "Build and verify /remote against the reference server");
+    remote_check.dependOn(b.getInstallStep());
+    const run_remote = b.addSystemCommand(&.{ "python3", "tools/remote_smoke.py" });
+    run_remote.setName("remote_smoke");
+    run_remote.has_side_effects = true;
+    remote_check.dependOn(&run_remote.step);
+
     // Phase 37: `zig build diag` — one-shot internal diagnostics. Doesn't
     // touch the network or the real HOME: --diag only reads /proc/self/status.
     const diag_step = b.step("diag", "Internal diagnostics: one-shot memory snapshot from /proc");
