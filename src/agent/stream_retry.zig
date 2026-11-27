@@ -1,9 +1,9 @@
 const std = @import("std");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const chat = @import("../chat.zig");
 const router_mod = @import("../lib/router.zig");
 const roster_mod = @import("../roster.zig");
-const free_auto = @import("../free_auto.zig");
+const free_auto = @import("app").free_auto;
 const submodel_mod = @import("submodel.zig");
 
 pub const Target = submodel_mod.Target;

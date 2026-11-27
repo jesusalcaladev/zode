@@ -7,10 +7,10 @@ const cliptext = @import("lib/cliptext.zig");
 const builtin = @import("builtin");
 
 const vaxis = @import("vaxis");
-const tui_events = @import("tui_events.zig");
-const tui_draw = @import("tui_draw.zig");
+const tui_events = @import("app").tui_events;
+const tui_draw = @import("app").tui_draw;
 const vxfw = vaxis.vxfw;
-const agent = @import("agent.zig");
+const agent = @import("app").agent;
 const chat = @import("chat.zig");
 const md = @import("lib/markdown.zig");
 const ansi = @import("lib/ansi.zig");
@@ -33,7 +33,7 @@ const keybinds = @import("lib/keybinds.zig");
 const schedule_mod = @import("lib/schedule.zig");
 const tick_mod = @import("lib/tick.zig");
 const diag_mod = @import("lib/diag.zig");
-const palette = @import("palette.zig");
+const palette = @import("app").palette;
 const compaction = @import("compaction.zig");
 const plan_mod = @import("lib/plan.zig");
 const facts_mod = @import("lib/facts.zig");
@@ -57,7 +57,7 @@ const filesearch = @import("lib/filesearch.zig");
 const mascot = @import("lib/mascot.zig");
 const sessionindex = @import("lib/sessionindex.zig");
 const session_search = @import("lib/session_search.zig");
-const commands = @import("commands.zig");
+const commands = @import("app").commands;
 const repeat = @import("lib/repeat.zig");
 
 /// The kind of the status: what color the face is and what phase the app is in.

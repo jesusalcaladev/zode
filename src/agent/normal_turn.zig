@@ -1,5 +1,5 @@
 const std = @import("std");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const agent_types = @import("types.zig");
 
 pub const TurnOutcome = agent_types.TurnOutcome;

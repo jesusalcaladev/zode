@@ -9,7 +9,7 @@ const common = @import("common.zig");
 const http = @import("../lib/http_client.zig");
 const web = @import("../lib/web.zig");
 const webcache = @import("../lib/webcache.zig");
-const agent = @import("../agent.zig");
+const agent = @import("app").agent;
 
 /// The page cache, and the lock around it.
 ///

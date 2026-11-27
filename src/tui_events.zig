@@ -6,12 +6,12 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
-const tui = @import("tui.zig");
-const agent = @import("agent.zig");
-const commands = @import("commands.zig");
+const tui = @import("app").tui;
+const agent = @import("app").agent;
+const commands = @import("app").commands;
 const chat = @import("chat.zig");
 const diag_mod = @import("lib/diag.zig");
-const palette = @import("palette.zig");
+const palette = @import("app").palette;
 
 pub fn typeErasedEventHandler(ud: *anyopaque, ctx: *vxfw.EventContext, event: vxfw.Event) anyerror!void {
     const self: *tui.Model = @ptrCast(@alignCast(ud));

@@ -55,3 +55,14 @@ test {
     try std.testing.expect(tools.defs.len > 0);
     try std.testing.expect(isParallelSafe("read"));
 }
+
+// Exports for the `@import("app")` self-import (42.8).
+pub const tui = @import("tui.zig");
+pub const agent = @import("agent.zig");
+pub const commands = @import("commands.zig");
+pub const palette = @import("palette.zig");
+pub const free_auto = @import("free_auto.zig");
+pub const headless = @import("headless.zig");
+pub const tui_events = @import("tui_events.zig");
+pub const tui_draw = @import("tui_draw.zig");
+pub const tui_tests = @import("tui_tests.zig");

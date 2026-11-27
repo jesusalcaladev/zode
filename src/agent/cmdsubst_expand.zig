@@ -1,5 +1,5 @@
 const std = @import("std");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const cmdsubst = @import("../lib/cmdsubst.zig");
 
 pub const PermOps = struct {

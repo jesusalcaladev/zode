@@ -191,3 +191,8 @@ pub const mcp_tool = @import("tools/mcp.zig");
 test {
     @import("std").testing.refAllDecls(@This());
 }
+
+// Exports for the `@import("app")` self-import (42.8).
+pub const headless = @import("headless.zig");
+pub const tui_events = @import("tui_events.zig");
+pub const tui_draw = @import("tui_draw.zig");

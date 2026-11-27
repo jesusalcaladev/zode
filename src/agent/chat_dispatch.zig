@@ -1,5 +1,5 @@
 const std = @import("std");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 
 /// Queues or starts a chat turn. Handles queue-vs-spawn and TUI
 /// streaming/busy bookkeeping; worker owns the job lifetime.

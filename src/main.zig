@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
-const tui = @import("tui.zig");
+pub const tui = @import("tui.zig");
 const http_client = @import("lib/http_client.zig");
 const models = @import("lib/models.zig");
 const modelcache = @import("lib/modelcache.zig");
@@ -12,8 +12,8 @@ const providers = @import("lib/providers.zig");
 const tools_mod = @import("tools_root.zig");
 const cache_stats = @import("cache_stats.zig");
 const chat = @import("chat.zig");
-const agent = @import("agent.zig");
-const free_auto = @import("free_auto.zig");
+pub const agent = @import("agent.zig");
+pub const free_auto = @import("free_auto.zig");
 const spawnenv_mod = @import("lib/spawnenv.zig");
 const env_mod = @import("lib/env.zig");
 const compaction_mod = @import("compaction.zig");
@@ -42,7 +42,7 @@ const theme = @import("lib/theme.zig");
 const lang_icons = @import("lib/lang_icons.zig");
 const keybinds = @import("lib/keybinds.zig");
 const acp_server = @import("acp/server.zig");
-const headless = @import("headless.zig");
+pub const headless = @import("headless.zig");
 const mission_runner = @import("mission/runner.zig");
 
 var child_env_static: std.process.Environ.Map = undefined;
@@ -778,3 +778,10 @@ pub fn main(init: std.process.Init) !u8 {
     return runTui(init);
 }
 
+
+// Exports for the `@import("app")` self-import (42.8).
+pub const commands = @import("commands.zig");
+pub const palette = @import("palette.zig");
+pub const tui_events = @import("tui_events.zig");
+pub const tui_draw = @import("tui_draw.zig");
+pub const tui_tests = @import("tui_tests.zig");

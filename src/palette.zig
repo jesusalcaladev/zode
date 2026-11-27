@@ -4,7 +4,7 @@ const vxfw = vaxis.vxfw;
 
 const theme = @import("lib/theme.zig");
 const fuzzy = @import("lib/fuzzy.zig");
-const tui = @import("tui.zig");
+const tui = @import("app").tui;
 
 const Painter = tui.Painter;
 

@@ -4,14 +4,14 @@
 //! through the public surface those modules share.
 
 const std = @import("std");
-const tui = @import("tui.zig");
+const tui = @import("app").tui;
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const agent = @import("agent.zig");
+const agent = @import("app").agent;
 const ed = @import("lib/editor.zig");
 const prompthistory = @import("lib/prompthistory.zig");
-const commands_mod = @import("commands.zig");
+const commands_mod = @import("app").commands;
 const keybinds = @import("lib/keybinds.zig");
 const mascot = @import("lib/mascot.zig");
 const md = @import("lib/markdown.zig");
@@ -28,7 +28,7 @@ const keyToBinding = tui.keyToBinding;
 const rowText = tui.rowText;
 const scrollbarThumb = tui.scrollbarThumb;
 
-const palette = @import("palette.zig");
+const palette = @import("app").palette;
 const plan_mod = @import("lib/plan.zig");
 const sleepz = @import("lib/sleep.zig");
 const zjsonl = @import("lib/zjsonl.zig");
@@ -43,7 +43,7 @@ const segsWidth = tui.segsWidth;
 const sessionInfo = tui.sessionInfo;
 const StatusKind = tui.StatusKind;
 const syncAutocomplete = tui.syncAutocomplete;
-const typeErasedEventHandler = @import("tui_events.zig").typeErasedEventHandler;
+const typeErasedEventHandler = @import("app").tui_events.typeErasedEventHandler;
 
 const allText = tui.allText;
 const ask_other_label = tui.ask_other_label;
@@ -4637,7 +4637,7 @@ test "drawHints does not exist: the shortcuts line is gone from the view" {
     // The ROADMAP asked to resurrect it or delete it. It was deleted: the
     // shortcuts are in the Ctrl+P palette and in `/help`, and one more line in
     // the view is exactly what was asked to be removed ("junk in the view").
-    try std.testing.expect(@hasDecl(@import("tui.zig"), "Model"));
+    try std.testing.expect(@hasDecl(@import("app").tui, "Model"));
 }
 
 test "the TUI diff uses the path's language: a + line carries tokens" {

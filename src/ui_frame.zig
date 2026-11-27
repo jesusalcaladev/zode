@@ -28,12 +28,12 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
 
-const tui = @import("tui.zig");
-const commands = @import("commands.zig");
+pub const tui = @import("tui.zig");
+pub const commands = @import("commands.zig");
 const configmenu = @import("lib/configmenu.zig");
 const sleepz = @import("lib/sleep.zig");
 const plan_mod = @import("lib/plan.zig");
-const palette = @import("palette.zig");
+pub const palette = @import("palette.zig");
 
 const Scene = struct {
     name: []const u8,
@@ -677,3 +677,11 @@ fn sceneConfigAgents(m: *tui.Model) void {
     m.settings_row = 0;
     m.settings_col = 1;
 }
+
+// Exports for the `@import("app")` self-import (42.8).
+pub const agent = @import("agent.zig");
+pub const free_auto = @import("free_auto.zig");
+pub const headless = @import("headless.zig");
+pub const tui_events = @import("tui_events.zig");
+pub const tui_draw = @import("tui_draw.zig");
+pub const tui_tests = @import("tui_tests.zig");

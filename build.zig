@@ -512,4 +512,15 @@ pub fn build(b: *std.Build) void {
     cm_run.addArgs(run_args);
     cm_run.has_side_effects = true;
     cm_step.dependOn(&cm_run.step);
+
+    // 42.8: each root module imports ITSELF as `app`. agent.zig, tui.zig and
+    // commands.zig now reference each other through that module import, so no
+    // source file belongs to two modules and the direct file-level cycle is
+    // gone. Zig allows module-level cycles, so this compiles.
+    const app_consumers = [_] *std.Build.Module{
+        exe_mod, debug_mod, tt_mod, tools_mod_root, check_probe_mod, shell_mod,
+        roster_mod, lsp_probe_mod, mission_mod, test_mod, ui_frame_mod,
+        ma_mod, ma_cli_mod, cm_release_mod, cm_mod,
+    };
+    for (app_consumers) |m| m.addImport("app", m);
 }

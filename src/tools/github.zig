@@ -1,6 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
-const agent = @import("../agent.zig");
+const agent = @import("app").agent;
 const gh = @import("../lib/github.zig");
 const context = gh.context;
 const api = gh.api;

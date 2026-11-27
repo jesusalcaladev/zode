@@ -1,5 +1,5 @@
 const std = @import("std");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const goal_mod = @import("../lib/goal.zig");
 const taskloop = @import("../lib/taskloop.zig");
 const loop_evidence = @import("loop_evidence.zig");

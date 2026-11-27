@@ -1,4 +1,4 @@
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const agent_types = @import("types.zig");
 
 pub const ChatJob = agent_types.ChatJob;

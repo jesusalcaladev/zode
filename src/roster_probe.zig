@@ -7,8 +7,8 @@ const std = @import("std");
 // modules because a file cannot be the root of two modules and `providers.zig`
 // already is one of `agent`. The probe picks them up by path; the only thing
 // build.zig declares is `vaxis`, which really does come from a package.
-const agent = @import("agent.zig");
-const free_auto = @import("free_auto.zig");
+pub const agent = @import("agent.zig");
+pub const free_auto = @import("free_auto.zig");
 const providers = @import("lib/providers.zig");
 const roster = @import("roster.zig");
 const models = @import("lib/models.zig");
@@ -106,3 +106,12 @@ pub fn main(init: std.process.Init) !void {
     try f.interface.writeAll(w.buffered());
     try f.interface.flush();
 }
+
+// Exports for the `@import("app")` self-import (42.8).
+pub const tui = @import("tui.zig");
+pub const commands = @import("commands.zig");
+pub const palette = @import("palette.zig");
+pub const headless = @import("headless.zig");
+pub const tui_events = @import("tui_events.zig");
+pub const tui_draw = @import("tui_draw.zig");
+pub const tui_tests = @import("tui_tests.zig");

@@ -96,6 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - remove dead code and close one-shot leaks (mission) [`0c0ead9c`](https://github.com/jesusalcaladev/zode/commit/0c0ead9c)
 - share hard-stop decisions between both runners [`c86b81eb`](https://github.com/jesusalcaladev/zode/commit/c86b81eb)
 - scale edge scrolling and unify copy cleanup (tui) [`cffd22f8`](https://github.com/jesusalcaladev/zode/commit/cffd22f8)
+- break the agent/tui/commands import cycle [`251df19d`](https://github.com/jesusalcaladev/zode/commit/251df19d)
 
 ### Performance
 
@@ -121,7 +122,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Build
 
-- cross-compile zode for Windows [`926456d3`](https://github.com/jesusalcaladev/zode/commit/926456d3)
+- cross-compile zode for Windows [`7e2061db`](https://github.com/jesusalcaladev/zode/commit/7e2061db)
 
 ### Styles
 

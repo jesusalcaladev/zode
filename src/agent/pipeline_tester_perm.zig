@@ -1,5 +1,5 @@
 const std = @import("std");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const permrules = @import("../lib/permrules.zig");
 const tools_mod = @import("../tools/dispatch.zig");
 const tool_exec_perm = @import("tool_exec_perm.zig");

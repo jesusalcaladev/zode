@@ -1,7 +1,7 @@
 const std = @import("std");
 const common = @import("common.zig");
 const sandbox_mod = @import("../lib/sandbox.zig");
-const agent = @import("../agent.zig");
+const agent = @import("app").agent;
 const bg_tool = @import("bg.zig");
 const bgproc = @import("../bgproc.zig");
 

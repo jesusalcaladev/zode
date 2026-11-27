@@ -1,5 +1,5 @@
 const std = @import("std");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const pipeline_mod = @import("../lib/pipeline.zig");
 
 /// Per-turn harness budget reset (shared by normal and pipeline turns).

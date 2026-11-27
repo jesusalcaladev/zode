@@ -1,7 +1,7 @@
 const std = @import("std");
-const agent = @import("agent.zig");
+const agent = @import("app").agent;
 const roster_mod = @import("roster.zig");
-const tui = @import("tui.zig");
+const tui = @import("app").tui;
 
 /// The pool of free models and the wheel that hands turns out among them
 /// (`/free-auto`).

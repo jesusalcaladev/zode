@@ -3,7 +3,7 @@ const pipeline_mod = @import("../lib/pipeline.zig");
 const testplan_mod = @import("../lib/testplan.zig");
 const testguard_mod = @import("../lib/testguard.zig");
 const filesearch = @import("../lib/filesearch.zig");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const subagent_mod = @import("../lib/subagent.zig");
 
 pub const SuiteResult = struct {

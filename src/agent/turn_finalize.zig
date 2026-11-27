@@ -1,5 +1,5 @@
 const std = @import("std");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const session_mod = @import("../session.zig");
 const chat = @import("../chat.zig");
 const turn_types = @import("turn_types.zig");

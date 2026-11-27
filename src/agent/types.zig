@@ -2,7 +2,7 @@
 ///
 /// Kept small and stable: this is a boundary module to reduce `agent.zig`
 /// monolith size without changing runtime behavior.
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const taskloop = @import("../lib/taskloop.zig");
 
 pub const TurnOutcome = struct {

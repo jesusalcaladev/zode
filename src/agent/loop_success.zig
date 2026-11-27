@@ -1,4 +1,4 @@
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const repeats_mod = @import("../lib/repeat_guard.zig");
 const taskloop = @import("../lib/taskloop.zig");
 const loop_guards = @import("loop_guards.zig");

@@ -1,5 +1,5 @@
 const std = @import("std");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const goal_mod = @import("../lib/goal.zig");
 const repeats_mod = @import("../lib/repeat_guard.zig");
 

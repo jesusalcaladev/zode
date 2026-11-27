@@ -4,12 +4,12 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const vxfw = vaxis.vxfw;
-const tui = @import("tui.zig");
+const tui = @import("app").tui;
 const theme = @import("lib/theme.zig");
 const textcap = @import("lib/textcap.zig");
 const md = @import("lib/markdown.zig");
-const agent = @import("agent.zig");
-const palette = @import("palette.zig");
+const agent = @import("app").agent;
+const palette = @import("app").palette;
 
 pub fn typeErasedDrawFn(ud: *anyopaque, ctx: vxfw.DrawContext) std.mem.Allocator.Error!vxfw.Surface {
     const self: *tui.Model = @ptrCast(@alignCast(ud));

@@ -1,5 +1,5 @@
 const std = @import("std");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const resultcap = @import("../lib/resultcap.zig");
 
 pub const TurnCtx = struct {

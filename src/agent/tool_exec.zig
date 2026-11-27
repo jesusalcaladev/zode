@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const tui = @import("../tui.zig");
+const tui = @import("app").tui;
 const session_mod = @import("../session.zig");
 const tools_mod = @import("../tools/dispatch.zig");
 const permrules = @import("../lib/permrules.zig");
