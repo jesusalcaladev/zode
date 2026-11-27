@@ -6,7 +6,11 @@
 
 const std = @import("std");
 const mission = @import("contract.zig");
-const dir = std.Io.Dir.cwd();
+/// `Dir.cwd()` reads the Windows PEB, which is not a comptime constant there.
+/// Computing it at the call site keeps this module cross-compilable.
+fn cwdDir() std.Io.Dir {
+    return std.Io.Dir.cwd();
+}
 
 // Local copies so this module owns a single file namespace: importing the
 // repo's shared helpers here would make the same source file belong to two
@@ -29,7 +33,7 @@ fn writeString(w: *std.Io.Writer, s: []const u8) !void {
 }
 
 fn writeAtomic(io: std.Io, path: []const u8, data: []const u8) !void {
-    var tmp = try dir.createFileAtomic(io, path, .{ .replace = true });
+    var tmp = try cwdDir().createFileAtomic(io, path, .{ .replace = true });
     defer tmp.deinit(io);
     var buf: [8192]u8 = undefined;
     var fw = tmp.file.writer(io, &buf);
@@ -91,7 +95,7 @@ fn pathFor(gpa: std.mem.Allocator, root: []const u8, name: []const u8) ![]const 
 }
 
 fn exists(io: std.Io, path: []const u8) bool {
-    _ = dir.statFile(io, path, .{}) catch return false;
+    _ = cwdDir().statFile(io, path, .{}) catch return false;
     return true;
 }
 
@@ -165,7 +169,7 @@ fn workspaceFingerprint(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ch
     while (stack.items.len > 0) {
         const rel = stack.pop().?;
         const full = if (rel.len == 0) try a.dupe(u8, root) else try std.fmt.allocPrint(a, "{s}/{s}", .{ root, rel });
-        var sub = dir.openDir(io, full, .{ .iterate = true }) catch continue;
+        var sub = cwdDir().openDir(io, full, .{ .iterate = true }) catch continue;
         defer sub.close(io);
         var it = sub.iterate();
         while (it.next(io) catch null) |entry| {
@@ -179,7 +183,7 @@ fn workspaceFingerprint(gpa: std.mem.Allocator, io: std.Io, root: []const u8, ch
             }
             if (entry.kind != .file) continue;
             const child_full = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, child_rel });
-            const st = dir.statFile(io, child_full, .{}) catch continue;
+            const st = cwdDir().statFile(io, child_full, .{}) catch continue;
             try stamps.append(a, .{ .path = child_rel, .size = st.size, .mtime_ns = st.mtime.nanoseconds });
         }
     }
@@ -220,7 +224,7 @@ fn freeCachedResults(gpa: std.mem.Allocator, results: []mission.CheckResult) voi
 fn loadCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?CheckCache {
     const path = pathFor(gpa, root, mission.checks_cache_file) catch return null;
     defer gpa.free(path);
-    const data = dir.readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch return null;
+    const data = cwdDir().readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch return null;
     defer gpa.free(data);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -253,7 +257,7 @@ fn loadCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?CheckCa
 fn saveCheckCache(gpa: std.mem.Allocator, io: std.Io, root: []const u8, fingerprint: u64, results: []const mission.CheckResult) void {
     const meta = pathFor(gpa, root, mission.dir_name) catch return;
     defer gpa.free(meta);
-    dir.createDirPath(io, meta) catch return;
+    cwdDir().createDirPath(io, meta) catch return;
     const path = pathFor(gpa, root, mission.checks_cache_file) catch return;
     defer gpa.free(path);
 
@@ -442,7 +446,7 @@ pub fn renderFacts(gpa: std.mem.Allocator, facts: []const Fact, budget: usize) !
 pub fn loadFacts(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]Fact {
     const path = try pathFor(gpa, root, facts_file);
     defer gpa.free(path);
-    const data = dir.readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch return &.{};
+    const data = cwdDir().readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch return &.{};
     defer gpa.free(data);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -473,7 +477,7 @@ pub fn loadFacts(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]Fact {
 pub fn saveFacts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, facts: []const Fact) !void {
     const meta = pathFor(gpa, root, mission.dir_name) catch return;
     defer gpa.free(meta);
-    try dir.createDirPath(io, meta);
+    try cwdDir().createDirPath(io, meta);
     const path = pathFor(gpa, root, facts_file) catch return;
     defer gpa.free(path);
     var buf: [64 * 1024]u8 = undefined;
@@ -504,9 +508,9 @@ pub fn saveFacts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, facts: []
 pub fn drainFactRequests(gpa: std.mem.Allocator, io: std.Io, root: []const u8, facts: *std.ArrayList(Fact)) !usize {
     const path = try pathFor(gpa, root, fact_requests_file);
     defer gpa.free(path);
-    const data = dir.readFileAlloc(io, path, gpa, .limited(256 * 1024)) catch return 0;
+    const data = cwdDir().readFileAlloc(io, path, gpa, .limited(256 * 1024)) catch return 0;
     defer gpa.free(data);
-    dir.deleteFile(io, path) catch {};
+    cwdDir().deleteFile(io, path) catch {};
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -692,7 +696,7 @@ pub fn hashTestsFor(gpa: std.mem.Allocator, io: std.Io, root: []const u8, owned:
         const rel = stack.pop().?;
         const full = if (rel.len == 0) try gpa.dupe(u8, root) else try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, rel });
         defer gpa.free(full);
-        var sub = dir.openDir(io, full, .{ .iterate = true }) catch continue;
+        var sub = cwdDir().openDir(io, full, .{ .iterate = true }) catch continue;
         defer sub.close(io);
         var it = sub.iterate();
         while (it.next(io) catch null) |entry| {
@@ -710,7 +714,7 @@ pub fn hashTestsFor(gpa: std.mem.Allocator, io: std.Io, root: []const u8, owned:
             }
             const child_full = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, child_rel });
             defer gpa.free(child_full);
-            const bytes = dir.readFileAlloc(io, child_full, gpa, .limited(16 * 1024 * 1024)) catch {
+            const bytes = cwdDir().readFileAlloc(io, child_full, gpa, .limited(16 * 1024 * 1024)) catch {
                 gpa.free(child_rel);
                 continue;
             };
@@ -782,10 +786,10 @@ fn parseStatus(s: []const u8) mission.Status {
 pub fn writePlanFiles(gpa: std.mem.Allocator, io: std.Io, root: []const u8, plan: mission.Plan) !void {
     const meta_dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ root, mission.dir_name });
     defer gpa.free(meta_dir);
-    try dir.createDirPath(io, meta_dir);
+    try cwdDir().createDirPath(io, meta_dir);
     const evidence = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ meta_dir, mission.evidence_dir });
     defer gpa.free(evidence);
-    try dir.createDirPath(io, evidence);
+    try cwdDir().createDirPath(io, evidence);
 
     const mission_path = try pathFor(gpa, root, mission.mission_file);
     defer gpa.free(mission_path);
@@ -856,7 +860,7 @@ pub fn writePlanFiles(gpa: std.mem.Allocator, io: std.Io, root: []const u8, plan
 pub fn loadCriteria(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]mission.Check {
     const path = try pathFor(gpa, root, mission.criteria_file);
     defer gpa.free(path);
-    const data = dir.readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch return &.{};
+    const data = cwdDir().readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch return &.{};
     defer gpa.free(data);
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, gpa, data, .{}) catch return &.{};
     if (parsed != .object) return &.{};
@@ -882,7 +886,7 @@ pub fn loadCriteria(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]mis
 pub fn loadTasks(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ![]mission.Task {
     const path = try pathFor(gpa, root, mission.tasks_file);
     defer gpa.free(path);
-    const data = dir.readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024)) catch return &.{};
+    const data = cwdDir().readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024)) catch return &.{};
     defer gpa.free(data);
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, gpa, data, .{}) catch return &.{};
     if (parsed != .object) return &.{};
@@ -959,7 +963,7 @@ pub fn saveTasks(gpa: std.mem.Allocator, io: std.Io, root: []const u8, tasks: []
 pub fn loadState(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !State {
     const path = try pathFor(gpa, root, mission.state_file);
     defer gpa.free(path);
-    const data = dir.readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch return .{};
+    const data = cwdDir().readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch return .{};
     defer gpa.free(data);
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, gpa, data, .{}) catch return .{};
     if (parsed != .object) return .{};
@@ -1103,7 +1107,7 @@ pub fn saveState(gpa: std.mem.Allocator, io: std.Io, root: []const u8, state: St
 pub fn appendJournal(gpa: std.mem.Allocator, io: std.Io, root: []const u8, line: []const u8) !void {
     const path = try pathFor(gpa, root, mission.journal_file);
     defer gpa.free(path);
-    const old = dir.readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch "";
+    const old = cwdDir().readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch "";
     defer if (old.len > 0) gpa.free(old);
     const text = try std.fmt.allocPrint(gpa, "{s}{s}\n", .{ old, line });
     defer gpa.free(text);
@@ -1119,7 +1123,7 @@ pub fn stopRequested(gpa: std.mem.Allocator, io: std.Io, root: []const u8) bool 
 fn readNamed(gpa: std.mem.Allocator, io: std.Io, root: []const u8, name: []const u8) ![]const u8 {
     const path = try pathFor(gpa, root, name);
     defer gpa.free(path);
-    return dir.readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024)) catch gpa.dupe(u8, "");
+    return cwdDir().readFileAlloc(io, path, gpa, .limited(4 * 1024 * 1024)) catch gpa.dupe(u8, "");
 }
 
 fn writeNamed(gpa: std.mem.Allocator, io: std.Io, root: []const u8, name: []const u8, text: []const u8) !void {
@@ -1161,13 +1165,13 @@ pub fn consumeExtend(gpa: std.mem.Allocator, io: std.Io, root: []const u8) bool 
     const path = pathFor(gpa, root, mission.extend_file) catch return false;
     defer gpa.free(path);
     if (!exists(io, path)) return false;
-    dir.deleteFile(io, path) catch return false;
+    cwdDir().deleteFile(io, path) catch return false;
     return true;
 }
 pub fn ensureV2Files(gpa: std.mem.Allocator, io: std.Io, root: []const u8) !void {
     const meta = pathFor(gpa, root, mission.dir_name) catch return;
     defer gpa.free(meta);
-    try dir.createDirPath(io, meta);
+    try cwdDir().createDirPath(io, meta);
     const names = [_][]const u8{ mission.charter_file, mission.memory_file, mission.summary_file, mission.roadmap_file, mission.improvements_file };
     for (names) |name| {
         const path = try pathFor(gpa, root, name);
@@ -1333,7 +1337,7 @@ fn testRoot(a: std.mem.Allocator, name: []const u8) ![]const u8 {
 }
 
 fn cleanRoot(io: std.Io, root: []const u8) void {
-    dir.deleteTree(io, root) catch {};
+    cwdDir().deleteTree(io, root) catch {};
 }
 
 fn runGit(gpa: std.mem.Allocator, io: std.Io, root: []const u8, argv: []const []const u8) !void {
@@ -1374,7 +1378,7 @@ test "mission_io: state survives a JSON round trip" {
     const root = try testRoot(a, "state");
     defer cleanRoot(io, root);
     const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
-    try dir.createDirPath(io, meta);
+    try cwdDir().createDirPath(io, meta);
 
     const hashes = [_]TestHash{.{ .path = "cli.test.js", .hash = 17_192_427_771_940_152_780 }};
     var first = State{ .turn = 4, .status = .blocked, .max_turns = 9, .cost_usd = 1.25, .test_hashes = &hashes };
@@ -1402,22 +1406,22 @@ test "mission_io: a checkpoint revert undoes an improvement, not the baseline" {
     const io = std.testing.io;
     const root = try testRoot(a, "revert");
     defer cleanRoot(io, root);
-    try dir.createDirPath(io, root);
+    try cwdDir().createDirPath(io, root);
     try runGit(a, io, root, &.{ "git", "init", "-q" });
 
     const file = try std.fmt.allocPrint(a, "{s}/note.txt", .{root});
-    try dir.writeFile(io, .{ .sub_path = file, .data = "baseline\n" });
+    try cwdDir().writeFile(io, .{ .sub_path = file, .data = "baseline\n" });
     try runGit(a, io, root, &.{ "git", "add", "note.txt" });
     try runGit(a, io, root, &.{ "git", "-c", "user.name=zode", "-c", "user.email=zode@local", "commit", "-q", "-m", "base" });
     const baseline = gitHead(a, io, root) orelse return error.NoHead;
 
-    try dir.writeFile(io, .{ .sub_path = file, .data = "improved\n" });
+    try cwdDir().writeFile(io, .{ .sub_path = file, .data = "improved\n" });
     try std.testing.expect(try gitCommit(a, io, root, "mission: improvement", &.{"note.txt"}));
     const current = gitHead(a, io, root) orelse return error.NoHead;
     try std.testing.expect(!std.mem.eql(u8, baseline, current));
     try std.testing.expect(try gitRevert(a, io, root, current));
 
-    const restored = try dir.readFileAlloc(io, file, a, .limited(1024));
+    const restored = try cwdDir().readFileAlloc(io, file, a, .limited(1024));
     try std.testing.expectEqualStrings("baseline\n", restored);
 }
 
@@ -1430,7 +1434,7 @@ test "mission_io: STOP is detected from disk" {
     defer cleanRoot(io, root);
 
     const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
-    try dir.createDirPath(io, meta);
+    try cwdDir().createDirPath(io, meta);
     try std.testing.expect(!stopRequested(a, io, root));
     const stop_path = try pathFor(a, root, mission.stop_file);
     try writeAtomic(io,stop_path, "");
@@ -1444,15 +1448,15 @@ test "mission_io: test erosion is detected by hash and count" {
     const io = std.testing.io;
     const root = try testRoot(a, "hash-guard");
     defer cleanRoot(io, root);
-    try dir.createDirPath(io, root);
+    try cwdDir().createDirPath(io, root);
 
     const file = try std.fmt.allocPrint(a, "{s}/cli.test.js", .{root});
-    try dir.writeFile(io, .{ .sub_path = file, .data = "test('a', () => {});\n" });
+    try cwdDir().writeFile(io, .{ .sub_path = file, .data = "test('a', () => {});\n" });
     const baseline = try hashTests(a, io, root);
     try std.testing.expectEqual(@as(usize, 1), baseline.len);
     try std.testing.expectEqual(@as(?[]const u8, null), checkTestIntegrity(baseline, baseline));
 
-    try dir.writeFile(io, .{ .sub_path = file, .data = "test('a', () => {}); // weakened\n" });
+    try cwdDir().writeFile(io, .{ .sub_path = file, .data = "test('a', () => {}); // weakened\n" });
     const changed = try hashTests(a, io, root);
     try std.testing.expect(checkTestIntegrity(baseline, changed) != null);
 }
@@ -1478,8 +1482,8 @@ test "mission_io: scoped hashing ignores tests outside task-owned paths" {
     const foreign = try std.fmt.allocPrint(a, "{s}/other/foreign.test.zig", .{root});
     for ([_][]const u8{ owned, foreign }) |path| {
         const slash = std.mem.lastIndexOfScalar(u8, path, '/').?;
-        try dir.createDirPath(io, path[0..slash]);
-        try dir.writeFile(io, .{ .sub_path = path, .data = "test {}\n" });
+        try cwdDir().createDirPath(io, path[0..slash]);
+        try cwdDir().writeFile(io, .{ .sub_path = path, .data = "test {}\n" });
     }
 
     const scoped = try hashTestsFor(a, io, root, &.{"src"});
@@ -1501,7 +1505,7 @@ test "mission_io: checks run and write evidence" {
     defer cleanRoot(io, root);
 
     const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
-    try dir.createDirPath(io, meta);
+    try cwdDir().createDirPath(io, meta);
     const checks = [_]mission.Check{
         .{ .id = "pass", .cmd = "printf 1.0.0", .expect = "contains:1.0.0" },
         .{ .id = "fail", .cmd = "exit 1", .expect = "exit0" },
@@ -1514,7 +1518,7 @@ test "mission_io: checks run and write evidence" {
 }
 
 fn countLines(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !usize {
-    const data = try dir.readFileAlloc(io, path, gpa, .limited(1024 * 1024));
+    const data = try cwdDir().readFileAlloc(io, path, gpa, .limited(1024 * 1024));
     defer gpa.free(data);
     var n: usize = 0;
     for (data) |c| if (c == '\n') {
@@ -1537,16 +1541,16 @@ test "mission_io: checks run in parallel up to the concurrency bound" {
     const io = std.testing.io;
     const root = try testRoot(a, "parallel");
     defer cleanRoot(io, root);
-    try dir.createDirPath(io, root);
+    try cwdDir().createDirPath(io, root);
     const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
-    try dir.createDirPath(io, meta);
+    try cwdDir().createDirPath(io, meta);
 
     // Deterministic barrier: every check appends a line, then waits until all
     // three lines exist. A serial runner cannot satisfy it and all checks time
     // out; a parallel runner passes in one tick.
     const marks = "/tmp/zode-mission-parallel-marks";
-    defer dir.deleteFile(io, marks) catch {};
-    try dir.writeFile(io, .{ .sub_path = marks, .data = "" });
+    defer cwdDir().deleteFile(io, marks) catch {};
+    try cwdDir().writeFile(io, .{ .sub_path = marks, .data = "" });
     const barrier = try std.fmt.allocPrint(a,
         "i=0; while [ \"$(wc -l < {s})\" -lt 3 ]; do i=$((i+1)); [ \"$i\" -ge 40 ] && exit 1; sleep 0.05; done",
         .{marks});
@@ -1569,15 +1573,15 @@ test "mission_io: unchanged checks are cached until the workspace or criteria ch
     const io = std.testing.io;
     const root = try testRoot(a, "cache");
     defer cleanRoot(io, root);
-    try dir.createDirPath(io, root);
+    try cwdDir().createDirPath(io, root);
     const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
-    try dir.createDirPath(io, meta);
+    try cwdDir().createDirPath(io, meta);
 
     // The counter lives OUTSIDE the workspace so the checks themselves do not
     // invalidate the fingerprint; it only records how often a shell ran.
     const counter = "/tmp/zode-mission-cache-counter";
-    defer dir.deleteFile(io, counter) catch {};
-    try dir.writeFile(io, .{ .sub_path = counter, .data = "" });
+    defer cwdDir().deleteFile(io, counter) catch {};
+    try cwdDir().writeFile(io, .{ .sub_path = counter, .data = "" });
 
     var checks = [_]mission.Check{
         .{ .id = "pass", .cmd = try std.fmt.allocPrint(a, "echo x >> {s}", .{counter}) },
@@ -1601,7 +1605,7 @@ test "mission_io: unchanged checks are cached until the workspace or criteria ch
     try std.testing.expectEqual(@as(usize, 2), try countLines(std.testing.allocator, io, counter));
 
     const source = try std.fmt.allocPrint(a, "{s}/source.txt", .{root});
-    try dir.writeFile(io, .{ .sub_path = source, .data = "changed\n" });
+    try cwdDir().writeFile(io, .{ .sub_path = source, .data = "changed\n" });
     const third = try runChecks(std.testing.allocator, io, root, &checks);
     defer freeCheckResults(std.testing.allocator, third);
     try std.testing.expectEqual(@as(usize, 4), try countLines(std.testing.allocator, io, counter));
@@ -1614,7 +1618,7 @@ test "mission_io: unchanged checks are cached until the workspace or criteria ch
     // Checks that depend on the clock or the network cannot be modeled by a
     // workspace fingerprint. `.mission/NO_CACHE` is an honest escape hatch.
     const marker = try pathFor(a, root, mission.no_cache_file);
-    try dir.writeFile(io, .{ .sub_path = marker, .data = "" });
+    try cwdDir().writeFile(io, .{ .sub_path = marker, .data = "" });
     const fifth = try runChecks(std.testing.allocator, io, root, &checks);
     defer freeCheckResults(std.testing.allocator, fifth);
     try std.testing.expectEqual(@as(usize, 8), try countLines(std.testing.allocator, io, counter));
@@ -1627,9 +1631,9 @@ test "mission_io: durable facts replace by subject and survive a JSON round trip
     const io = std.testing.io;
     const root = try testRoot(a, "facts");
     defer cleanRoot(io, root);
-    try dir.createDirPath(io, root);
+    try cwdDir().createDirPath(io, root);
     const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
-    try dir.createDirPath(io, meta);
+    try cwdDir().createDirPath(io, meta);
 
     var facts = std.ArrayList(Fact).empty;
     defer {
@@ -1668,9 +1672,9 @@ test "mission_io: proposed flag survives the facts JSON round trip" {
     const io = std.testing.io;
     const root = try testRoot(a, "facts-proposed");
     defer cleanRoot(io, root);
-    try dir.createDirPath(io, root);
+    try cwdDir().createDirPath(io, root);
     const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
-    try dir.createDirPath(io, meta);
+    try cwdDir().createDirPath(io, meta);
 
     var facts = std.ArrayList(Fact).empty;
     defer {
@@ -1697,9 +1701,9 @@ test "mission_io: fact proposals are validated, labelled and consumed" {
     const root = try testRoot(a, "fact-requests");
     defer cleanRoot(io, root);
     const meta = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mission.dir_name });
-    try dir.createDirPath(io, meta);
+    try cwdDir().createDirPath(io, meta);
     const path = try pathFor(a, root, fact_requests_file);
-    try dir.writeFile(io, .{ .sub_path = path, .data =
+    try cwdDir().writeFile(io, .{ .sub_path = path, .data =
         \\{"kind":"fact","subject":"layout","text":"tests live under src/lib"}
         \\not json
         \\{"kind":"check","subject":"forged","text":"PASS"}

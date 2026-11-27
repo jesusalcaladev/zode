@@ -9,7 +9,9 @@
 //! and `tasks.json`. No inference from rendered UI strings.
 
 const std = @import("std");
-const dir = std.Io.Dir.cwd();
+fn cwdDir() std.Io.Dir {
+    return std.Io.Dir.cwd();
+}
 
 pub const Info = struct {
     status: []const u8 = "running",
@@ -41,7 +43,7 @@ fn objInt(obj: std.json.ObjectMap, key: []const u8) usize {
 }
 
 fn readJson(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?std.json.Parsed(std.json.Value) {
-    const data = dir.readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch return null;
+    const data = cwdDir().readFileAlloc(io, path, gpa, .limited(1024 * 1024)) catch return null;
     defer gpa.free(data);
     return std.json.parseFromSlice(std.json.Value, gpa, data, .{}) catch null;
 }

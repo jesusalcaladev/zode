@@ -152,7 +152,10 @@ pub const Job = struct {
     /// is reaped, at which point `getpgid` on it is `error.CHILD` — a PANIC in Zig
     /// 0.16, not a value. So the pid that `killTree` needs is kept here, where the
     /// reaper cannot invalidate it.
-    pgid: std.posix.pid_t = 0,
+    /// POSIX: process group id; Windows: the HANDLE as an integer. Stored
+    /// platform-neutrally so this module cross-compiles; group kill is POSIX
+    /// only (see killTree).
+    pgid: usize = 0,
     /// Set by `killAll` (ESC) so a job that has not been reaped yet dies too.
     kill_requested: bool = false,
 
@@ -700,11 +703,16 @@ pub fn stateWord(reg: *Registry, id: u32) []const u8 {
 /// nobody a handle. So the foreground tool registers here too — only the pid —
 /// and ESC kills that pid. Without it, ESC set a flag that the `run` never looks
 /// at and the command ran to the end of its timeout.
-var foreground: std.atomic.Value(std.posix.pid_t) = .init(0);
+var foreground: std.atomic.Value(usize) = .init(0);
 
-/// Publishes the pid of the command a foreground tool is waiting on.
-pub fn setForeground(pid: std.posix.pid_t) void {
-    foreground.store(pid, .seq_cst);
+/// Publishes the pid of the command a foreground tool is waiting on. On
+/// Windows `Child.Id` is a HANDLE; both are stored as plain integers here.
+pub fn setForeground(pid: std.process.Child.Id) void {
+    const value: usize = if (builtin.os.tag == .windows)
+        @intFromPtr(pid)
+    else
+        @as(usize, @intCast(pid));
+    foreground.store(value, .seq_cst);
 }
 
 pub fn clearForeground() void {
@@ -719,14 +727,19 @@ pub fn clearForeground() void {
 /// which is exactly the "ESC did nothing" symptom, one level down.
 pub fn killForeground() bool {
     const pid = foreground.load(.seq_cst);
-    if (pid <= 0) return false;
+    if (pid == 0) return false;
+    // Windows has no POSIX process groups and the foreground child is owned by
+    // `std.process.run`, so there is no handle here to signal. The turn's
+    // timeout still bounds it; native Ctrl+C handling is a separate port task.
+    if (builtin.os.tag == .windows) return false;
     clearForeground();
     // `SIGKILL` and not `SIGTERM`: the user pressed ESC to stop it NOW, and a
     // build that ignores SIGTERM (or takes three seconds to notice) keeps burning
     // the core for those three seconds.
-    std.posix.kill(-pid, std.posix.SIG.KILL) catch {
+    const posix_pid: std.posix.pid_t = @intCast(pid);
+    std.posix.kill(-posix_pid, std.posix.SIG.KILL) catch {
         // No process group (or already gone): fall back to the pid itself.
-        std.posix.kill(pid, std.posix.SIG.KILL) catch return true;
+        std.posix.kill(posix_pid, std.posix.SIG.KILL) catch return true;
     };
     return true;
 }
@@ -869,7 +882,7 @@ pub fn spawn(
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
-        .pgid = 0,
+        .pgid = if (builtin.os.tag == .windows) null else 0,
     }) catch return error.SpawnFailed;
     errdefer child.kill(io);
 
@@ -895,7 +908,10 @@ pub fn spawn(
     j.child = child;
     // The pid, taken BEFORE the reader thread can reap the child. `killTree`
     // signals `-pgid`, and after a reap that pid belongs to somebody else.
-    j.pgid = child.id orelse 0;
+    j.pgid = if (child.id) |cid|
+        if (builtin.os.tag == .windows) @intFromPtr(cid) else @as(usize, @intCast(cid))
+    else
+        0;
     reg.next_id +%= 1;
     if (reg.next_id == 0) reg.next_id = 1;
 
@@ -1100,8 +1116,7 @@ pub fn kill(reg: *Registry, io: std.Io, id: u32) bool {
 /// reaches all of it. The plain `c.kill(io)` still runs after, for its own side
 /// effects on the struct (it zeroes `id`, which the reader's `wait` relies on).
 fn killTree(j: *Job, io: std.Io) void {
-    _ = io;
-    const c = j.child orelse return;
+    var c = j.child orelse return;
     const pid = c.id orelse return;
 
     // SIGNAL ONLY. No `Child.kill`, and that is the whole fix for a crash that killed the
@@ -1134,10 +1149,15 @@ fn killTree(j: *Job, io: std.Io) void {
     // shell leaves its own children compiling. `j.pgid` and not `pid`, because a pid can
     // be recycled between the spawn and the kill, and `pgid` is the one value the reaper
     // cannot invalidate under us.
-    if (j.pgid > 0) {
-        std.posix.kill(-j.pgid, std.posix.SIG.KILL) catch {};
+    if (builtin.os.tag != .windows) {
+        if (j.pgid > 0) {
+            // POSIX only: Windows has no process groups and kills the handle.
+            std.posix.kill(-@as(std.posix.pid_t, @intCast(j.pgid)), std.posix.SIG.KILL) catch {};
+        } else {
+            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        }
     } else {
-        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+        c.kill(io);
     }
 }
 /// A plain `nanosleep`, NOT `Io.sleep`: `Io.sleep` goes through the shared `Io`,
@@ -1329,7 +1349,7 @@ test "spawn: the child LEADS its process group (or ESC cannot kill it)" {
             .stdin = .ignore,
             .stdout = .pipe,
             .stderr = .pipe,
-            .pgid = 0,
+            .pgid = if (builtin.os.tag == .windows) null else 0,
         });
         const pid = c.id.?;
         const child = try procPgrp(io, pid);
@@ -1355,9 +1375,9 @@ test "spawn: the child LEADS its process group (or ESC cannot kill it)" {
     // compiled from `src/test_all.zig`, so the path is `bgproc.zig`), and the
     // module path cannot be written into a comptime `@embedFile`.
     const bg_src = @embedFile("bgproc.zig");
-    try std.testing.expect(std.mem.indexOf(u8, bg_src, ".pgid = 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bg_src, ".pgid = if (builtin.os.tag == .windows) null else 0,") != null);
     const tools_src = @embedFile("tools/bg.zig");
-    try std.testing.expect(std.mem.indexOf(u8, tools_src, ".pgid = 0,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_src, ".pgid = if (builtin.os.tag == .windows) null else 0,") != null);
 }
 
 /// Field 5 of `/proc/<pid>/stat` (the `pgrp`), or an error if it cannot be read.

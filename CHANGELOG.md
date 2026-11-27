@@ -117,7 +117,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - add a real headless tool-loop smoke (hooks) [`423e774a`](https://github.com/jesusalcaladev/zode/commit/423e774a)
 - gate background completion in the headless loop [`d66c2e57`](https://github.com/jesusalcaladev/zode/commit/d66c2e57)
 - gate /remote against the reference server [`906855e3`](https://github.com/jesusalcaladev/zode/commit/906855e3)
-- close the last verification gaps [`42f6c575`](https://github.com/jesusalcaladev/zode/commit/42f6c575)
+- close the last verification gaps [`9356865f`](https://github.com/jesusalcaladev/zode/commit/9356865f)
+
+### Build
+
+- cross-compile zode for Windows [`926456d3`](https://github.com/jesusalcaladev/zode/commit/926456d3)
 
 ### Styles
 

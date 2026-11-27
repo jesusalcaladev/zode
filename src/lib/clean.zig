@@ -342,9 +342,9 @@ fn isStaleInstance(
 /// so it counts as alive — deleting another user's live entry would be the one
 /// destructive thing this command could plausibly do.
 /// Signal 0 is not delivered: the kernel only checks that the pid exists.
-const signal_zero: std.posix.SIG = @enumFromInt(0);
-
 pub fn pidAlive(pid: i32) bool {
+    if (@import("builtin").os.tag == .windows) return false; // no POSIX pid probe
+    const signal_zero: std.posix.SIG = @enumFromInt(0);
     std.posix.kill(pid, signal_zero) catch |err| switch (err) {
         error.ProcessNotFound => return false,
         error.PermissionDenied => return true,

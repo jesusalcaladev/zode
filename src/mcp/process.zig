@@ -15,6 +15,7 @@
 //! needs is a tool that works.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const client = @import("client.zig");
 
 pub const Process = struct {
@@ -22,7 +23,7 @@ pub const Process = struct {
     io: std.Io,
     child: std.process.Child,
     /// The group leader's pid, for `kill(-pid)`.
-    pid: std.posix.pid_t,
+    pid: usize,
 
     pub fn transport(self: *Process) client.Transport {
         return .{ .ctx = self, .vtable = &vtable };
@@ -44,6 +45,13 @@ pub const Process = struct {
     fn readSome(ctx: *anyopaque, buf: []u8, timeout_ms: i64) anyerror!usize {
         const self: *Process = @ptrCast(@alignCast(ctx));
         const out = self.child.stdout orelse return error.ServerClosed;
+        // Windows has no POSIX poll and a HANDLE is not an fd. Read through
+        // Io.File there (the timeout stays a POSIX-only refinement for now).
+        if (builtin.os.tag == .windows) {
+            const n = out.readStreaming(self.io, &.{buf}) catch return error.ServerClosed;
+            if (n == 0) return error.ServerClosed;
+            return n;
+        }
         var fds = [_]std.posix.pollfd{.{ .fd = out.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         const capped: i32 = @intCast(@min(@max(timeout_ms, 0), std.math.maxInt(i32)));
         const ready = std.posix.poll(&fds, capped) catch return error.ServerClosed;
@@ -55,7 +63,9 @@ pub const Process = struct {
         const self: *Process = @ptrCast(@alignCast(ctx));
         const io = self.io;
         // The whole GROUP first: a server may have spawned children of its own.
-        if (self.pid != 0) std.posix.kill(-self.pid, std.posix.SIG.KILL) catch {};
+        if (builtin.os.tag != .windows and self.pid != 0) {
+            std.posix.kill(-@as(std.posix.pid_t, @intCast(self.pid)), std.posix.SIG.KILL) catch {};
+        }
         // Reap, do NOT `Child.kill`: that sends a signal before waiting, and
         // the pid is already dead — `childKillPosix` would answer `.CHILD` and
         // panic.
@@ -77,7 +87,9 @@ pub const Process = struct {
     /// wakes up with an end-of-stream and leaves on its own.
     fn kill(ctx: *anyopaque) void {
         const self: *Process = @ptrCast(@alignCast(ctx));
-        if (self.pid != 0) std.posix.kill(-self.pid, std.posix.SIG.KILL) catch {};
+        if (builtin.os.tag != .windows and self.pid != 0) {
+            std.posix.kill(-@as(std.posix.pid_t, @intCast(self.pid)), std.posix.SIG.KILL) catch {};
+        }
     }
 };
 
@@ -101,7 +113,7 @@ pub fn spawn(
         .stdin = .pipe,
         .stdout = .pipe,
         .stderr = .ignore,
-        .pgid = 0,
+        .pgid = if (builtin.os.tag == .windows) null else 0,
         .environ_map = env,
     }) catch |e| switch (e) {
         error.FileNotFound => return error.ServerNotFound,
@@ -117,7 +129,7 @@ pub fn spawn(
         .gpa = gpa,
         .io = io,
         .child = child,
-        .pid = child.id orelse 0,
+        .pid = if (builtin.os.tag == .windows) 0 else @as(usize, @intCast(child.id orelse 0)),
     };
     return self.transport();
 }

@@ -44,10 +44,12 @@ Phase 13 modules have reference harnesses in `tools/`: `remote_server.py` for
 
 ## Areas that need help
 
-- **Windows support is not implemented and is not on the roadmap.** The crash
-  handler (signals, `/dev/tty`, raw terminal restore), the pty harnesses and the
-  keychain backend are POSIX-only. Use WSL or a Linux VM if you need zode on
-  Windows; a native port would be a redesign, not a patch.
+- **Windows: cross-compiles, runtime still unverified.** `zig build -Dtarget=x86_64-windows-gnu`
+  now produces `zode.exe` (module-level `Dir.cwd()`, `Args.Iterator`, POSIX pid
+  fields and `poll` were made platform-neutral or guarded). The crash handler,
+  the pty harnesses and the keychain backend remain POSIX-only, so this is NOT
+  yet first-class Windows support: it needs a Windows machine to exercise the
+  runtime, especially terminal raw mode, signals and process-group kills.
 - End-to-end verification against a real Anthropic key (`zig build test -De2e`).
 - The remaining mission-runtime gaps in [`docs/mission-gaps.md`](docs/mission-gaps.md).
   The `TASKS.md` quality backlog (Phases 40–51) is fully closed.

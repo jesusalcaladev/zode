@@ -265,7 +265,8 @@ pub fn main(init: std.process.Init) !void {
     const io = threaded.io();
     const gpa = std.heap.page_allocator;
 
-    var it = std.process.Args.Iterator.init(init.minimal.args);
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+    defer it.deinit();
     var arg_list: std.ArrayList([]const u8) = .empty;
     while (it.next()) |a| arg_list.append(gpa, a) catch {};
     const args = arg_list.items;

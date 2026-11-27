@@ -14,7 +14,9 @@ const mission = @import("contract.zig");
 const mission_io = @import("io.zig");
 const instructions = @import("../lib/instructions.zig");
 
-const dir = std.Io.Dir.cwd();
+fn cwdDir() std.Io.Dir {
+    return std.Io.Dir.cwd();
+}
 
 fn nap(ms: u64) void {
     const ts = std.os.linux.timespec{
@@ -61,7 +63,7 @@ fn loadProjectInstructions(gpa: std.mem.Allocator, io: std.Io, env: ?*const std.
     var entries = std.ArrayList(mission_io.InstructionEntry).empty;
     defer entries.deinit(a);
     for (paths) |path| {
-        const text = dir.readFileAlloc(io, path, a, .limited(64 * 1024)) catch continue;
+        const text = cwdDir().readFileAlloc(io, path, a, .limited(64 * 1024)) catch continue;
         try entries.append(a, .{ .path = path, .text = text });
     }
     return mission_io.composeInstructions(gpa, entries.items, 12 * 1024);
@@ -254,7 +256,7 @@ fn writeWorkerPrompts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, task
     errdefer prompts.deinit(gpa);
     const prompts_dir = try std.fmt.allocPrint(gpa, "{s}/{s}/prompts", .{ root, mission.dir_name });
     defer gpa.free(prompts_dir);
-    try dir.createDirPath(io, prompts_dir);
+    try cwdDir().createDirPath(io, prompts_dir);
     for (wave.ids) |id| {
         for (tasks) |task| {
             if (task.id != id) continue;
@@ -262,7 +264,7 @@ fn writeWorkerPrompts(gpa: std.mem.Allocator, io: std.Io, root: []const u8, task
             const text = try std.fmt.allocPrint(gpa,
                 "{s}[MISSION WORKER] Workspace: {s}\nTask #{d}: {s}\nDo only this task. Use zode's write/edit tools. Do not run the global checks; the lead verifies them. When finished, create a note with mission_task_done in your final answer. The harness writes .mission/prompts/task-{d}.done when your process exits.\n",
                 .{ context, root, task.id, task.subject, task.id });
-            try dir.writeFile(io, .{ .sub_path = path, .data = text });
+            try cwdDir().writeFile(io, .{ .sub_path = path, .data = text });
             try prompts.append(gpa, path);
             break;
         }
@@ -285,7 +287,7 @@ const WorkerCtx = struct {
         const text = std.Io.Dir.cwd().readFileAlloc(self.io, self.prompt_path, self.gpa, .limited(1024 * 1024)) catch return;
         defer self.gpa.free(text);
         self.ok = callAgent(self.gpa, self.io, self.env, self.root, text, self.command, self.model);
-        dir.writeFile(self.io, .{ .sub_path = self.marker_path, .data = if (self.ok) "done\n" else "failed\n" }) catch {};
+        cwdDir().writeFile(self.io, .{ .sub_path = self.marker_path, .data = if (self.ok) "done\n" else "failed\n" }) catch {};
     }
 };
 

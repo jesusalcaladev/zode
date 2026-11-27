@@ -10569,7 +10569,7 @@ pub fn quitFast(m: *tui.Model, io: std.Io) noreturn {
     // script, or when piped). vaxis does the same: it opens /dev/tty and writes
     // escape sequences there. We also restore the termios to exit raw mode,
     // which the escape sequences alone cannot do.
-    {
+    if (builtin.os.tag != .windows) {
         // Open the controlling terminal directly
         const tty_file = std.Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_write }) catch {
             std.process.exit(0);
@@ -10590,6 +10590,7 @@ pub fn quitFast(m: *tui.Model, io: std.Io) noreturn {
 }
 
 fn restoreTermios(fd: posix.fd_t) void {
+    if (builtin.os.tag == .windows) return; // no POSIX termios there
     const termios = posix.tcgetattr(fd) catch return;
     var termios_copy = termios;
     termios_copy.lflag.ECHO = true;

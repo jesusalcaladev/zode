@@ -452,7 +452,7 @@ fn runTui(init: std.process.Init) !u8 {
     // /var/lib/systemd/coredump, so it is opt-in and not the default. The
     // rlimit has to be lifted too, or an `ulimit -c 0` from the caller's
     // environment silently swallows the core again.
-    if (env_mod.truthyIn(init.environ_map, "ZODE_CORE_DUMP", false)) {
+    if (builtin.os.tag != .windows and env_mod.truthyIn(init.environ_map, "ZODE_CORE_DUMP", false)) {
         if (std.posix.getrlimit(.CORE)) |lim| {
             if (lim.cur != lim.max) {
                 _ = std.posix.setrlimit(.CORE, .{ .cur = lim.max, .max = lim.max }) catch {};
@@ -679,7 +679,8 @@ pub fn runSelftest(init: std.process.Init) u8 {
 }
 
 pub fn main(init: std.process.Init) !u8 {
-    var it = std.process.Args.Iterator.init(init.minimal.args);
+    var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
+    defer it.deinit();
     _ = it.next(); // argv[0]
     var first = it.next();
     // 50.8: a caller-supplied system prompt suffix. It is process-wide and
