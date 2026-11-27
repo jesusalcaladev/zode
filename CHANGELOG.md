@@ -96,7 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - remove dead code and close one-shot leaks (mission) [`0c0ead9c`](https://github.com/jesusalcaladev/zode/commit/0c0ead9c)
 - share hard-stop decisions between both runners [`c86b81eb`](https://github.com/jesusalcaladev/zode/commit/c86b81eb)
 - scale edge scrolling and unify copy cleanup (tui) [`cffd22f8`](https://github.com/jesusalcaladev/zode/commit/cffd22f8)
-- break the agent/tui/commands import cycle [`251df19d`](https://github.com/jesusalcaladev/zode/commit/251df19d)
+- break the agent/tui/commands import cycle [`368cb489`](https://github.com/jesusalcaladev/zode/commit/368cb489)
 
 ### Performance
 
@@ -119,6 +119,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - gate background completion in the headless loop [`d66c2e57`](https://github.com/jesusalcaladev/zode/commit/d66c2e57)
 - gate /remote against the reference server [`906855e3`](https://github.com/jesusalcaladev/zode/commit/906855e3)
 - close the last verification gaps [`9356865f`](https://github.com/jesusalcaladev/zode/commit/9356865f)
+- guard the 42.8 import seam [`7630289a`](https://github.com/jesusalcaladev/zode/commit/7630289a)
 
 ### Build
 

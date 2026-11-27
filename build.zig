@@ -513,6 +513,12 @@ pub fn build(b: *std.Build) void {
     cm_run.has_side_effects = true;
     cm_step.dependOn(&cm_run.step);
 
+    const cycle_check = b.step("cycle-check", "Guard the agent/tui/commands import seam (42.8)");
+    const run_cycle = b.addSystemCommand(&.{ "python3", "tools/cycle_check.py" });
+    run_cycle.setName("cycle_check");
+    run_cycle.has_side_effects = true;
+    cycle_check.dependOn(&run_cycle.step);
+
     // 42.8: each root module imports ITSELF as `app`. agent.zig, tui.zig and
     // commands.zig now reference each other through that module import, so no
     // source file belongs to two modules and the direct file-level cycle is
