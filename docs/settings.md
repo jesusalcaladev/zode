@@ -204,8 +204,7 @@ follow the main turn.
 
 Everything is optional; an empty `{}` is valid.
 
-The `settings` object also accepts `mode`: `interactive` (default), `mission`
-(autonomous supervisor) or `auto`. See [`missions-zode.md`](missions-zode.md).
+The `settings` object also accepts `mode`: `interactive` (default) or `auto`.
 
 ```json
 {

@@ -139,8 +139,6 @@ See [`docs/settings.md`](docs/settings.md) for the full provider table and `conf
 | [`docs/commands.md`](docs/commands.md) | Every slash command and what it does |
 | [`docs/usage.md`](docs/usage.md) | How to use zode, end to end (run → model → task → verify) |
 | [`docs/architecture.md`](docs/architecture.md) | How streaming, compaction, permissions, subagents, MCP, self-update work |
-| [`docs/missions-zode.md`](docs/missions-zode.md) | Headless autonomous missions: executable criteria, parallel workers, durable state |
-| [`docs/mission-gaps.md`](docs/mission-gaps.md) | Honest delta vs the OpenCode plugin and the port roadmap |
 | [`docs/releasing.md`](docs/releasing.md) | Release/beta runbook: tag, publish, install pinned builds |
 | [`docs/RULES-ZODE-TUI.md`](docs/RULES-ZODE-TUI.md) | TUI/runtime invariants (required reading before changing the TUI) |
 | `AGENTS.md` | Code conventions for contributors and AI coding agents |

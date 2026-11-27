@@ -35,16 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - make provider search work in the model picker (palette) [`c59bbbd3`](https://github.com/jesusalcaladev/zode/commit/c59bbbd3)
 - keep the selected model across catalog refreshes (palette) [`93389c31`](https://github.com/jesusalcaladev/zode/commit/93389c31)
 - make /focus a real quiet transcript (tui) [`af2d7528`](https://github.com/jesusalcaladev/zode/commit/af2d7528)
-- headless autonomous mission runner (mission) [`20212f85`](https://github.com/jesusalcaladev/zode/commit/20212f85)
-- add recovery, model rotation, test guard and model planner (mission) [`dfba48c8`](https://github.com/jesusalcaladev/zode/commit/dfba48c8)
-- full contract parity with the OpenCode plugin (mission) [`e4a539c8`](https://github.com/jesusalcaladev/zode/commit/e4a539c8)
-- continuous improvement loop for missions (core) [`da601944`](https://github.com/jesusalcaladev/zode/commit/da601944)
-- close autonomy gaps vs the OpenCode plugin (mission) [`bccfd226`](https://github.com/jesusalcaladev/zode/commit/bccfd226)
-- route models by role (mission) [`eef98870`](https://github.com/jesusalcaladev/zode/commit/eef98870)
-- add progress and cost status dashboard (mission) [`f23b7e12`](https://github.com/jesusalcaladev/zode/commit/f23b7e12)
-- quiet mission footer segment (tui) [`5d6c9df7`](https://github.com/jesusalcaladev/zode/commit/5d6c9df7)
-- add NO_CACHE escape hatch for external-state checks (mission) [`bd193b2d`](https://github.com/jesusalcaladev/zode/commit/bd193b2d)
-- accept verified-shaped fact proposals from the agent (mission) [`4e3531d7`](https://github.com/jesusalcaladev/zode/commit/4e3531d7)
 - regex transcript search and code-fence guides (tui) [`fcaa72a3`](https://github.com/jesusalcaladev/zode/commit/fcaa72a3)
 - collapsible reasoning and visible vim state (tui) [`6c36307f`](https://github.com/jesusalcaladev/zode/commit/6c36307f)
 - fire PreCompact and subagent lifecycle events (hooks) [`7fc97683`](https://github.com/jesusalcaladev/zode/commit/7fc97683)
@@ -53,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - auto-scroll selection and cleaner copied text (tui) [`2817fc49`](https://github.com/jesusalcaladev/zode/commit/2817fc49)
 - polish compact fallback and regex search feedback (tui) [`b8ac804b`](https://github.com/jesusalcaladev/zode/commit/b8ac804b)
 - polish Settings with useful runtime switches (tui) [`4885ef3d`](https://github.com/jesusalcaladev/zode/commit/4885ef3d)
-- unify and capitalize tool result output (tools) [`784e8525`](https://github.com/jesusalcaladev/zode/commit/784e8525)
+- unify and capitalize tool result output (tools) [`1c1a8bce`](https://github.com/jesusalcaladev/zode/commit/1c1a8bce)
 
 ### Bug Fixes
 
@@ -67,7 +57,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop ending turns at 12 iterations and explain gate refusals (agent) [`76e1f0bc`](https://github.com/jesusalcaladev/zode/commit/76e1f0bc)
 - stop inferring tool failures from the summary text (tui) [`b2e5c400`](https://github.com/jesusalcaladev/zode/commit/b2e5c400)
 - finish moving config feedback out of the transcript (tui) [`18f38529`](https://github.com/jesusalcaladev/zode/commit/18f38529)
-- bound worker concurrency (mission) [`bff212ae`](https://github.com/jesusalcaladev/zode/commit/bff212ae)
 - make autocomplete replacement one undo step (editor) [`49e3de67`](https://github.com/jesusalcaladev/zode/commit/49e3de67)
 - rewind the live transcript on /undo yes (tui) [`d936f6c8`](https://github.com/jesusalcaladev/zode/commit/d936f6c8)
 
@@ -84,7 +73,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - new improvement backlog from a six-track code audit (tasks) [`a674eb1b`](https://github.com/jesusalcaladev/zode/commit/a674eb1b)
 - record the two remaining deferrals with their real blockers (tasks) [`5d2c8cd2`](https://github.com/jesusalcaladev/zode/commit/5d2c8cd2)
 - add Claude Code parity backlog (phases 48-51) (tasks) [`2aa540d7`](https://github.com/jesusalcaladev/zode/commit/2aa540d7)
-- record mission runtime gaps vs the OpenCode plugin [`9b116613`](https://github.com/jesusalcaladev/zode/commit/9b116613)
 
 ### Refactors
 
@@ -96,8 +84,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - use the Model's io instead of agent.io_global (25 sites) (42.8) [`b4436af8`](https://github.com/jesusalcaladev/zode/commit/b4436af8)
 - pass the autocomplete count into drawAutocomplete (tui) [`9ace7f27`](https://github.com/jesusalcaladev/zode/commit/9ace7f27)
 - remove the duplicated palette key dispatch (47.6) (tui) [`965d2cf2`](https://github.com/jesusalcaladev/zode/commit/965d2cf2)
-- integrate mission runtime into zode (core) [`7644158c`](https://github.com/jesusalcaladev/zode/commit/7644158c)
-- remove dead code and close one-shot leaks (mission) [`0c0ead9c`](https://github.com/jesusalcaladev/zode/commit/0c0ead9c)
 - share hard-stop decisions between both runners [`c86b81eb`](https://github.com/jesusalcaladev/zode/commit/c86b81eb)
 - scale edge scrolling and unify copy cleanup (tui) [`cffd22f8`](https://github.com/jesusalcaladev/zode/commit/cffd22f8)
 - break the agent/tui/commands import cycle [`368cb489`](https://github.com/jesusalcaladev/zode/commit/368cb489)
@@ -111,7 +97,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - eliminate quadratic SSE tool-arg parsing and per-chunk allocations (46.6-46.11) [`14ee2362`](https://github.com/jesusalcaladev/zode/commit/14ee2362)
 - materialize autocomplete matches once per query (47.3) (tui) [`c99f62d1`](https://github.com/jesusalcaladev/zode/commit/c99f62d1)
 - refresh stale model cache, cache keychain lookups (47.8) (startup) [`50081b94`](https://github.com/jesusalcaladev/zode/commit/50081b94)
-- per-check cache keys from declared files (mission) [`ed158298`](https://github.com/jesusalcaladev/zode/commit/ed158298)
 - add ZODE_TERSE_TOOLS and stabilize pty smokes [`33d93b57`](https://github.com/jesusalcaladev/zode/commit/33d93b57)
 
 ### Tests
@@ -121,7 +106,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - end-to-end smoke for --chat (43.7) (headless) [`4bf7827b`](https://github.com/jesusalcaladev/zode/commit/4bf7827b)
 - wait for asserted screen state instead of fixed sleeps (47.5) (pty) [`d8a5eb1c`](https://github.com/jesusalcaladev/zode/commit/d8a5eb1c)
 - cover the last untested pure module (47.7) (envutil) [`c4425861`](https://github.com/jesusalcaladev/zode/commit/c4425861)
-- add parity cases for supervisor decisions (mission) [`9dfef4d9`](https://github.com/jesusalcaladev/zode/commit/9dfef4d9)
 - add a real headless tool-loop smoke (hooks) [`423e774a`](https://github.com/jesusalcaladev/zode/commit/423e774a)
 - gate background completion in the headless loop [`d66c2e57`](https://github.com/jesusalcaladev/zode/commit/d66c2e57)
 - gate /remote against the reference server [`906855e3`](https://github.com/jesusalcaladev/zode/commit/906855e3)
@@ -137,11 +121,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - capitalize visible UI labels (tui) [`0c88e35a`](https://github.com/jesusalcaladev/zode/commit/0c88e35a)
 - give the Ctrl+R hint its own key colour (tui) [`bf8817bc`](https://github.com/jesusalcaladev/zode/commit/bf8817bc)
-
-### Other
-
-- Merge mission runtime: autonomous mission supervisor with roles, memory and chaining [`816bd24b`](https://github.com/jesusalcaladev/zode/commit/816bd24b)
-- Merge mission runtime into zode core [`ffc4c99c`](https://github.com/jesusalcaladev/zode/commit/ffc4c99c)
 
 ## [0.3.0-beta.1] - 2026-11-16
 

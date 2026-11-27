@@ -53,8 +53,7 @@ Phase 13 modules have reference harnesses in `tools/`: `remote_server.py` for
   yet first-class Windows support: it needs a Windows machine to exercise the
   runtime, especially terminal raw mode, signals and process-group kills.
 - End-to-end verification against a real Anthropic key (`zig build test -De2e`).
-- The remaining mission-runtime gaps in [`docs/mission-gaps.md`](docs/mission-gaps.md).
-  The `TASKS.md` quality backlog (Phases 40–51) is fully closed.
+- The `TASKS.md` quality backlog (Phases 40–51) is fully closed.
 
 Checksum verification and the generated command reference are DONE (Phases 45.2
 and 45.6); they are no longer open areas.

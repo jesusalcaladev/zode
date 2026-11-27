@@ -37,6 +37,10 @@ NOISE_PREFIXES = (
     "untracked files",
 )
 
+# A feature removed before the next release must not be announced by a later
+# regeneration. The word boundary is essential: "permission" contains "mission".
+REMOVED_FEATURE_RE = re.compile(r"\bmissions?\b", re.IGNORECASE)
+
 # Conventional commit type -> human-readable Keep a Changelog section label.
 TYPE_LABELS = {
     "feat": "Features",
@@ -73,6 +77,11 @@ def run(cmd: list[str]) -> str:
 def is_noise(subject: str) -> bool:
     low = subject.lower()
     return any(low.startswith(p) for p in NOISE_PREFIXES)
+
+
+def is_removed_feature(subject: str, scope: str | None) -> bool:
+    """The autonomous mission runtime was removed; keep it out of release notes."""
+    return bool(REMOVED_FEATURE_RE.search(subject)) or scope == "mission"
 
 
 def last_release_tag() -> str:
@@ -115,6 +124,9 @@ def get_git_log() -> list[dict]:
             ctype, scope, desc = m.group(1), m.group(2), m.group(3)
         else:
             ctype, scope, desc = "other", None, subject
+
+        if is_removed_feature(subject, scope):
+            continue
 
         is_breaking = "!" in subject or BREAKING_MARKER in body
         commits.append({

@@ -32,7 +32,7 @@ const mcp_servers = @import("mcp/servers.zig");
 /// under a single `settings` object in config.json so a patch can update them
 /// without touching (or losing) the provider/LSP/MCP fields around them.
 pub const Settings = struct {
-    /// Agent mode: interactive (default), mission (autonomous supervisor), auto.
+    /// Agent mode: interactive (default) or auto.
     mode: ?[]const u8 = null,
     output_style: ?[]const u8 = null,
     effort: ?[]const u8 = null,
@@ -220,7 +220,7 @@ pub fn parse(arena: std.mem.Allocator, data: []const u8, path: []const u8) !Conf
         if (sv == .object) {
             const so = sv.object;
             if (so.get("mode")) |v| {
-                if (v == .string and (std.mem.eql(u8, v.string, "interactive") or std.mem.eql(u8, v.string, "mission") or std.mem.eql(u8, v.string, "auto"))) {
+                if (v == .string and (std.mem.eql(u8, v.string, "interactive") or std.mem.eql(u8, v.string, "auto"))) {
                     cfg.settings.mode = try arena.dupe(u8, v.string);
                 }
             }

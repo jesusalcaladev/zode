@@ -43,7 +43,6 @@ const lang_icons = @import("lib/lang_icons.zig");
 const keybinds = @import("lib/keybinds.zig");
 const acp_server = @import("acp/server.zig");
 pub const headless = @import("headless.zig");
-const mission_runner = @import("mission/runner.zig");
 
 var child_env_static: std.process.Environ.Map = undefined;
 var child_env_live: bool = false;
@@ -439,7 +438,6 @@ fn runTui(init: std.process.Init) !u8 {
         model.bg.child_env = &child_env_static;
     } else |_| {}
     model.attachIo(io); // for the activity strip clock
-    model.refreshMissionStatus(); // one cached, dim footer segment; no draw-path I/O
     model.loadPromptHistory(); // ↑ still works after a restart
     model.attach();
 
@@ -704,12 +702,6 @@ pub fn main(init: std.process.Init) !u8 {
         if (std.mem.eql(u8, arg0, "--models")) {
             return runModels(init.gpa, init.io, init.environ_map);
         }
-        if (std.mem.eql(u8, arg0, "mission")) {
-            var mission_args = std.ArrayList([]const u8).empty;
-            defer mission_args.deinit(init.gpa);
-            while (it.next()) |tok| try mission_args.append(init.gpa, tok);
-            return mission_runner.run(init.gpa, init.io, init.environ_map, mission_args.items);
-        }
         if (std.mem.eql(u8, arg0, "acp") or std.mem.eql(u8, arg0, "--acp")) {
             return acp_server.run(init.gpa, init.io, init.environ_map);
         }
@@ -760,7 +752,6 @@ pub fn main(init: std.process.Init) !u8 {
                     "  (no args)    full TUI\n" ++
                     "  acp, --acp   run Agent Client Protocol (ACP) agent over stdio\n" ++
                     "  --models     list the models of the provider\n" ++
-                    "  mission      autonomous missions (plan|status|check|run|stop|resume)\n" ++
                     "  --chat TXT   send a message (streaming)\n" ++
                     "  --chat --schema FILE TXT   schema mode: the model must call structured_output with a matching object (JSON on stdout, non-zero if missing)\n" ++
                     "  --resume     resume the last session\n" ++

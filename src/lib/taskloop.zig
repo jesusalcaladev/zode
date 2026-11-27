@@ -107,9 +107,9 @@ pub const Policy = struct {
     }
 
     pub fn decide(self: *Policy, iteration: usize) Decision {
-        // The ceiling is now the SAME ordered stop rule the mission supervisor
-        // uses. `Budget.allows` is kept for callers that only ask "is there
-        // room for another iteration"; the decision itself lives in stopgate.
+        // The ceiling is the ordered stop rule in stopgate. `Budget.allows`
+        // is kept for callers that only ask "is there room for another
+        // iteration"; the decision itself lives in stopgate.
         if (stopgate.isStop(stopgate.firstStop(.{
             .turn = iteration,
             .max_turns = self.budget.hard,

@@ -1,11 +1,9 @@
-//! Shared hard-stop rules for both runners.
+//! Shared hard-stop rules for the interactive loop.
 //!
-//! The interactive loop (`taskloop`) and the mission supervisor
-//! (`mission/contract.zig`) used to own separate ceilings. This module is the
-//! ONE ordered list of reasons a loop may not continue, written as pure data
-//! so neither runner can quietly change the priority. They are wired together
-//! as a shared Build module because a source file can belong to only one
-//! module in Zig; importing the same `.zig` from both module roots is an error.
+//! This module is the ONE ordered list of reasons a loop may not continue,
+//! written as pure data so the loop cannot quietly change the priority. It is
+//! a shared Build module because a source file can belong to only one module
+//! in Zig; importing the same `.zig` from two module roots is an error.
 //!
 //! Zero means "unlimited" for every budget field. An absent ceiling never
 //! invents a stop.

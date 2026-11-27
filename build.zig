@@ -90,10 +90,8 @@ pub fn build(b: *std.Build) void {
     const build_options_mod = build_options.createModule();
 
     // Shared PURE decision rules. A Zig source file can belong to only one
-    // module: taskloop lives in the root module and the mission contract in
-    // `mission_mod`, so importing stopgate.zig by relative path from both is a
-    // compile error. Registering it as its own module and importing that module
-    // into both is the bridge that lets one rule serve both runners.
+    // module, so stopgate.zig is registered as its own module and imported by
+    // every consumer instead of being reached by relative path.
     const stopgate_mod = b.createModule(.{
         .root_source_file = b.path("src/lib/stopgate.zig"),
         .target = target,
@@ -285,15 +283,6 @@ pub fn build(b: *std.Build) void {
     // compiling the suite in ReleaseSafe takes 2 minutes and finds no MORE bug —
     // it finds fewer, because the DebugAllocator and the overflow checks are
     // exactly what catch them.
-    // Mission runtime lives in the CORE (src/mission/), imported by main.zig
-    // like any other feature. There is no separate mission binary.
-    const mission_mod = b.createModule(.{
-        .root_source_file = b.path("src/mission/contract.zig"),
-        .target = target,
-        .optimize = .safe,
-    });
-    mission_mod.addImport("stopgate", stopgate_mod);
-
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_all.zig"),
         .target = target,
@@ -305,7 +294,6 @@ pub fn build(b: *std.Build) void {
         .strip = strip_tests,
     });
     test_mod.addImport("vaxis", vaxis.module("vaxis"));
-    test_mod.addImport("mission", mission_mod);
     test_mod.addImport("stopgate", stopgate_mod);
 
     // The network E2E test (a REAL turn against a REAL provider) is OFF by default and
@@ -532,7 +520,7 @@ pub fn build(b: *std.Build) void {
     // gone. Zig allows module-level cycles, so this compiles.
     const app_consumers = [_] *std.Build.Module{
         exe_mod, debug_mod, tt_mod, tools_mod_root, check_probe_mod, shell_mod,
-        roster_mod, lsp_probe_mod, mission_mod, test_mod, ui_frame_mod,
+        roster_mod, lsp_probe_mod, test_mod, ui_frame_mod,
         ma_mod, ma_cli_mod, cm_release_mod, cm_mod,
     };
     for (app_consumers) |m| m.addImport("app", m);
